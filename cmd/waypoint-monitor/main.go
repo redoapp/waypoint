@@ -7,11 +7,14 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
 	"github.com/redis/go-redis/v9"
+	"github.com/redoapp/waypoint/internal/admin"
 	"github.com/redoapp/waypoint/internal/monitor"
+	"tailscale.com/tsnet"
 )
 
 func main() {
@@ -41,6 +44,48 @@ func main() {
 	defer rdb.Close()
 
 	store := monitor.NewStore(rdb, cfg.Redis.KeyPrefix)
+
+	// Start tsnet + SSH TUI if enabled.
+	if cfg.SSH.Enabled {
+		tsSrv := &tsnet.Server{
+			Hostname: cfg.Tailscale.Hostname,
+			Dir:      cfg.Tailscale.StateDir,
+		}
+		if authKey := os.Getenv("TS_AUTHKEY"); authKey != "" {
+			tsSrv.AuthKey = authKey
+		}
+		if err := tsSrv.Start(); err != nil {
+			logger.Error("tsnet start failed", "error", err)
+			os.Exit(1)
+		}
+		defer tsSrv.Close()
+
+		lc, err := tsSrv.LocalClient()
+		if err != nil {
+			logger.Error("tsnet local client failed", "error", err)
+			os.Exit(1)
+		}
+
+		hostKeyPath := cfg.SSH.HostKey
+		if hostKeyPath == "" {
+			hostKeyPath = filepath.Join(cfg.Tailscale.StateDir, "ssh_host_ed25519_key")
+		}
+
+		adminSrv, err := admin.New(lc, store, logger, hostKeyPath)
+		if err != nil {
+			logger.Error("admin server init failed", "error", err)
+			os.Exit(1)
+		}
+
+		sshLn, err := tsSrv.Listen("tcp", cfg.SSH.Listen)
+		if err != nil {
+			logger.Error("ssh listen failed", "error", err)
+			os.Exit(1)
+		}
+
+		logger.Info("starting SSH TUI", "hostname", cfg.Tailscale.Hostname, "listen", cfg.SSH.Listen)
+		go adminSrv.Serve(ctx, sshLn)
+	}
 
 	h, err := newHandlers(store, logger)
 	if err != nil {

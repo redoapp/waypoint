@@ -8,8 +8,21 @@ import (
 )
 
 type MonitorConfig struct {
-	Listen string      `toml:"listen"`
-	Redis  RedisConfig `toml:"redis"`
+	Listen    string          `toml:"listen"`
+	Redis     RedisConfig     `toml:"redis"`
+	Tailscale TailscaleConfig `toml:"tailscale"`
+	SSH       SSHConfig       `toml:"ssh"`
+}
+
+type TailscaleConfig struct {
+	Hostname string `toml:"hostname"`
+	StateDir string `toml:"state_dir"`
+}
+
+type SSHConfig struct {
+	Enabled bool   `toml:"enabled"`
+	Listen  string `toml:"listen"`
+	HostKey string `toml:"host_key"`
 }
 
 type RedisConfig struct {
@@ -42,6 +55,12 @@ func loadConfig(path string) (*MonitorConfig, error) {
 	}
 	if cfg.Redis.KeyPrefix == "" {
 		cfg.Redis.KeyPrefix = "waypoint:"
+	}
+	if cfg.Tailscale.Hostname == "" {
+		cfg.Tailscale.Hostname = "waypoint-mgr"
+	}
+	if cfg.SSH.Listen == "" {
+		cfg.SSH.Listen = ":22"
 	}
 
 	return &cfg, nil
