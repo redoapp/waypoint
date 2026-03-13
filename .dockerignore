@@ -1,0 +1,11 @@
+.devenv/
+.direnv/
+.git/
+.pre-commit-config.yaml
+coverage/
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+Thumbs.db
