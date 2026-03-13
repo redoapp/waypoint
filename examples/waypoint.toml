@@ -1,0 +1,35 @@
+[tailscale]
+hostname = "waypoint-db"
+state_dir = "/var/lib/waypoint/tsnet"
+# auth_key via TS_AUTHKEY env var
+
+[redis]
+address = "localhost:6379"
+# password = ""
+# db = 0
+key_prefix = "waypoint:"
+
+[revalidation]
+interval = "1m"
+
+[defaults.limits]
+max_conns_total = 200
+
+[[listeners]]
+name = "pg-main"
+listen = ":5432"
+mode = "postgres"
+backend = "10.0.1.10:5432"
+
+[listeners.postgres]
+admin_user = "waypoint_admin"
+admin_password = "${PG_ADMIN_PASSWORD}"
+admin_database = "postgres"
+user_prefix = "wp_"
+user_ttl = "24h"
+
+[[listeners]]
+name = "raw-mysql"
+listen = ":3306"
+mode = "tcp"
+backend = "10.0.1.5:3306"

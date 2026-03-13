@@ -1,0 +1,20 @@
+# devenv / direnv
+.devenv/
+.direnv/
+.pre-commit-config.yaml
+
+# test coverage
+coverage/
+
+# binary
+/waypoint
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db
