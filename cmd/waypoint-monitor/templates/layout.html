@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Waypoint Monitor</title>
+    <script src="https://unpkg.com/htmx.org@2.0.4"></script>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <header>
+        <h1>Waypoint Monitor</h1>
+    </header>
+    <main>
+        <section>
+            <h2>Instances</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Health</th>
+                        <th>Hostname</th>
+                        <th>Instance ID</th>
+                        <th>Uptime</th>
+                        <th>Listeners</th>
+                        <th>Active Conns</th>
+                        <th>Total Conns</th>
+                        <th>Bytes Read</th>
+                        <th>Bytes Written</th>
+                    </tr>
+                </thead>
+                <tbody hx-get="/partials/instances" hx-trigger="every 5s" hx-swap="innerHTML">
+                    {{template "instances.html" .Instances}}
+                </tbody>
+            </table>
+        </section>
+
+        <section>
+            <h2>Users</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th>User</th>
+                        <th>Active Conns</th>
+                        <th>Total Bytes</th>
+                        <th>Bandwidth</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody hx-get="/partials/users" hx-trigger="every 5s" hx-swap="innerHTML">
+                    {{template "users.html" .Users}}
+                </tbody>
+            </table>
+        </section>
+    </main>
+</body>
+</html>

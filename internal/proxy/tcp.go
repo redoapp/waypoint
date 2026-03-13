@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"net"
+	"sync/atomic"
 	"time"
 
 	"github.com/redoapp/waypoint/internal/auth"
@@ -14,12 +15,14 @@ import (
 
 // TCPProxy handles raw TCP proxying with Tailscale auth and limits.
 type TCPProxy struct {
-	Backend string
-	Name    string
-	LC      *local.Client
-	Tracker *restrict.Tracker
-	Metrics *metrics.Metrics
-	Logger  *slog.Logger
+	Backend      string
+	Name         string
+	LC           *local.Client
+	Tracker      *restrict.Tracker
+	Metrics      *metrics.Metrics
+	Logger       *slog.Logger
+	BytesRead    *atomic.Int64 // optional: aggregate byte counter
+	BytesWritten *atomic.Int64 // optional: aggregate byte counter
 }
 
 // HandleConn processes a single inbound TCP connection.
@@ -82,6 +85,13 @@ func (p *TCPProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 	}
 
 	// Record byte counters after relay completes.
-	m.BytesRead.Add(ctx, cl.BytesRead(), m.Attrs("waypoint.bytes.read", listenerAttr))
-	m.BytesWritten.Add(ctx, cl.BytesWritten(), m.Attrs("waypoint.bytes.written", listenerAttr))
+	br, bw := cl.BytesRead(), cl.BytesWritten()
+	m.BytesRead.Add(ctx, br, m.Attrs("waypoint.bytes.read", listenerAttr))
+	m.BytesWritten.Add(ctx, bw, m.Attrs("waypoint.bytes.written", listenerAttr))
+	if p.BytesRead != nil {
+		p.BytesRead.Add(br)
+	}
+	if p.BytesWritten != nil {
+		p.BytesWritten.Add(bw)
+	}
 }

@@ -1,0 +1,15 @@
+{{range .}}
+<tr>
+    <td><span class="health health-{{.HealthStatus}}"></span></td>
+    <td>{{.Hostname}}</td>
+    <td class="mono">{{.ID}}</td>
+    <td>{{.Uptime}}</td>
+    <td class="mono">{{.Listeners}}</td>
+    <td>{{.ActiveConns}}</td>
+    <td>{{.TotalConns}}</td>
+    <td>{{formatBytes .BytesRead}}</td>
+    <td>{{formatBytes .BytesWritten}}</td>
+</tr>
+{{else}}
+<tr><td colspan="9" class="empty">No instances found</td></tr>
+{{end}}

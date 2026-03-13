@@ -1,0 +1,32 @@
+{{range .}}
+{{template "user-row" .}}
+{{else}}
+<tr><td colspan="5" class="empty">No users found</td></tr>
+{{end}}
+
+{{define "user-row"}}
+<tr id="user-{{.LoginName}}">
+    <td>{{.LoginName}}</td>
+    <td>
+        {{.ActiveConns}}
+        <button class="btn btn-sm" hx-delete="/users/{{.LoginName}}/conns" hx-target="#user-{{.LoginName}}" hx-swap="outerHTML">Reset</button>
+    </td>
+    <td>
+        {{formatBytes .TotalBytes}}
+        <button class="btn btn-sm" hx-delete="/users/{{.LoginName}}/bytes" hx-target="#user-{{.LoginName}}" hx-swap="outerHTML">Reset</button>
+    </td>
+    <td>
+        {{range .Bandwidth}}
+        <div class="bw-entry">
+            <span>{{.PeriodStr}}: {{formatBytes .Bytes}}</span>
+            <button class="btn btn-sm" hx-delete="/users/{{$.LoginName}}/bandwidth/{{.Period.Seconds}}" hx-target="#user-{{$.LoginName}}" hx-swap="outerHTML">Reset</button>
+        </div>
+        {{else}}
+        <span class="muted">none</span>
+        {{end}}
+    </td>
+    <td>
+        <button class="btn btn-danger" hx-delete="/users/{{.LoginName}}/all" hx-target="#user-{{.LoginName}}" hx-swap="outerHTML" hx-confirm="Reset all limits for {{.LoginName}}?">Reset All</button>
+    </td>
+</tr>
+{{end}}

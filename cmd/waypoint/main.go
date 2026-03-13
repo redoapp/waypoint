@@ -9,15 +9,25 @@ import (
 	"os/signal"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 
+	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 	"github.com/redoapp/waypoint/internal/config"
+	"github.com/redoapp/waypoint/internal/heartbeat"
 	"github.com/redoapp/waypoint/internal/metrics"
 	"github.com/redoapp/waypoint/internal/provision"
 	"github.com/redoapp/waypoint/internal/proxy"
 	"github.com/redoapp/waypoint/internal/restrict"
 	"tailscale.com/tsnet"
+)
+
+var (
+	activeConns  atomic.Int64
+	totalConns   atomic.Int64
+	bytesRead    atomic.Int64
+	bytesWritten atomic.Int64
 )
 
 func main() {
@@ -62,6 +72,26 @@ func main() {
 	store := restrict.NewRedisStore(rdb, cfg.Redis.KeyPrefix, m)
 	tracker := restrict.NewTracker(store, m, logger)
 
+	// Heartbeat publisher.
+	instanceID := uuid.New().String()
+	go heartbeat.Run(ctx, heartbeat.Config{
+		InstanceID: instanceID,
+		Client:     rdb,
+		KeyPrefix:  cfg.Redis.KeyPrefix,
+		Hostname:   cfg.Tailscale.Hostname,
+		Listeners:  cfg.Listeners,
+		StatsFunc: func() heartbeat.Stats {
+			return heartbeat.Stats{
+				ActiveConns:  activeConns.Load(),
+				TotalConns:   totalConns.Load(),
+				BytesRead:    bytesRead.Load(),
+				BytesWritten: bytesWritten.Load(),
+			}
+		},
+		Logger: logger.With("component", "heartbeat"),
+	})
+	logger.Info("heartbeat started", "instance_id", instanceID)
+
 	// tsnet server.
 	srv := &tsnet.Server{
 		Hostname: cfg.Tailscale.Hostname,
@@ -104,12 +134,14 @@ func main() {
 		switch mode {
 		case "tcp":
 			p := &proxy.TCPProxy{
-				Backend: lCfg.Backend,
-				Name:    lCfg.Name,
-				LC:      lc,
-				Tracker: tracker,
-				Metrics: m,
-				Logger:  logger.With("listener", lCfg.Name),
+				Backend:      lCfg.Backend,
+				Name:         lCfg.Name,
+				LC:           lc,
+				Tracker:      tracker,
+				Metrics:      m,
+				Logger:       logger.With("listener", lCfg.Name),
+				BytesRead:    &bytesRead,
+				BytesWritten: &bytesWritten,
 			}
 			go acceptLoop(ctx, &wg, ln, p.HandleConn, logger.With("listener", lCfg.Name))
 
@@ -139,6 +171,8 @@ func main() {
 				PGConfig:      lCfg.Postgres,
 				RevalInterval: revalInterval,
 				Logger:        logger.With("listener", lCfg.Name),
+				BytesRead:     &bytesRead,
+				BytesWritten:  &bytesWritten,
 			}
 			go acceptLoop(ctx, &wg, ln, p.HandleConn, logger.With("listener", lCfg.Name))
 
@@ -187,8 +221,11 @@ func acceptLoop(ctx context.Context, wg *sync.WaitGroup, ln net.Listener, handle
 			}
 		}
 		wg.Add(1)
+		activeConns.Add(1)
+		totalConns.Add(1)
 		go func() {
 			defer wg.Done()
+			defer activeConns.Add(-1)
 			handler(ctx, conn)
 		}()
 	}

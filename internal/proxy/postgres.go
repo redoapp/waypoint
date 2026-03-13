@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"net"
+	"sync/atomic"
 	"time"
 
 	"github.com/redoapp/waypoint/internal/auth"
@@ -27,6 +28,8 @@ type PostgresProxy struct {
 	PGConfig      *config.PostgresAdmin
 	RevalInterval time.Duration
 	Logger        *slog.Logger
+	BytesRead     *atomic.Int64 // optional: aggregate byte counter
+	BytesWritten  *atomic.Int64 // optional: aggregate byte counter
 }
 
 // HandleConn processes a single inbound PostgreSQL connection.
@@ -168,8 +171,15 @@ func (p *PostgresProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 	}
 
 	// Record byte counters after relay completes.
-	m.BytesRead.Add(ctx, cl.BytesRead(), m.Attrs("waypoint.bytes.read", listenerAttr))
-	m.BytesWritten.Add(ctx, cl.BytesWritten(), m.Attrs("waypoint.bytes.written", listenerAttr))
+	br, bw := cl.BytesRead(), cl.BytesWritten()
+	m.BytesRead.Add(ctx, br, m.Attrs("waypoint.bytes.read", listenerAttr))
+	m.BytesWritten.Add(ctx, bw, m.Attrs("waypoint.bytes.written", listenerAttr))
+	if p.BytesRead != nil {
+		p.BytesRead.Add(br)
+	}
+	if p.BytesWritten != nil {
+		p.BytesWritten.Add(bw)
+	}
 }
 
 // revalidateLoop periodically re-checks WhoIs + caps. Closes connections
