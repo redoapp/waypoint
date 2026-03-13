@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/redoapp/waypoint/internal/metrics"
 	"github.com/redoapp/waypoint/internal/restrict"
 )
 
@@ -17,11 +18,12 @@ type Cleaner struct {
 	userPrefix   string
 	ttl          time.Duration
 	store        *restrict.RedisStore
+	metrics      *metrics.Metrics
 	logger       *slog.Logger
 }
 
 // NewCleaner creates a new user cleanup worker.
-func NewCleaner(adminUser, adminPassword, adminDatabase, backend, userPrefix string, ttl time.Duration, store *restrict.RedisStore, logger *slog.Logger) *Cleaner {
+func NewCleaner(adminUser, adminPassword, adminDatabase, backend, userPrefix string, ttl time.Duration, store *restrict.RedisStore, m *metrics.Metrics, logger *slog.Logger) *Cleaner {
 	connStr := fmt.Sprintf("postgres://%s:%s@%s/%s?sslmode=disable",
 		adminUser, adminPassword, backend, adminDatabase)
 	if userPrefix == "" {
@@ -32,6 +34,7 @@ func NewCleaner(adminUser, adminPassword, adminDatabase, backend, userPrefix str
 		userPrefix:   userPrefix,
 		ttl:          ttl,
 		store:        store,
+		metrics:      m,
 		logger:       logger,
 	}
 }
@@ -59,6 +62,8 @@ func (c *Cleaner) Run(ctx context.Context) {
 }
 
 func (c *Cleaner) cleanup(ctx context.Context) {
+	c.metrics.CleanupRuns.Add(ctx, 1, c.metrics.Attrs("waypoint.cleanup.runs"))
+
 	conn, err := pgx.Connect(ctx, c.adminConnStr)
 	if err != nil {
 		c.logger.Error("cleanup: admin connect failed", "error", err)
@@ -117,6 +122,7 @@ func (c *Cleaner) cleanup(ctx context.Context) {
 		}
 
 		dropped++
+		c.metrics.CleanupDropped.Add(ctx, 1, c.metrics.Attrs("waypoint.cleanup.dropped"))
 		c.logger.Info("cleanup: dropped idle role", "role", rolname)
 	}
 

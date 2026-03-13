@@ -15,6 +15,34 @@ interval = "1m"
 [defaults.limits]
 max_conns_total = 200
 
+# [metrics]
+# endpoint = "http://localhost:4318"   # OTLP HTTP endpoint (enables metrics when set)
+# interval = "30s"                      # export interval
+#
+# [metrics.enable]
+# # Each key is a metric name — presence enables it. Value is the tag allow-list.
+# # Use ["*"] for all tags, [] for no tags.
+# "waypoint.conn.active"      = ["listener", "mode", "backend"]
+# "waypoint.conn.total"       = ["listener", "mode"]
+# "waypoint.conn.duration"    = ["listener", "user", "backend"]
+# "waypoint.conn.rejected"    = ["listener", "mode"]
+# "waypoint.auth.attempts"    = ["listener"]
+# "waypoint.auth.failures"    = ["listener"]
+# "waypoint.auth.latency"     = ["listener", "backend"]
+# "waypoint.reval.attempts"   = ["listener"]
+# "waypoint.reval.failures"   = ["listener"]
+# "waypoint.bytes.read"       = ["listener"]
+# "waypoint.bytes.written"    = ["listener"]
+# "waypoint.limit.violations" = ["listener", "limit_type"]
+# "waypoint.provision.total"  = ["listener"]
+# "waypoint.provision.latency" = ["listener"]
+# "waypoint.provision.errors" = ["listener"]
+# "waypoint.cleanup.runs"     = []
+# "waypoint.cleanup.dropped"  = []
+# "waypoint.redis.op_duration" = ["operation"]
+# "waypoint.redis.errors"     = ["operation"]
+# "waypoint.system.listeners" = []
+
 [[listeners]]
 name = "pg-main"
 listen = ":5432"

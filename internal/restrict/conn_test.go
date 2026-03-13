@@ -10,6 +10,8 @@ import (
 
 	"github.com/alicebob/miniredis/v2"
 	"github.com/redis/go-redis/v9"
+	"github.com/redoapp/waypoint/internal/auth"
+	"github.com/redoapp/waypoint/internal/metrics"
 )
 
 func setupConnTest(t *testing.T) *RedisStore {
@@ -17,7 +19,7 @@ func setupConnTest(t *testing.T) *RedisStore {
 	mr := miniredis.RunT(t)
 	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { rdb.Close() })
-	return NewRedisStore(rdb, "test:")
+	return NewRedisStore(rdb, "test:", metrics.Noop())
 }
 
 func testLogger() *slog.Logger {
@@ -153,13 +155,12 @@ func TestConnLimits_FlushZeroPendingIsNoop(t *testing.T) {
 func TestConnLimits_BandwidthLimitViaFlush(t *testing.T) {
 	store := setupConnTest(t)
 	cl := &ConnLimits{
-		store:           store,
-		user:            "alice",
-		bandwidthBytes:  100,
-		bandwidthPeriod: time.Hour,
-		logger:          testLogger(),
-		flushInterval:   time.Hour,
-		done:            make(chan struct{}),
+		store:          store,
+		user:           "alice",
+		bandwidthTiers: []auth.BandwidthTier{{Bytes: 100, Period: time.Hour}},
+		logger:         testLogger(),
+		flushInterval:  time.Hour,
+		done:           make(chan struct{}),
 	}
 
 	cl.pendingBytes.Store(150) // Over bandwidth limit.
@@ -167,6 +168,28 @@ func TestConnLimits_BandwidthLimitViaFlush(t *testing.T) {
 
 	if err := cl.checkLimitErr(); err != errBandwidthLimitExceeded {
 		t.Fatalf("expected bandwidth limit exceeded, got: %v", err)
+	}
+}
+
+func TestConnLimits_BandwidthMultiTierViaFlush(t *testing.T) {
+	store := setupConnTest(t)
+	cl := &ConnLimits{
+		store: store,
+		user:  "alice",
+		bandwidthTiers: []auth.BandwidthTier{
+			{Bytes: 10000, Period: time.Hour},     // generous hourly
+			{Bytes: 200, Period: 168 * time.Hour}, // tight weekly
+		},
+		logger:        testLogger(),
+		flushInterval: time.Hour,
+		done:          make(chan struct{}),
+	}
+
+	cl.pendingBytes.Store(300) // Under hourly, over weekly.
+	cl.flush()
+
+	if err := cl.checkLimitErr(); err != errBandwidthLimitExceeded {
+		t.Fatalf("expected bandwidth limit exceeded (weekly tier), got: %v", err)
 	}
 }
 
@@ -274,13 +297,12 @@ func TestConnLimits_ByteLimit_ViaReportReadWrite(t *testing.T) {
 func TestConnLimits_ReportReadWrite_FlushesToRedis(t *testing.T) {
 	store := setupConnTest(t)
 	cl := &ConnLimits{
-		store:           store,
-		user:            "alice",
-		bandwidthBytes:  10000,
-		bandwidthPeriod: time.Hour,
-		logger:          testLogger(),
-		flushInterval:   time.Hour,
-		done:            make(chan struct{}),
+		store:          store,
+		user:           "alice",
+		bandwidthTiers: []auth.BandwidthTier{{Bytes: 10000, Period: time.Hour}},
+		logger:         testLogger(),
+		flushInterval:  time.Hour,
+		done:           make(chan struct{}),
 	}
 
 	// Report bytes via ReportRead/ReportWrite — these must accumulate in pendingBytes.
@@ -372,8 +394,7 @@ func TestRelay_CombinedLimits(t *testing.T) {
 		store:           store,
 		user:            "alice",
 		maxBytesPerConn: 50,
-		bandwidthBytes:  10000,
-		bandwidthPeriod: time.Hour,
+		bandwidthTiers:  []auth.BandwidthTier{{Bytes: 10000, Period: time.Hour}},
 		deadline:        time.Now().Add(5 * time.Second),
 		logger:          testLogger(),
 		flushInterval:   time.Hour,
@@ -408,16 +429,15 @@ func TestConnLimits_BandwidthFlushError_DoesNotPanic(t *testing.T) {
 	mr := miniredis.RunT(t)
 	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { rdb.Close() })
-	store := NewRedisStore(rdb, "test:")
+	store := NewRedisStore(rdb, "test:", metrics.Noop())
 
 	cl := &ConnLimits{
-		store:           store,
-		user:            "alice",
-		bandwidthBytes:  100,
-		bandwidthPeriod: time.Hour,
-		logger:          testLogger(),
-		flushInterval:   time.Hour,
-		done:            make(chan struct{}),
+		store:          store,
+		user:           "alice",
+		bandwidthTiers: []auth.BandwidthTier{{Bytes: 100, Period: time.Hour}},
+		logger:         testLogger(),
+		flushInterval:  time.Hour,
+		done:           make(chan struct{}),
 	}
 
 	cl.ReportBytes(50)

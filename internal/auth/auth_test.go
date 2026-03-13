@@ -143,14 +143,17 @@ func TestMergeLimits_Bandwidth(t *testing.T) {
 	var m MergedLimits
 
 	mergeLimits(&m, &LimitsCap{
-		Bandwidth: &BandwidthCap{Bytes: 1_000_000, Period: "1h"},
+		Bandwidth: []BandwidthCap{{Bytes: 1_000_000, Period: "1h"}},
 	})
 
-	if m.BandwidthBytes != 1_000_000 {
-		t.Errorf("expected 1000000, got %d", m.BandwidthBytes)
+	if len(m.BandwidthTiers) != 1 {
+		t.Fatalf("expected 1 tier, got %d", len(m.BandwidthTiers))
 	}
-	if m.BandwidthPeriod != time.Hour {
-		t.Errorf("expected 1h, got %v", m.BandwidthPeriod)
+	if m.BandwidthTiers[0].Bytes != 1_000_000 {
+		t.Errorf("expected 1000000, got %d", m.BandwidthTiers[0].Bytes)
+	}
+	if m.BandwidthTiers[0].Period != time.Hour {
+		t.Errorf("expected 1h, got %v", m.BandwidthTiers[0].Period)
 	}
 }
 
@@ -158,14 +161,62 @@ func TestMergeLimits_BandwidthMostRestrictive(t *testing.T) {
 	var m MergedLimits
 
 	mergeLimits(&m, &LimitsCap{
-		Bandwidth: &BandwidthCap{Bytes: 2_000_000, Period: "1h"},
+		Bandwidth: []BandwidthCap{{Bytes: 2_000_000, Period: "1h"}},
 	})
 	mergeLimits(&m, &LimitsCap{
-		Bandwidth: &BandwidthCap{Bytes: 1_000_000, Period: "1h"},
+		Bandwidth: []BandwidthCap{{Bytes: 1_000_000, Period: "1h"}},
 	})
 
-	if m.BandwidthBytes != 1_000_000 {
-		t.Errorf("expected 1000000 (most restrictive), got %d", m.BandwidthBytes)
+	if len(m.BandwidthTiers) != 1 {
+		t.Fatalf("expected 1 tier (deduped by period), got %d", len(m.BandwidthTiers))
+	}
+	if m.BandwidthTiers[0].Bytes != 1_000_000 {
+		t.Errorf("expected 1000000 (most restrictive), got %d", m.BandwidthTiers[0].Bytes)
+	}
+}
+
+func TestMergeLimits_BandwidthMultipleTiers(t *testing.T) {
+	var m MergedLimits
+
+	mergeLimits(&m, &LimitsCap{
+		Bandwidth: []BandwidthCap{
+			{Bytes: 100_000_000, Period: "1h"},
+			{Bytes: 10_000_000_000, Period: "168h"},
+		},
+	})
+
+	if len(m.BandwidthTiers) != 2 {
+		t.Fatalf("expected 2 tiers, got %d", len(m.BandwidthTiers))
+	}
+	if m.BandwidthTiers[0].Bytes != 100_000_000 {
+		t.Errorf("expected hourly tier 100MB, got %d", m.BandwidthTiers[0].Bytes)
+	}
+	if m.BandwidthTiers[1].Period != 168*time.Hour {
+		t.Errorf("expected weekly tier period 168h, got %v", m.BandwidthTiers[1].Period)
+	}
+}
+
+func TestMergeLimits_BandwidthMultipleTiers_DedupByPeriod(t *testing.T) {
+	var m MergedLimits
+
+	mergeLimits(&m, &LimitsCap{
+		Bandwidth: []BandwidthCap{
+			{Bytes: 200_000_000, Period: "1h"},
+			{Bytes: 10_000_000_000, Period: "168h"},
+		},
+	})
+	mergeLimits(&m, &LimitsCap{
+		Bandwidth: []BandwidthCap{
+			{Bytes: 100_000_000, Period: "1h"},
+		},
+	})
+
+	if len(m.BandwidthTiers) != 2 {
+		t.Fatalf("expected 2 tiers, got %d", len(m.BandwidthTiers))
+	}
+	// Hourly should be the more restrictive 100MB.
+	if m.BandwidthTiers[0].Bytes != 100_000_000 {
+		t.Errorf("expected hourly tier 100MB (most restrictive), got %d", m.BandwidthTiers[0].Bytes)
 	}
 }
 

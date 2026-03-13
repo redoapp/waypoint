@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/BurntSushi/toml"
+	"github.com/redoapp/waypoint/internal/metrics"
 )
 
 type Config struct {
@@ -14,6 +15,7 @@ type Config struct {
 	Redis        RedisConfig        `toml:"redis"`
 	Revalidation RevalidationConfig `toml:"revalidation"`
 	Defaults     DefaultsConfig     `toml:"defaults"`
+	Metrics      metrics.Config     `toml:"metrics"`
 	Listeners    []ListenerConfig   `toml:"listeners"`
 }
 

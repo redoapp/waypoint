@@ -8,6 +8,7 @@ import (
 
 	"github.com/redoapp/waypoint/internal/auth"
 	"github.com/redoapp/waypoint/internal/config"
+	"github.com/redoapp/waypoint/internal/metrics"
 	"github.com/redoapp/waypoint/internal/pgwire"
 	"github.com/redoapp/waypoint/internal/provision"
 	"github.com/redoapp/waypoint/internal/restrict"
@@ -22,6 +23,7 @@ type PostgresProxy struct {
 	LC            *local.Client
 	Tracker       *restrict.Tracker
 	Provisioner   *provision.Provisioner
+	Metrics       *metrics.Metrics
 	PGConfig      *config.PostgresAdmin
 	RevalInterval time.Duration
 	Logger        *slog.Logger
@@ -31,9 +33,19 @@ type PostgresProxy struct {
 func (p *PostgresProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 	defer clientConn.Close()
 
+	m := p.Metrics
+	listenerAttr := metrics.AttrListener.String(p.Name)
+	modeAttr := metrics.AttrMode.String("postgres")
+
 	// Step 1: Authorize via Tailscale identity.
+	m.AuthAttempts.Add(ctx, 1, m.Attrs("waypoint.auth.attempts", listenerAttr))
+	authStart := time.Now()
 	result, err := auth.Authorize(ctx, p.LC, clientConn.RemoteAddr().String(), p.Name)
+	authDur := time.Since(authStart).Seconds()
+	m.AuthLatency.Record(ctx, authDur, m.Attrs("waypoint.auth.latency", listenerAttr))
 	if err != nil {
+		m.AuthFailures.Add(ctx, 1, m.Attrs("waypoint.auth.failures", listenerAttr))
+		m.ConnRejected.Add(ctx, 1, m.Attrs("waypoint.conn.rejected", listenerAttr, modeAttr))
 		p.Logger.Warn("auth failed", "remote", clientConn.RemoteAddr(), "error", err)
 		pgwire.SendErrorResponse(clientConn, "FATAL", "28000", "authentication failed: "+err.Error())
 		return
@@ -48,11 +60,22 @@ func (p *PostgresProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 	// Step 2: Acquire connection slot.
 	release, err := p.Tracker.Acquire(ctx, result.LoginName, result.Limits)
 	if err != nil {
+		m.ConnRejected.Add(ctx, 1, m.Attrs("waypoint.conn.rejected", listenerAttr, modeAttr))
 		p.Logger.Warn("limit exceeded", "user", result.LoginName, "error", err)
 		pgwire.SendErrorResponse(clientConn, "FATAL", "53300", "too many connections: "+err.Error())
 		return
 	}
 	defer release()
+
+	// Track connection.
+	connStart := time.Now()
+	m.ConnTotal.Add(ctx, 1, m.Attrs("waypoint.conn.total", listenerAttr, modeAttr))
+	m.ConnActive.Add(ctx, 1, m.Attrs("waypoint.conn.active", listenerAttr, modeAttr))
+	defer func() {
+		m.ConnActive.Add(ctx, -1, m.Attrs("waypoint.conn.active", listenerAttr, modeAttr))
+		m.ConnDuration.Record(ctx, time.Since(connStart).Seconds(),
+			m.Attrs("waypoint.conn.duration", listenerAttr, metrics.AttrUser.String(result.LoginName)))
+	}()
 
 	// Step 3: Read client's StartupMessage to get requested database.
 	startup, err := pgwire.ReadStartupMessage(clientConn)
@@ -79,8 +102,13 @@ func (p *PostgresProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 	}
 
 	// Step 5: Provision dynamic PG user.
+	provStart := time.Now()
+	m.ProvisionTotal.Add(ctx, 1, m.Attrs("waypoint.provision.total", listenerAttr))
 	pgUser, pgPass, err := p.Provisioner.EnsureUser(ctx, result.LoginName, result.NodeName, requestedDB, dbPerms)
+	m.ProvisionLatency.Record(ctx, time.Since(provStart).Seconds(),
+		m.Attrs("waypoint.provision.latency", listenerAttr))
 	if err != nil {
+		m.ProvisionErrors.Add(ctx, 1, m.Attrs("waypoint.provision.errors", listenerAttr))
 		p.Logger.Error("provision failed",
 			"user", result.LoginName,
 			"database", requestedDB,
@@ -138,6 +166,10 @@ func (p *PostgresProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 	if err := restrict.Relay(clientConn, backendConn, cl); err != nil {
 		p.Logger.Debug("relay ended", "user", result.LoginName, "error", err)
 	}
+
+	// Record byte counters after relay completes.
+	m.BytesRead.Add(ctx, cl.BytesRead(), m.Attrs("waypoint.bytes.read", listenerAttr))
+	m.BytesWritten.Add(ctx, cl.BytesWritten(), m.Attrs("waypoint.bytes.written", listenerAttr))
 }
 
 // revalidateLoop periodically re-checks WhoIs + caps. Closes connections
@@ -146,13 +178,18 @@ func (p *PostgresProxy) revalidateLoop(ctx context.Context, clientConn, backendC
 	ticker := time.NewTicker(p.RevalInterval)
 	defer ticker.Stop()
 
+	m := p.Metrics
+	listenerAttr := metrics.AttrListener.String(p.Name)
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			m.RevalAttempts.Add(ctx, 1, m.Attrs("waypoint.reval.attempts", listenerAttr))
 			result, err := auth.Authorize(ctx, p.LC, clientConn.RemoteAddr().String(), p.Name)
 			if err != nil {
+				m.RevalFailures.Add(ctx, 1, m.Attrs("waypoint.reval.failures", listenerAttr))
 				p.Logger.Warn("revalidation failed, closing connection",
 					"user", loginName,
 					"error", err,
@@ -164,6 +201,7 @@ func (p *PostgresProxy) revalidateLoop(ctx context.Context, clientConn, backendC
 
 			dbPerms := auth.DatabasePermissions(result, database)
 			if dbPerms == nil {
+				m.RevalFailures.Add(ctx, 1, m.Attrs("waypoint.reval.failures", listenerAttr))
 				p.Logger.Warn("permissions revoked, closing connection",
 					"user", loginName,
 					"database", database,

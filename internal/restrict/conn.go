@@ -9,6 +9,9 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/redoapp/waypoint/internal/auth"
+	"github.com/redoapp/waypoint/internal/metrics"
 )
 
 var errByteLimitExceeded = errors.New("per-connection byte limit exceeded")
@@ -18,10 +21,10 @@ var errDeadlineExceeded = errors.New("connection duration limit exceeded")
 // ConnLimits tracks per-connection limits and batches byte updates to Redis.
 type ConnLimits struct {
 	store           *RedisStore
+	metrics         *metrics.Metrics
 	user            string
 	maxBytesPerConn int64
-	bandwidthBytes  int64
-	bandwidthPeriod time.Duration
+	bandwidthTiers  []auth.BandwidthTier
 	deadline        time.Time
 	logger          *slog.Logger
 	flushInterval   time.Duration
@@ -56,6 +59,16 @@ func (cl *ConnLimits) Stop() {
 	})
 }
 
+// BytesRead returns the total bytes read from the client side.
+func (cl *ConnLimits) BytesRead() int64 {
+	return cl.bytesRead.Load()
+}
+
+// BytesWritten returns the total bytes written to the client side.
+func (cl *ConnLimits) BytesWritten() int64 {
+	return cl.bytesWritten.Load()
+}
+
 // ReportBytes records bytes transferred and checks per-connection limits.
 // Returns an error if a limit is exceeded.
 func (cl *ConnLimits) ReportBytes(n int64) error {
@@ -65,11 +78,19 @@ func (cl *ConnLimits) ReportBytes(n int64) error {
 	if cl.maxBytesPerConn > 0 {
 		total := cl.totalBytes.Load()
 		if total > cl.maxBytesPerConn {
+			if cl.metrics != nil {
+				cl.metrics.LimitViolations.Add(context.Background(), 1,
+					cl.metrics.Attrs("waypoint.limit.violations", metrics.AttrLimitType.String("bytes_per_conn")))
+			}
 			return errByteLimitExceeded
 		}
 	}
 
 	if !cl.deadline.IsZero() && time.Now().After(cl.deadline) {
+		if cl.metrics != nil {
+			cl.metrics.LimitViolations.Add(context.Background(), 1,
+				cl.metrics.Attrs("waypoint.limit.violations", metrics.AttrLimitType.String("conn_duration")))
+		}
 		return errDeadlineExceeded
 	}
 
@@ -128,14 +149,14 @@ func (cl *ConnLimits) flush() {
 	// Update aggregate bytes.
 	cl.store.AddBytes(ctx, cl.user, pending)
 
-	// Check bandwidth limit.
-	if cl.bandwidthBytes > 0 && cl.bandwidthPeriod > 0 {
-		total, err := cl.store.AddBandwidthBytes(ctx, cl.user, pending, cl.bandwidthPeriod)
+	// Check bandwidth limits across all tiers.
+	if len(cl.bandwidthTiers) > 0 {
+		result, err := cl.store.AddBandwidthBytesMulti(ctx, cl.user, pending, cl.bandwidthTiers)
 		if err != nil {
 			cl.logger.Error("bandwidth flush failed", "user", cl.user, "error", err)
 			return
 		}
-		if total > cl.bandwidthBytes {
+		if result.Exceeded {
 			cl.setLimitErr(errBandwidthLimitExceeded)
 		}
 	}

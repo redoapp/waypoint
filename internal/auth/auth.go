@@ -20,13 +20,18 @@ type AuthResult struct {
 	MatchedRules []CapRule // rules that matched the backend, for per-database lookup
 }
 
+// BandwidthTier defines a byte budget over a time period.
+type BandwidthTier struct {
+	Bytes  int64
+	Period time.Duration
+}
+
 // MergedLimits holds the resolved limits after merging all matching rules.
 type MergedLimits struct {
 	MaxConns        int
 	MaxBytesPerConn int64
 	MaxConnDuration time.Duration
-	BandwidthBytes  int64
-	BandwidthPeriod time.Duration
+	BandwidthTiers  []BandwidthTier
 }
 
 // Authorize checks the caller's Tailscale identity and capability grants
@@ -139,13 +144,27 @@ func mergeLimits(merged *MergedLimits, cap *LimitsCap) {
 			merged.MaxConnDuration = d
 		}
 	}
-	if cap.Bandwidth != nil {
-		period, err := time.ParseDuration(cap.Bandwidth.Period)
-		if err == nil && cap.Bandwidth.Bytes > 0 {
-			if merged.BandwidthBytes == 0 || cap.Bandwidth.Bytes < merged.BandwidthBytes {
-				merged.BandwidthBytes = cap.Bandwidth.Bytes
-				merged.BandwidthPeriod = period
+	for _, bw := range cap.Bandwidth {
+		period, err := time.ParseDuration(bw.Period)
+		if err != nil || bw.Bytes <= 0 || period <= 0 {
+			continue
+		}
+		// Dedup by period: keep the most restrictive bytes for the same period.
+		found := false
+		for i := range merged.BandwidthTiers {
+			if merged.BandwidthTiers[i].Period == period {
+				if bw.Bytes < merged.BandwidthTiers[i].Bytes {
+					merged.BandwidthTiers[i].Bytes = bw.Bytes
+				}
+				found = true
+				break
 			}
+		}
+		if !found {
+			merged.BandwidthTiers = append(merged.BandwidthTiers, BandwidthTier{
+				Bytes:  bw.Bytes,
+				Period: period,
+			})
 		}
 	}
 }

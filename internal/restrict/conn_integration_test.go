@@ -11,20 +11,20 @@ import (
 	"time"
 
 	"github.com/redoapp/waypoint/internal/auth"
+	"github.com/redoapp/waypoint/internal/metrics"
 	"github.com/redoapp/waypoint/internal/restrict"
 	"github.com/redoapp/waypoint/internal/testutil"
 )
 
 func TestIntegration_Relay_BandwidthTracking(t *testing.T) {
 	rdb := testutil.RedisClient(t)
-	store := restrict.NewRedisStore(rdb, "inttest:")
+	store := restrict.NewRedisStore(rdb, "inttest:", metrics.Noop())
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	tracker := restrict.NewTracker(store, logger)
+	tracker := restrict.NewTracker(store, metrics.Noop(), logger)
 	ctx := context.Background()
 
 	limits := auth.MergedLimits{
-		BandwidthBytes:  100_000,
-		BandwidthPeriod: time.Hour,
+		BandwidthTiers: []auth.BandwidthTier{{Bytes: 100_000, Period: time.Hour}},
 	}
 	cl := tracker.WrapConn(ctx, "relay_bw_user", limits)
 	cl.SetFlushIntervalForTest(50 * time.Millisecond)
@@ -72,14 +72,13 @@ func TestIntegration_Relay_BandwidthTracking(t *testing.T) {
 
 func TestIntegration_Relay_BandwidthLimitEnforced(t *testing.T) {
 	rdb := testutil.RedisClient(t)
-	store := restrict.NewRedisStore(rdb, "inttest:")
+	store := restrict.NewRedisStore(rdb, "inttest:", metrics.Noop())
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	tracker := restrict.NewTracker(store, logger)
+	tracker := restrict.NewTracker(store, metrics.Noop(), logger)
 	ctx := context.Background()
 
 	limits := auth.MergedLimits{
-		BandwidthBytes:  500,
-		BandwidthPeriod: time.Hour,
+		BandwidthTiers: []auth.BandwidthTier{{Bytes: 500, Period: time.Hour}},
 	}
 	cl := tracker.WrapConn(ctx, "relay_limit_user", limits)
 	cl.SetFlushIntervalForTest(10 * time.Millisecond)
@@ -127,9 +126,9 @@ func TestIntegration_Relay_BandwidthLimitEnforced(t *testing.T) {
 
 func TestIntegration_ConnLimits_FlushToRealRedis(t *testing.T) {
 	rdb := testutil.RedisClient(t)
-	store := restrict.NewRedisStore(rdb, "inttest:")
+	store := restrict.NewRedisStore(rdb, "inttest:", metrics.Noop())
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	tracker := restrict.NewTracker(store, logger)
+	tracker := restrict.NewTracker(store, metrics.Noop(), logger)
 	ctx := context.Background()
 
 	limits := auth.MergedLimits{}

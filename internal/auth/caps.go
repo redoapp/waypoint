@@ -21,10 +21,10 @@ type DBPermissions struct {
 
 // LimitsCap defines per-user restriction overrides from ACL grants.
 type LimitsCap struct {
-	MaxConns        int           `json:"max_conns,omitempty"`
-	MaxBytesPerConn int64         `json:"max_bytes_per_conn,omitempty"`
-	MaxConnDuration string        `json:"max_conn_duration,omitempty"`
-	Bandwidth       *BandwidthCap `json:"bandwidth,omitempty"`
+	MaxConns        int            `json:"max_conns,omitempty"`
+	MaxBytesPerConn int64          `json:"max_bytes_per_conn,omitempty"`
+	MaxConnDuration string         `json:"max_conn_duration,omitempty"`
+	Bandwidth       []BandwidthCap `json:"bandwidth,omitempty"`
 }
 
 // BandwidthCap defines a byte budget over a time period.

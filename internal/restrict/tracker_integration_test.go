@@ -11,15 +11,16 @@ import (
 	"testing"
 
 	"github.com/redoapp/waypoint/internal/auth"
+	"github.com/redoapp/waypoint/internal/metrics"
 	"github.com/redoapp/waypoint/internal/restrict"
 	"github.com/redoapp/waypoint/internal/testutil"
 )
 
 func TestIntegration_Tracker_AcquireRelease(t *testing.T) {
 	rdb := testutil.RedisClient(t)
-	store := restrict.NewRedisStore(rdb, "inttest:")
+	store := restrict.NewRedisStore(rdb, "inttest:", metrics.Noop())
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	tracker := restrict.NewTracker(store, logger)
+	tracker := restrict.NewTracker(store, metrics.Noop(), logger)
 	ctx := context.Background()
 	limits := auth.MergedLimits{MaxConns: 2}
 
@@ -53,9 +54,9 @@ func TestIntegration_Tracker_AcquireRelease(t *testing.T) {
 
 func TestIntegration_Tracker_ConcurrentAcquire(t *testing.T) {
 	rdb := testutil.RedisClient(t)
-	store := restrict.NewRedisStore(rdb, "inttest:")
+	store := restrict.NewRedisStore(rdb, "inttest:", metrics.Noop())
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	tracker := restrict.NewTracker(store, logger)
+	tracker := restrict.NewTracker(store, metrics.Noop(), logger)
 	ctx := context.Background()
 
 	const maxConns = 5
@@ -105,9 +106,9 @@ func TestIntegration_Tracker_ConcurrentAcquire(t *testing.T) {
 
 func TestIntegration_Tracker_HighConcurrencyStress(t *testing.T) {
 	rdb := testutil.RedisClient(t)
-	store := restrict.NewRedisStore(rdb, "inttest:")
+	store := restrict.NewRedisStore(rdb, "inttest:", metrics.Noop())
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	tracker := restrict.NewTracker(store, logger)
+	tracker := restrict.NewTracker(store, metrics.Noop(), logger)
 	ctx := context.Background()
 
 	const maxConns = 10
@@ -162,9 +163,9 @@ func TestIntegration_Tracker_HighConcurrencyStress(t *testing.T) {
 
 func TestIntegration_Tracker_AcquireReleaseCycle_CountConsistency(t *testing.T) {
 	rdb := testutil.RedisClient(t)
-	store := restrict.NewRedisStore(rdb, "inttest:")
+	store := restrict.NewRedisStore(rdb, "inttest:", metrics.Noop())
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	tracker := restrict.NewTracker(store, logger)
+	tracker := restrict.NewTracker(store, metrics.Noop(), logger)
 	ctx := context.Background()
 
 	const maxConns = 5

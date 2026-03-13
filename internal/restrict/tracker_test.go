@@ -10,6 +10,7 @@ import (
 	"github.com/alicebob/miniredis/v2"
 	"github.com/redis/go-redis/v9"
 	"github.com/redoapp/waypoint/internal/auth"
+	"github.com/redoapp/waypoint/internal/metrics"
 )
 
 func setupTracker(t *testing.T) (*Tracker, *miniredis.Miniredis) {
@@ -17,9 +18,9 @@ func setupTracker(t *testing.T) (*Tracker, *miniredis.Miniredis) {
 	mr := miniredis.RunT(t)
 	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { rdb.Close() })
-	store := NewRedisStore(rdb, "test:")
+	store := NewRedisStore(rdb, "test:", metrics.Noop())
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	return NewTracker(store, logger), mr
+	return NewTracker(store, metrics.Noop(), logger), mr
 }
 
 func TestTracker_AcquireAndRelease(t *testing.T) {

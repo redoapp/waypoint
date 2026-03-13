@@ -13,6 +13,7 @@ import (
 
 	"github.com/redis/go-redis/v9"
 	"github.com/redoapp/waypoint/internal/config"
+	"github.com/redoapp/waypoint/internal/metrics"
 	"github.com/redoapp/waypoint/internal/provision"
 	"github.com/redoapp/waypoint/internal/proxy"
 	"github.com/redoapp/waypoint/internal/restrict"
@@ -34,6 +35,14 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
+	// Metrics.
+	m, err := metrics.New(ctx, cfg.Metrics)
+	if err != nil {
+		logger.Error("failed to initialize metrics", "error", err)
+		os.Exit(1)
+	}
+	defer m.Shutdown(ctx)
+
 	// Redis client.
 	redisAddr := cfg.Redis.Address
 	if redisAddr == "" {
@@ -50,8 +59,8 @@ func main() {
 	}
 	defer rdb.Close()
 
-	store := restrict.NewRedisStore(rdb, cfg.Redis.KeyPrefix)
-	tracker := restrict.NewTracker(store, logger)
+	store := restrict.NewRedisStore(rdb, cfg.Redis.KeyPrefix, m)
+	tracker := restrict.NewTracker(store, m, logger)
 
 	// tsnet server.
 	srv := &tsnet.Server{
@@ -99,6 +108,7 @@ func main() {
 				Name:    lCfg.Name,
 				LC:      lc,
 				Tracker: tracker,
+				Metrics: m,
 				Logger:  logger.With("listener", lCfg.Name),
 			}
 			go acceptLoop(ctx, &wg, ln, p.HandleConn, logger.With("listener", lCfg.Name))
@@ -125,6 +135,7 @@ func main() {
 				LC:            lc,
 				Tracker:       tracker,
 				Provisioner:   provisioner,
+				Metrics:       m,
 				PGConfig:      lCfg.Postgres,
 				RevalInterval: revalInterval,
 				Logger:        logger.With("listener", lCfg.Name),
@@ -140,11 +151,13 @@ func main() {
 				lCfg.Postgres.UserPrefix,
 				lCfg.Postgres.UserTTLDuration(),
 				store,
+				m,
 				logger.With("component", "cleaner", "listener", lCfg.Name),
 			)
 			go cleaner.Run(ctx)
 		}
 
+		m.SystemListeners.Add(ctx, 1, m.Attrs("waypoint.system.listeners"))
 		logger.Info("listening", "name", lCfg.Name, "addr", lCfg.Listen, "mode", mode, "backend", lCfg.Backend)
 	}
 

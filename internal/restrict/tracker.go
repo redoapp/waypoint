@@ -7,17 +7,19 @@ import (
 	"time"
 
 	"github.com/redoapp/waypoint/internal/auth"
+	"github.com/redoapp/waypoint/internal/metrics"
 )
 
 // Tracker orchestrates per-connection (local) and per-user (Redis) limits.
 type Tracker struct {
-	store  *RedisStore
-	logger *slog.Logger
+	store   *RedisStore
+	metrics *metrics.Metrics
+	logger  *slog.Logger
 }
 
 // NewTracker creates a new limit tracker.
-func NewTracker(store *RedisStore, logger *slog.Logger) *Tracker {
-	return &Tracker{store: store, logger: logger}
+func NewTracker(store *RedisStore, m *metrics.Metrics, logger *slog.Logger) *Tracker {
+	return &Tracker{store: store, metrics: m, logger: logger}
 }
 
 // Acquire checks and increments the connection count for a user.
@@ -29,6 +31,8 @@ func (t *Tracker) Acquire(ctx context.Context, user string, limits auth.MergedLi
 			return nil, fmt.Errorf("check conn count: %w", err)
 		}
 		if current >= int64(limits.MaxConns) {
+			t.metrics.LimitViolations.Add(ctx, 1,
+				t.metrics.Attrs("waypoint.limit.violations", metrics.AttrLimitType.String("max_conns")))
 			return nil, fmt.Errorf("connection limit exceeded (%d/%d)", current, limits.MaxConns)
 		}
 	}
@@ -41,6 +45,8 @@ func (t *Tracker) Acquire(ctx context.Context, user string, limits auth.MergedLi
 	// Double-check after increment (race window is acceptable per spec).
 	if limits.MaxConns > 0 && count > int64(limits.MaxConns) {
 		t.store.DecrConns(ctx, user)
+		t.metrics.LimitViolations.Add(ctx, 1,
+			t.metrics.Attrs("waypoint.limit.violations", metrics.AttrLimitType.String("max_conns")))
 		return nil, fmt.Errorf("connection limit exceeded (%d/%d)", count, limits.MaxConns)
 	}
 
@@ -62,10 +68,10 @@ func (t *Tracker) Acquire(ctx context.Context, user string, limits auth.MergedLi
 func (t *Tracker) WrapConn(ctx context.Context, user string, limits auth.MergedLimits) *ConnLimits {
 	cl := &ConnLimits{
 		store:           t.store,
+		metrics:         t.metrics,
 		user:            user,
 		maxBytesPerConn: limits.MaxBytesPerConn,
-		bandwidthBytes:  limits.BandwidthBytes,
-		bandwidthPeriod: limits.BandwidthPeriod,
+		bandwidthTiers:  limits.BandwidthTiers,
 		logger:          t.logger,
 		flushInterval:   10 * time.Second,
 	}
