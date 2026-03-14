@@ -243,14 +243,14 @@ func TestDatabasePermissions_ExactMatch(t *testing.T) {
 		}},
 	}
 
-	perms := DatabasePermissions(result, "app_db")
-	if len(perms) != 1 || perms[0] != "SELECT ON public.users" {
-		t.Errorf("unexpected perms for app_db: %v", perms)
+	dbPerms := DatabasePermissions(result, "app_db")
+	if dbPerms == nil || len(dbPerms.Permissions) != 1 || dbPerms.Permissions[0] != "SELECT ON public.users" {
+		t.Errorf("unexpected perms for app_db: %v", dbPerms)
 	}
 
-	perms = DatabasePermissions(result, "analytics")
-	if len(perms) != 1 || perms[0] != "SELECT ON public.events" {
-		t.Errorf("unexpected perms for analytics: %v", perms)
+	dbPerms = DatabasePermissions(result, "analytics")
+	if dbPerms == nil || len(dbPerms.Permissions) != 1 || dbPerms.Permissions[0] != "SELECT ON public.events" {
+		t.Errorf("unexpected perms for analytics: %v", dbPerms)
 	}
 }
 
@@ -266,9 +266,9 @@ func TestDatabasePermissions_WildcardMatch(t *testing.T) {
 		}},
 	}
 
-	perms := DatabasePermissions(result, "any_database")
-	if len(perms) != 1 {
-		t.Errorf("wildcard should match any database, got: %v", perms)
+	dbPerms := DatabasePermissions(result, "any_database")
+	if dbPerms == nil || len(dbPerms.Permissions) != 1 {
+		t.Errorf("wildcard should match any database, got: %v", dbPerms)
 	}
 }
 
@@ -285,9 +285,9 @@ func TestDatabasePermissions_ExactAndWildcardMerge(t *testing.T) {
 		}},
 	}
 
-	perms := DatabasePermissions(result, "app_db")
-	if len(perms) != 2 {
-		t.Errorf("expected exact + wildcard merged, got %d perms: %v", len(perms), perms)
+	dbPerms := DatabasePermissions(result, "app_db")
+	if dbPerms == nil || len(dbPerms.Permissions) != 2 {
+		t.Errorf("expected exact + wildcard merged, got: %v", dbPerms)
 	}
 }
 
@@ -303,9 +303,9 @@ func TestDatabasePermissions_NoMatch(t *testing.T) {
 		}},
 	}
 
-	perms := DatabasePermissions(result, "secret_db")
-	if perms != nil {
-		t.Errorf("expected nil for unmatched database, got: %v", perms)
+	dbPerms := DatabasePermissions(result, "secret_db")
+	if dbPerms != nil {
+		t.Errorf("expected nil for unmatched database, got: %v", dbPerms)
 	}
 }
 
@@ -316,9 +316,9 @@ func TestDatabasePermissions_NoPGCap(t *testing.T) {
 		}},
 	}
 
-	perms := DatabasePermissions(result, "any_db")
-	if perms != nil {
-		t.Errorf("expected nil for non-PG rule, got: %v", perms)
+	dbPerms := DatabasePermissions(result, "any_db")
+	if dbPerms != nil {
+		t.Errorf("expected nil for non-PG rule, got: %v", dbPerms)
 	}
 }
 
@@ -344,9 +344,77 @@ func TestDatabasePermissions_MultipleRulesMerge(t *testing.T) {
 		},
 	}
 
-	perms := DatabasePermissions(result, "app_db")
-	if len(perms) != 2 {
-		t.Errorf("expected 2 perms from merged rules, got %d: %v", len(perms), perms)
+	dbPerms := DatabasePermissions(result, "app_db")
+	if dbPerms == nil || len(dbPerms.Permissions) != 2 {
+		t.Errorf("expected 2 perms from merged rules, got: %v", dbPerms)
+	}
+}
+
+func TestDatabasePermissions_SQLFieldMerge(t *testing.T) {
+	result := &AuthResult{
+		MatchedRules: []CapRule{
+			{
+				Backends: []string{"pg-main"},
+				PG: &PGCap{
+					Databases: map[string]DBPermissions{
+						"app_db": {
+							Permissions: []string{"SELECT ON public.users"},
+							SQL:         []string{"GRANT USAGE ON SCHEMA analytics TO {role}"},
+						},
+					},
+				},
+			},
+			{
+				Backends: []string{"pg-main"},
+				PG: &PGCap{
+					Databases: map[string]DBPermissions{
+						"app_db": {
+							SQL: []string{"ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO {role}"},
+						},
+						"*": {
+							SQL: []string{"GRANT USAGE ON SCHEMA public TO {role}"},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	dbPerms := DatabasePermissions(result, "app_db")
+	if dbPerms == nil {
+		t.Fatal("expected non-nil perms")
+	}
+	if len(dbPerms.Permissions) != 1 {
+		t.Errorf("expected 1 permission, got %d: %v", len(dbPerms.Permissions), dbPerms.Permissions)
+	}
+	if len(dbPerms.SQL) != 3 {
+		t.Errorf("expected 3 SQL statements merged from exact+exact+wildcard, got %d: %v", len(dbPerms.SQL), dbPerms.SQL)
+	}
+}
+
+func TestDatabasePermissions_SQLOnlyAccess(t *testing.T) {
+	result := &AuthResult{
+		MatchedRules: []CapRule{{
+			Backends: []string{"pg-main"},
+			PG: &PGCap{
+				Databases: map[string]DBPermissions{
+					"app_db": {
+						SQL: []string{"GRANT SELECT ON public.users TO {role}"},
+					},
+				},
+			},
+		}},
+	}
+
+	dbPerms := DatabasePermissions(result, "app_db")
+	if dbPerms == nil {
+		t.Fatal("expected non-nil perms for SQL-only access")
+	}
+	if len(dbPerms.Permissions) != 0 {
+		t.Errorf("expected 0 permissions, got %d", len(dbPerms.Permissions))
+	}
+	if len(dbPerms.SQL) != 1 || dbPerms.SQL[0] != "GRANT SELECT ON public.users TO {role}" {
+		t.Errorf("unexpected SQL: %v", dbPerms.SQL)
 	}
 }
 

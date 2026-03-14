@@ -11,6 +11,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/redis/go-redis/v9"
+	"github.com/redoapp/waypoint/internal/auth"
 	"github.com/redoapp/waypoint/internal/restrict"
 	"github.com/redoapp/waypoint/internal/testutil"
 )
@@ -242,7 +243,7 @@ func TestIntegration_EnsureUser_PermissionGrantFailure(t *testing.T) {
 	_, backend := testutil.PostgresBackend(t)
 
 	// Pass an invalid permission that will fail to GRANT.
-	badPerms := []string{"USAGE ON SCHEMA nonexistent_schema"}
+	badPerms := &auth.DBPermissions{Permissions: []string{"USAGE ON SCHEMA nonexistent_schema"}}
 	pgUser, password, err := p.EnsureUser(ctx, "badperm@example.com", "badperm-node", "waypoint_test", badPerms)
 	if err != nil {
 		t.Fatal(err)
@@ -270,6 +271,48 @@ func TestIntegration_EnsureUser_PermissionGrantFailure(t *testing.T) {
 	}
 	if currentUser != pgUser {
 		t.Fatalf("expected current_user=%q, got %q", pgUser, currentUser)
+	}
+}
+
+func TestIntegration_EnsureUser_SQLStatements(t *testing.T) {
+	p := setupProvisioner(t)
+	ctx := context.Background()
+
+	// Create a table to grant on.
+	conn := adminConn(t)
+	_, err := conn.Exec(ctx, "CREATE TABLE IF NOT EXISTS public.sql_test_table (id int)")
+	if err != nil {
+		t.Fatalf("create test table: %v", err)
+	}
+	t.Cleanup(func() {
+		conn := adminConn(t)
+		conn.Exec(context.Background(), "DROP TABLE IF EXISTS public.sql_test_table")
+	})
+
+	perms := &auth.DBPermissions{
+		SQL: []string{
+			"GRANT SELECT ON public.sql_test_table TO {role}",
+		},
+	}
+	pgUser, password, err := p.EnsureUser(ctx, "sqltest@example.com", "sql-node", "waypoint_test", perms)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { cleanupRole(t, pgUser) })
+
+	// Connect as the provisioned user and verify access.
+	_, backend := testutil.PostgresBackend(t)
+	userConnStr := fmt.Sprintf("postgres://%s:%s@%s/waypoint_test?sslmode=disable", pgUser, password, backend)
+	userConn, err := pgx.Connect(ctx, userConnStr)
+	if err != nil {
+		t.Fatalf("login as provisioned user failed: %v", err)
+	}
+	defer userConn.Close(ctx)
+
+	// The SQL statement should have granted SELECT on the test table.
+	_, err = userConn.Exec(ctx, "SELECT * FROM public.sql_test_table")
+	if err != nil {
+		t.Fatalf("SELECT should succeed after SQL grant: %v", err)
 	}
 }
 

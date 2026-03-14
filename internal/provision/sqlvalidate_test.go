@@ -1,0 +1,498 @@
+package provision
+
+import (
+	"strings"
+	"testing"
+)
+
+func TestTokenize(t *testing.T) {
+	tests := []struct {
+		name      string
+		input     string
+		wantKinds []tokenKind
+		wantErr   bool
+	}{
+		{"empty", "", nil, false},
+		{"whitespace only", "   \t\n  ", nil, false},
+		{"single word", "GRANT", []tokenKind{tokWord}, false},
+		{"multiple words", "GRANT SELECT ON", []tokenKind{tokWord, tokWord, tokWord}, false},
+		{"dot", "public.users", []tokenKind{tokWord, tokDot, tokWord}, false},
+		{"comma", "SELECT, INSERT", []tokenKind{tokWord, tokComma, tokWord}, false},
+		{"star", "*", []tokenKind{tokStar}, false},
+		{"role placeholder", "{role}", []tokenKind{tokRolePH}, false},
+		{"mixed tokens", "GRANT SELECT ON public.users TO {role}",
+			[]tokenKind{tokWord, tokWord, tokWord, tokWord, tokDot, tokWord, tokWord, tokRolePH}, false},
+		{"underscore identifier", "my_schema.my_table", []tokenKind{tokWord, tokDot, tokWord}, false},
+		{"digits in identifier", "schema1.table2", []tokenKind{tokWord, tokDot, tokWord}, false},
+
+		// Rejected characters.
+		{"semicolon", "GRANT;", nil, true},
+		{"parenthesis open", "GRANT(", nil, true},
+		{"parenthesis close", ")", nil, true},
+		{"single quote", "'hello'", nil, true},
+		{"double quote", "\"hello\"", nil, true},
+		{"equals", "x=1", nil, true},
+		{"dash dash comment", "GRANT -- comment", nil, true},
+		{"slash", "GRANT /", nil, true},
+		{"backslash", "GRANT \\", nil, true},
+		{"at sign", "user@host", nil, true},
+		{"hash", "GRANT #", nil, true},
+		{"dollar", "$1", nil, true},
+		{"colon", "GRANT:", nil, true},
+		{"exclamation", "GRANT!", nil, true},
+		{"pipe", "GRANT|", nil, true},
+		{"ampersand", "GRANT&", nil, true},
+		{"plus", "1+1", nil, true},
+		{"backtick", "`table`", nil, true},
+		{"curly brace not role", "{notarole}", nil, true},
+		{"open brace alone", "{", nil, true},
+		{"incomplete role placeholder", "{rol}", nil, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tokens, err := tokenize(tt.input)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("tokenize(%q) error = %v, wantErr %v", tt.input, err, tt.wantErr)
+				return
+			}
+			if !tt.wantErr && len(tokens) != len(tt.wantKinds) {
+				t.Errorf("tokenize(%q) got %d tokens, want %d", tt.input, len(tokens), len(tt.wantKinds))
+				return
+			}
+			for i, tok := range tokens {
+				if tok.kind != tt.wantKinds[i] {
+					t.Errorf("token[%d] kind = %v, want %v", i, tok.kind, tt.wantKinds[i])
+				}
+			}
+		})
+	}
+}
+
+func TestTokenize_WordsAreLowercased(t *testing.T) {
+	tokens, err := tokenize("GRANT Select ON Public.Users TO")
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := []string{"grant", "select", "on", "public", "users", "to"}
+	words := 0
+	for _, tok := range tokens {
+		if tok.kind == tokWord {
+			if tok.text != expected[words] {
+				t.Errorf("word[%d] = %q, want %q", words, tok.text, expected[words])
+			}
+			words++
+		}
+	}
+	if words != len(expected) {
+		t.Errorf("got %d words, want %d", words, len(expected))
+	}
+}
+
+func TestValidateSQL_Grants(t *testing.T) {
+	valid := []struct {
+		name string
+		stmt string
+	}{
+		{"select on table", "GRANT SELECT ON public.users TO {role}"},
+		{"insert on table", "GRANT INSERT ON public.users TO {role}"},
+		{"update on table", "GRANT UPDATE ON public.users TO {role}"},
+		{"delete on table", "GRANT DELETE ON public.users TO {role}"},
+		{"truncate on table", "GRANT TRUNCATE ON public.users TO {role}"},
+		{"references on table", "GRANT REFERENCES ON public.users TO {role}"},
+		{"trigger on table", "GRANT TRIGGER ON public.users TO {role}"},
+		{"multiple privileges", "GRANT SELECT, INSERT, UPDATE ON public.users TO {role}"},
+		{"all privileges", "GRANT ALL PRIVILEGES ON public.users TO {role}"},
+		{"all on table", "GRANT ALL ON public.users TO {role}"},
+		{"usage on schema", "GRANT USAGE ON SCHEMA public TO {role}"},
+		{"create on schema", "GRANT CREATE ON SCHEMA public TO {role}"},
+		{"usage create on schema", "GRANT USAGE, CREATE ON SCHEMA public TO {role}"},
+		{"connect on database", "GRANT CONNECT ON DATABASE mydb TO {role}"},
+		{"temporary on database", "GRANT TEMPORARY ON DATABASE mydb TO {role}"},
+		{"temp on database", "GRANT TEMP ON DATABASE mydb TO {role}"},
+		{"create on database", "GRANT CREATE ON DATABASE mydb TO {role}"},
+		{"all tables in schema", "GRANT SELECT ON ALL TABLES IN SCHEMA public TO {role}"},
+		{"all sequences in schema", "GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO {role}"},
+		{"all functions in schema", "GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public TO {role}"},
+		{"all routines in schema", "GRANT EXECUTE ON ALL ROUTINES IN SCHEMA public TO {role}"},
+		{"select insert on all tables", "GRANT SELECT, INSERT ON ALL TABLES IN SCHEMA public TO {role}"},
+		{"unqualified table", "GRANT SELECT ON users TO {role}"},
+		{"schema qualified table", "GRANT SELECT ON myschema.mytable TO {role}"},
+		{"table keyword", "GRANT SELECT ON TABLE public.users TO {role}"},
+		{"sequence keyword", "GRANT USAGE ON SEQUENCE public.my_seq TO {role}"},
+		{"lowercase", "grant select on public.users to {role}"},
+		{"mixed case", "Grant Select On Public.Users To {role}"},
+		{"extra whitespace", "  GRANT  SELECT  ON  public.users  TO  {role}  "},
+	}
+
+	for _, tt := range valid {
+		t.Run("valid/"+tt.name, func(t *testing.T) {
+			if err := validateSQL([]string{tt.stmt}); err != nil {
+				t.Errorf("expected valid, got error: %v", err)
+			}
+		})
+	}
+}
+
+func TestValidateSQL_Revokes(t *testing.T) {
+	valid := []struct {
+		name string
+		stmt string
+	}{
+		{"select on table", "REVOKE SELECT ON public.users FROM {role}"},
+		{"multiple privileges", "REVOKE SELECT, INSERT ON public.users FROM {role}"},
+		{"all privileges", "REVOKE ALL PRIVILEGES ON public.users FROM {role}"},
+		{"usage on schema", "REVOKE USAGE ON SCHEMA public FROM {role}"},
+		{"all tables in schema", "REVOKE SELECT ON ALL TABLES IN SCHEMA public FROM {role}"},
+		{"connect on database", "REVOKE CONNECT ON DATABASE mydb FROM {role}"},
+	}
+
+	for _, tt := range valid {
+		t.Run("valid/"+tt.name, func(t *testing.T) {
+			if err := validateSQL([]string{tt.stmt}); err != nil {
+				t.Errorf("expected valid, got error: %v", err)
+			}
+		})
+	}
+}
+
+func TestValidateSQL_AlterDefaultPrivileges(t *testing.T) {
+	valid := []struct {
+		name string
+		stmt string
+	}{
+		{"grant select on tables", "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO {role}"},
+		{"grant all on tables", "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO {role}"},
+		{"grant usage on sequences", "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE ON SEQUENCES TO {role}"},
+		{"grant execute on functions", "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT EXECUTE ON FUNCTIONS TO {role}"},
+		{"grant execute on routines", "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT EXECUTE ON ROUTINES TO {role}"},
+		{"grant usage on types", "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE ON TYPES TO {role}"},
+		{"revoke select on tables", "ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE SELECT ON TABLES FROM {role}"},
+		{"for role clause", "ALTER DEFAULT PRIVILEGES FOR ROLE admin IN SCHEMA public GRANT SELECT ON TABLES TO {role}"},
+		{"for role without schema", "ALTER DEFAULT PRIVILEGES FOR ROLE admin GRANT SELECT ON TABLES TO {role}"},
+		{"schema without for role", "ALTER DEFAULT PRIVILEGES IN SCHEMA analytics GRANT SELECT ON TABLES TO {role}"},
+		{"no optional clauses", "ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO {role}"},
+		{"multiple schemas", "ALTER DEFAULT PRIVILEGES IN SCHEMA public, analytics GRANT SELECT ON TABLES TO {role}"},
+	}
+
+	for _, tt := range valid {
+		t.Run("valid/"+tt.name, func(t *testing.T) {
+			if err := validateSQL([]string{tt.stmt}); err != nil {
+				t.Errorf("expected valid, got error: %v", err)
+			}
+		})
+	}
+}
+
+func TestValidateSQL_RejectedStatementTypes(t *testing.T) {
+	rejected := []struct {
+		name string
+		stmt string
+	}{
+		{"drop table", "DROP TABLE public.users"},
+		{"drop schema", "DROP SCHEMA public"},
+		{"drop database", "DROP DATABASE mydb"},
+		{"drop role", "DROP ROLE myrole"},
+		{"create table", "CREATE TABLE public.test (id int)"},
+		{"create role", "CREATE ROLE hacker WITH SUPERUSER"},
+		{"create database", "CREATE DATABASE evil"},
+		{"alter table", "ALTER TABLE public.users ADD COLUMN x INT"},
+		{"alter role", "ALTER ROLE admin WITH SUPERUSER"},
+		{"delete", "DELETE FROM public.users"},
+		{"insert", "INSERT INTO public.users VALUES (1)"},
+		{"update", "UPDATE public.users SET name = 'x'"},
+		{"select", "SELECT * FROM pg_shadow"},
+		{"truncate", "TRUNCATE public.users"},
+		{"copy", "COPY public.users TO '/tmp/out'"},
+		{"execute", "EXECUTE my_plan"},
+		{"explain", "EXPLAIN SELECT 1"},
+		{"set", "SET ROLE admin"},
+		{"reset", "RESET ROLE"},
+		{"begin", "BEGIN"},
+		{"commit", "COMMIT"},
+		{"rollback", "ROLLBACK"},
+	}
+
+	for _, tt := range rejected {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateSQL([]string{tt.stmt})
+			if err == nil {
+				t.Errorf("expected rejection for %q", tt.stmt)
+			}
+		})
+	}
+}
+
+func TestValidateSQL_InjectionAttempts(t *testing.T) {
+	rejected := []struct {
+		name string
+		stmt string
+	}{
+		{"semicolon after valid", "GRANT SELECT ON public.users TO {role}; DROP TABLE public.users"},
+		{"semicolon before valid", ";GRANT SELECT ON public.users TO {role}"},
+		{"parenthesized subquery", "GRANT SELECT ON (SELECT tablename FROM pg_tables) TO {role}"},
+		{"single quoted string", "GRANT SELECT ON 'public.users' TO {role}"},
+		{"double quoted identifier", "GRANT SELECT ON \"public\".\"users\" TO {role}"},
+		{"line comment", "GRANT SELECT ON public.users TO {role} -- drop table"},
+		{"block comment", "GRANT SELECT ON public.users /* evil */ TO {role}"},
+		{"dollar quoting", "GRANT SELECT ON $$evil$$ TO {role}"},
+		{"backslash escape", "GRANT SELECT ON public\\.users TO {role}"},
+		{"null byte", "GRANT SELECT ON public.users TO {role}\x00"},
+		{"unicode escape", "GRANT SELECT ON U&\"\\0041\" TO {role}"},
+		{"cast expression", "GRANT SELECT ON public.users::text TO {role}"},
+		{"concatenation", "GRANT SELECT ON public.users || 'x' TO {role}"},
+		{"function call", "GRANT EXECUTE ON FUNCTION pg_sleep(10) TO {role}"},
+	}
+
+	for _, tt := range rejected {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateSQL([]string{tt.stmt})
+			if err == nil {
+				t.Errorf("expected rejection for injection attempt: %q", tt.stmt)
+			}
+		})
+	}
+}
+
+func TestValidateSQL_StructuralErrors(t *testing.T) {
+	rejected := []struct {
+		name string
+		stmt string
+	}{
+		{"empty string", ""},
+		{"whitespace only", "   \t\n  "},
+		{"grant no privileges", "GRANT ON public.users TO {role}"},
+		{"grant no on", "GRANT SELECT TO {role}"},
+		{"grant no to", "GRANT SELECT ON public.users"},
+		{"grant no target", "GRANT SELECT ON TO {role}"},
+		{"grant no role ref", "GRANT SELECT ON public.users TO admin"},
+		{"revoke no from", "REVOKE SELECT ON public.users"},
+		{"revoke no role ref", "REVOKE SELECT ON public.users FROM admin"},
+		{"alter missing default", "ALTER PRIVILEGES GRANT SELECT ON TABLES TO {role}"},
+		{"alter missing privileges", "ALTER DEFAULT GRANT SELECT ON TABLES TO {role}"},
+		{"alter default privileges no body", "ALTER DEFAULT PRIVILEGES IN SCHEMA public"},
+		{"alter default privileges invalid body", "ALTER DEFAULT PRIVILEGES DROP TABLE foo"},
+		{"alter for without role keyword", "ALTER DEFAULT PRIVILEGES FOR admin GRANT SELECT ON TABLES TO {role}"},
+		{"alter in without schema keyword", "ALTER DEFAULT PRIVILEGES IN public GRANT SELECT ON TABLES TO {role}"},
+		{"unknown privilege keyword", "GRANT SUPERUSER ON public.users TO {role}"},
+		{"just grant keyword", "GRANT"},
+		{"just revoke keyword", "REVOKE"},
+		{"just alter keyword", "ALTER"},
+	}
+
+	for _, tt := range rejected {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateSQL([]string{tt.stmt})
+			if err == nil {
+				t.Errorf("expected rejection for structural error: %q", tt.stmt)
+			}
+		})
+	}
+}
+
+func TestValidateSQL_Malicious(t *testing.T) {
+	rejected := []struct {
+		name string
+		stmt string
+	}{
+		// Privilege escalation: grant to additional roles besides {role}.
+		{"grant to extra role before placeholder", "GRANT SELECT ON public.users TO admin, {role}"},
+		{"grant to extra role via group keyword", "GRANT SELECT ON public.users TO GROUP {role}"},
+		{"revoke from extra role", "REVOKE SELECT ON public.users FROM admin, {role}"},
+
+		// WITH GRANT OPTION allows the grantee to re-grant privileges.
+		{"with grant option", "GRANT SELECT ON public.users TO {role} WITH GRANT OPTION"},
+		{"with admin option", "GRANT somerole TO {role} WITH ADMIN OPTION"},
+
+		// Unicode homoglyph attacks: Cyrillic letters look like Latin.
+		// Cyrillic 'а' (U+0430) looks like Latin 'a'.
+		{"cyrillic a in grant keyword", "GR\u0430NT SELECT ON public.users TO {role}"},
+		// Cyrillic 'о' (U+043E) looks like Latin 'o'.
+		{"cyrillic o in on keyword", "GRANT SELECT \u043EN public.users TO {role}"},
+		// Cyrillic 'с' (U+0441) looks like Latin 'c'.
+		{"cyrillic c in select keyword", "GRANT SELE\u0441T ON public.users TO {role}"},
+		// Cyrillic letter in identifier — could spoof a different table.
+		{"cyrillic in identifier", "GRANT SELECT ON \u0440ublic.users TO {role}"},
+
+		// Unicode whitespace tricks.
+		// Non-breaking space (U+00A0) could visually hide token boundaries.
+		{"non-breaking space hides extra role", "GRANT SELECT ON public.users TO\u00A0admin {role}"},
+		// Ogham space (U+1680) same trick.
+		{"ogham space hides extra role", "GRANT SELECT ON public.users TO\u1680admin {role}"},
+		// Ideographic space (U+3000).
+		{"ideographic space", "GRANT SELECT ON public.users TO\u3000{role}"},
+		// Zero-width space (U+200B) — category Cf, not Zs.
+		{"zero width space", "GRANT SELECT ON public.users\u200BTO {role}"},
+
+		// Role placeholder in wrong position — injects role name into target.
+		{"role placeholder in target", "GRANT SELECT ON {role} TO {role}"},
+		{"role placeholder in privilege", "GRANT {role} ON public.users TO {role}"},
+		{"role placeholder as schema name", "GRANT USAGE ON SCHEMA {role} TO {role}"},
+
+		// Degenerate privilege lists.
+		{"only commas as privileges", "GRANT , , ON public.users TO {role}"},
+		{"trailing comma in privileges", "GRANT SELECT, ON public.users TO {role}"},
+		{"leading comma in privileges", "GRANT , SELECT ON public.users TO {role}"},
+
+		// Degenerate targets.
+		{"only dots in target", "GRANT SELECT ON ... TO {role}"},
+		{"only star in target", "GRANT SELECT ON * TO {role}"},
+
+		// Excessively long inputs (potential resource abuse).
+		{"extremely long identifier", "GRANT SELECT ON " + strings.Repeat("a", 10000) + " TO {role}"},
+	}
+
+	for _, tt := range rejected {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateSQL([]string{tt.stmt})
+			if err == nil {
+				t.Errorf("expected rejection for malicious statement: %q", tt.stmt)
+			}
+		})
+	}
+
+	// These are syntactically valid grants where PG enforces its own access
+	// control. The parser allows them — PG will reject unauthorized access.
+	allowed := []struct {
+		name string
+		stmt string
+	}{
+		{"system catalog table", "GRANT SELECT ON pg_catalog.pg_authid TO {role}"},
+		{"pg_shadow", "GRANT SELECT ON pg_shadow TO {role}"},
+		{"information_schema", "GRANT SELECT ON information_schema.role_table_grants TO {role}"},
+		{"identifier named exec", "GRANT SELECT ON exec TO {role}"},
+		{"identifier named drop", "GRANT SELECT ON drop.my_table TO {role}"},
+	}
+
+	for _, tt := range allowed {
+		t.Run("allowed/"+tt.name, func(t *testing.T) {
+			if err := validateSQL([]string{tt.stmt}); err != nil {
+				t.Errorf("expected valid (PG enforces access), got error: %v", err)
+			}
+		})
+	}
+}
+
+func TestValidateSQL_TargetEdgeCases(t *testing.T) {
+	rejected := []struct {
+		name string
+		stmt string
+	}{
+		// Dot placement.
+		{"leading dot", "GRANT SELECT ON .users TO {role}"},
+		{"trailing dot", "GRANT SELECT ON public. TO {role}"},
+		{"double dot", "GRANT SELECT ON public..users TO {role}"},
+		{"triple dot", "GRANT SELECT ON public...users TO {role}"},
+		{"dot only", "GRANT SELECT ON . TO {role}"},
+
+		// Comma placement.
+		{"leading comma in target", "GRANT SELECT ON , public.users TO {role}"},
+		{"trailing comma in target", "GRANT SELECT ON public.users, TO {role}"},
+		{"double comma in target", "GRANT SELECT ON public.users,, analytics.events TO {role}"},
+		{"comma only target", "GRANT SELECT ON , TO {role}"},
+
+		// Star placement — only valid after ALL keyword (ALL TABLES IN SCHEMA).
+		{"star dot name", "GRANT SELECT ON *.users TO {role}"},
+		{"name dot star", "GRANT SELECT ON public.* TO {role}"},
+		{"bare star", "GRANT SELECT ON * TO {role}"},
+		{"star star", "GRANT SELECT ON * * TO {role}"},
+
+		// Nonsense keyword combinations.
+		{"repeated keywords", "GRANT SELECT ON ALL ALL ALL TO {role}"},
+		{"in without schema", "GRANT SELECT ON ALL TABLES IN public TO {role}"},
+		{"schema without in", "GRANT SELECT ON ALL TABLES SCHEMA public TO {role}"},
+		{"all without object type", "GRANT SELECT ON ALL IN SCHEMA public TO {role}"},
+		{"database without name", "GRANT SELECT ON DATABASE TO {role}"},
+		{"schema keyword without name", "GRANT USAGE ON SCHEMA TO {role}"},
+
+		// Excessive depth (schema.table is max 2 parts).
+		{"triple qualified", "GRANT SELECT ON a.b.c TO {role}"},
+		{"quad qualified", "GRANT SELECT ON a.b.c.d TO {role}"},
+	}
+
+	for _, tt := range rejected {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateSQL([]string{tt.stmt})
+			if err == nil {
+				t.Errorf("expected rejection for target edge case: %q", tt.stmt)
+			}
+		})
+	}
+}
+
+func TestValidateSQL_PrivilegeEdgeCases(t *testing.T) {
+	rejected := []struct {
+		name string
+		stmt string
+	}{
+		// Consecutive commas.
+		{"double comma", "GRANT SELECT,, INSERT ON public.users TO {role}"},
+		{"triple comma", "GRANT SELECT,,, INSERT ON public.users TO {role}"},
+
+		// ALL mixed with specific privileges — PG doesn't allow this.
+		{"all plus specific", "GRANT ALL, SELECT ON public.users TO {role}"},
+		{"specific plus all", "GRANT SELECT, ALL ON public.users TO {role}"},
+
+		// PRIVILEGES without ALL.
+		{"privileges alone", "GRANT PRIVILEGES ON public.users TO {role}"},
+	}
+
+	for _, tt := range rejected {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateSQL([]string{tt.stmt})
+			if err == nil {
+				t.Errorf("expected rejection for privilege edge case: %q", tt.stmt)
+			}
+		})
+	}
+}
+
+func TestValidateSQL_ResourceLimits(t *testing.T) {
+	rejected := []struct {
+		name string
+		stmt string
+	}{
+		// Excessive token count.
+		{"too many commas and names", "GRANT SELECT ON " + strings.Repeat("tbl, ", 500) + "tbl TO {role}"},
+	}
+
+	for _, tt := range rejected {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateSQL([]string{tt.stmt})
+			if err == nil {
+				t.Errorf("expected rejection for resource limit: %q", tt.stmt[:80]+"...")
+			}
+		})
+	}
+}
+
+func TestValidateSQL_MultipleStatements(t *testing.T) {
+	// All valid.
+	err := validateSQL([]string{
+		"GRANT SELECT ON public.users TO {role}",
+		"GRANT USAGE ON SCHEMA analytics TO {role}",
+		"ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO {role}",
+		"REVOKE DELETE ON public.users FROM {role}",
+	})
+	if err != nil {
+		t.Errorf("all valid statements should pass: %v", err)
+	}
+
+	// First invalid stops validation.
+	err = validateSQL([]string{
+		"DROP TABLE public.users",
+		"GRANT SELECT ON public.users TO {role}",
+	})
+	if err == nil {
+		t.Error("should reject when first statement is invalid")
+	}
+
+	// Last invalid stops validation.
+	err = validateSQL([]string{
+		"GRANT SELECT ON public.users TO {role}",
+		"SELECT 1",
+	})
+	if err == nil {
+		t.Error("should reject when last statement is invalid")
+	}
+}

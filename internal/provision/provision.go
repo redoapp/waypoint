@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/redoapp/waypoint/internal/auth"
 	"github.com/redoapp/waypoint/internal/restrict"
 )
 
@@ -46,7 +47,7 @@ func NewProvisioner(adminUser, adminPassword, adminDatabase, backend, userPrefix
 
 // EnsureUser creates or updates a dynamic PG role for the given identity,
 // node, and database. Returns the PG username and password.
-func (p *Provisioner) EnsureUser(ctx context.Context, loginName, nodeName, database string, permissions []string) (string, string, error) {
+func (p *Provisioner) EnsureUser(ctx context.Context, loginName, nodeName, database string, perms *auth.DBPermissions) (string, string, error) {
 	pgUser := p.formatUsername(loginName, nodeName, database)
 
 	conn, err := pgx.Connect(ctx, p.adminConnStr)
@@ -109,11 +110,25 @@ func (p *Provisioner) EnsureUser(ctx context.Context, loginName, nodeName, datab
 		p.logger.Warn("grant connect failed", "role", pgUser, "database", database, "error", err)
 	}
 
-	// Apply permission grants.
-	for _, perm := range permissions {
-		stmt := fmt.Sprintf("GRANT %s TO %s", perm, pgx.Identifier{pgUser}.Sanitize())
-		if _, err := conn.Exec(ctx, stmt); err != nil {
-			p.logger.Warn("grant failed", "role", pgUser, "grant", perm, "error", err)
+	// Apply permission grants and raw SQL statements.
+	if perms != nil {
+		sanitizedRole := pgx.Identifier{pgUser}.Sanitize()
+
+		for _, perm := range perms.Permissions {
+			stmt := fmt.Sprintf("GRANT %s TO %s", perm, sanitizedRole)
+			if _, err := conn.Exec(ctx, stmt); err != nil {
+				p.logger.Warn("grant failed", "role", pgUser, "grant", perm, "error", err)
+			}
+		}
+
+		if err := validateSQL(perms.SQL); err != nil {
+			return "", "", fmt.Errorf("invalid sql in permissions: %w", err)
+		}
+		for _, raw := range perms.SQL {
+			resolved := strings.ReplaceAll(raw, "{role}", sanitizedRole)
+			if _, err := conn.Exec(ctx, resolved); err != nil {
+				p.logger.Warn("sql statement failed", "role", pgUser, "sql", raw, "error", err)
+			}
 		}
 	}
 

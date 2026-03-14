@@ -14,9 +14,10 @@ type PGCap struct {
 	Databases map[string]DBPermissions `json:"databases"`
 }
 
-// DBPermissions lists SQL GRANT statements for a database.
+// DBPermissions lists SQL GRANT statements and raw SQL for a database.
 type DBPermissions struct {
 	Permissions []string `json:"permissions"`
+	SQL         []string `json:"sql,omitempty"`
 }
 
 // LimitsCap defines per-user restriction overrides from ACL grants.

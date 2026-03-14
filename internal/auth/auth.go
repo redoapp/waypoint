@@ -83,10 +83,11 @@ func Authorize(ctx context.Context, lc *local.Client, remoteAddr string, backend
 	}, nil
 }
 
-// DatabasePermissions returns the merged SQL permissions for a specific database
+// DatabasePermissions returns the merged permissions for a specific database
 // from the matched rules. Returns nil if no rules grant access to the database.
-func DatabasePermissions(result *AuthResult, database string) []string {
+func DatabasePermissions(result *AuthResult, database string) *DBPermissions {
 	var perms []string
+	var sql []string
 	found := false
 
 	for _, r := range result.MatchedRules {
@@ -96,11 +97,13 @@ func DatabasePermissions(result *AuthResult, database string) []string {
 		// Check for exact database match.
 		if db, ok := r.PG.Databases[database]; ok {
 			perms = append(perms, db.Permissions...)
+			sql = append(sql, db.SQL...)
 			found = true
 		}
 		// Check for wildcard.
 		if db, ok := r.PG.Databases["*"]; ok {
 			perms = append(perms, db.Permissions...)
+			sql = append(sql, db.SQL...)
 			found = true
 		}
 	}
@@ -108,7 +111,10 @@ func DatabasePermissions(result *AuthResult, database string) []string {
 	if !found {
 		return nil
 	}
-	return perms
+	return &DBPermissions{
+		Permissions: perms,
+		SQL:         sql,
+	}
 }
 
 // mergeRules collects all permissions and picks the most restrictive limits.
