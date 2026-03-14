@@ -7,17 +7,15 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/redoapp/waypoint/internal/auth"
 	"github.com/redoapp/waypoint/internal/metrics"
 	"github.com/redoapp/waypoint/internal/restrict"
-	"tailscale.com/client/local"
 )
 
 // TCPProxy handles raw TCP proxying with Tailscale auth and limits.
 type TCPProxy struct {
 	Backend      string
 	Name         string
-	LC           *local.Client
+	Auth         Authorizer
 	Tracker      *restrict.Tracker
 	Metrics      *metrics.Metrics
 	Logger       *slog.Logger
@@ -36,7 +34,7 @@ func (p *TCPProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 	// Auth.
 	m.AuthAttempts.Add(ctx, 1, m.Attrs("waypoint.auth.attempts", listenerAttr))
 	authStart := time.Now()
-	result, err := auth.Authorize(ctx, p.LC, clientConn.RemoteAddr().String(), p.Name)
+	result, err := p.Auth.Authorize(ctx, clientConn.RemoteAddr().String(), p.Name)
 	authDur := time.Since(authStart).Seconds()
 	m.AuthLatency.Record(ctx, authDur, m.Attrs("waypoint.auth.latency", listenerAttr))
 	if err != nil {

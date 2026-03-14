@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/redoapp/waypoint/internal/metrics"
 	"github.com/redoapp/waypoint/internal/restrict"
 	"github.com/redoapp/waypoint/internal/testutil"
 )
@@ -18,12 +19,13 @@ import (
 func setupCleaner(t *testing.T, ttl time.Duration) (*Cleaner, *Provisioner, *restrict.RedisStore) {
 	t.Helper()
 	rdb := testutil.RedisClient(t)
-	store := restrict.NewRedisStore(rdb, "inttest:")
+	m := metrics.Noop()
+	store := restrict.NewRedisStore(rdb, "inttest:", m)
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
 	_, backend := testutil.PostgresBackend(t)
 
 	provisioner := NewProvisioner("admin", "adminpass", "waypoint_test", backend, "wp_", store, logger)
-	cleaner := NewCleaner("admin", "adminpass", "waypoint_test", backend, "wp_", ttl, store, logger)
+	cleaner := NewCleaner("admin", "adminpass", "waypoint_test", backend, "wp_", ttl, store, m, logger)
 
 	return cleaner, provisioner, store
 }

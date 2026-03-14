@@ -13,7 +13,6 @@ import (
 	"github.com/redoapp/waypoint/internal/pgwire"
 	"github.com/redoapp/waypoint/internal/provision"
 	"github.com/redoapp/waypoint/internal/restrict"
-	"tailscale.com/client/local"
 )
 
 // PostgresProxy handles PG-aware proxying with Tailscale auth,
@@ -21,7 +20,7 @@ import (
 type PostgresProxy struct {
 	Backend       string
 	Name          string
-	LC            *local.Client
+	Auth          Authorizer
 	Tracker       *restrict.Tracker
 	Provisioner   *provision.Provisioner
 	Metrics       *metrics.Metrics
@@ -43,7 +42,7 @@ func (p *PostgresProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 	// Step 1: Authorize via Tailscale identity.
 	m.AuthAttempts.Add(ctx, 1, m.Attrs("waypoint.auth.attempts", listenerAttr))
 	authStart := time.Now()
-	result, err := auth.Authorize(ctx, p.LC, clientConn.RemoteAddr().String(), p.Name)
+	result, err := p.Auth.Authorize(ctx, clientConn.RemoteAddr().String(), p.Name)
 	authDur := time.Since(authStart).Seconds()
 	m.AuthLatency.Record(ctx, authDur, m.Attrs("waypoint.auth.latency", listenerAttr))
 	if err != nil {
@@ -138,7 +137,8 @@ func (p *PostgresProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 	}
 
 	// Step 8: Handle upstream auth.
-	if err := pgwire.HandleUpstreamAuth(backendConn, pgUser, pgPass); err != nil {
+	upstreamFE, err := pgwire.HandleUpstreamAuth(backendConn, pgUser, pgPass)
+	if err != nil {
 		p.Logger.Error("upstream auth failed", "user", pgUser, "error", err)
 		pgwire.SendErrorResponse(clientConn, "FATAL", "28P01", "backend authentication failed")
 		return
@@ -151,7 +151,7 @@ func (p *PostgresProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 	}
 
 	// Step 10: Forward post-auth messages (ParameterStatus, BackendKeyData, ReadyForQuery).
-	if err := pgwire.ForwardPostAuth(backendConn, clientConn); err != nil {
+	if err := pgwire.ForwardPostAuth(upstreamFE, clientConn); err != nil {
 		p.Logger.Error("forward post-auth failed", "error", err)
 		return
 	}
@@ -197,7 +197,7 @@ func (p *PostgresProxy) revalidateLoop(ctx context.Context, clientConn, backendC
 			return
 		case <-ticker.C:
 			m.RevalAttempts.Add(ctx, 1, m.Attrs("waypoint.reval.attempts", listenerAttr))
-			result, err := auth.Authorize(ctx, p.LC, clientConn.RemoteAddr().String(), p.Name)
+			result, err := p.Auth.Authorize(ctx, clientConn.RemoteAddr().String(), p.Name)
 			if err != nil {
 				m.RevalFailures.Add(ctx, 1, m.Attrs("waypoint.reval.failures", listenerAttr))
 				p.Logger.Warn("revalidation failed, closing connection",

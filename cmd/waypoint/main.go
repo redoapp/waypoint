@@ -136,7 +136,7 @@ func main() {
 			p := &proxy.TCPProxy{
 				Backend:      lCfg.Backend,
 				Name:         lCfg.Name,
-				LC:           lc,
+				Auth:         &proxy.TailscaleAuthorizer{LC: lc},
 				Tracker:      tracker,
 				Metrics:      m,
 				Logger:       logger.With("listener", lCfg.Name),
@@ -164,7 +164,7 @@ func main() {
 			p := &proxy.PostgresProxy{
 				Backend:       lCfg.Backend,
 				Name:          lCfg.Name,
-				LC:            lc,
+				Auth:          &proxy.TailscaleAuthorizer{LC: lc},
 				Tracker:       tracker,
 				Provisioner:   provisioner,
 				Metrics:       m,

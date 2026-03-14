@@ -23,43 +23,45 @@ func SendAuthOK(conn net.Conn) error {
 
 // HandleUpstreamAuth handles the authentication exchange with the upstream
 // PostgreSQL server. Supports CleartextPassword, MD5Password, and
-// SASL (SCRAM-SHA-256).
-func HandleUpstreamAuth(conn net.Conn, user, password string) error {
+// SASL (SCRAM-SHA-256). Returns the pgproto3 Frontend so that callers
+// (e.g. ForwardPostAuth) can continue reading from the same buffered reader.
+func HandleUpstreamAuth(conn net.Conn, user, password string) (*pgproto3.Frontend, error) {
 	backend := pgproto3.NewFrontend(conn, conn)
 
 	for {
 		msg, err := backend.Receive()
 		if err != nil {
-			return fmt.Errorf("receive auth message: %w", err)
+			return nil, fmt.Errorf("receive auth message: %w", err)
 		}
 
 		switch m := msg.(type) {
 		case *pgproto3.AuthenticationOk:
-			return nil
+			return backend, nil
 
 		case *pgproto3.AuthenticationCleartextPassword:
 			resp := &pgproto3.PasswordMessage{Password: password}
 			if err := writeMsg(conn, resp); err != nil {
-				return fmt.Errorf("send cleartext password: %w", err)
+				return nil, fmt.Errorf("send cleartext password: %w", err)
 			}
 
 		case *pgproto3.AuthenticationMD5Password:
 			hash := md5Hash(password, user, m.Salt)
 			resp := &pgproto3.PasswordMessage{Password: hash}
 			if err := writeMsg(conn, resp); err != nil {
-				return fmt.Errorf("send md5 password: %w", err)
+				return nil, fmt.Errorf("send md5 password: %w", err)
 			}
 
 		case *pgproto3.AuthenticationSASL:
 			if err := handleSCRAM(conn, backend, user, password, m); err != nil {
-				return fmt.Errorf("SCRAM auth: %w", err)
+				return nil, fmt.Errorf("SCRAM auth: %w", err)
 			}
+			return backend, nil
 
 		case *pgproto3.ErrorResponse:
-			return fmt.Errorf("upstream auth error: %s (code %s)", m.Message, m.Code)
+			return nil, fmt.Errorf("upstream auth error: %s (code %s)", m.Message, m.Code)
 
 		default:
-			return fmt.Errorf("unexpected auth message type: %T", msg)
+			return nil, fmt.Errorf("unexpected auth message type: %T", msg)
 		}
 	}
 }
@@ -79,10 +81,9 @@ func writeMsg(conn net.Conn, msg encodable) error {
 
 // ForwardPostAuth forwards ParameterStatus, BackendKeyData, and
 // ReadyForQuery messages from upstream to the client. Returns when
-// ReadyForQuery is received.
-func ForwardPostAuth(upstream, client net.Conn) error {
-	fe := pgproto3.NewFrontend(upstream, upstream)
-
+// ReadyForQuery is received. The fe parameter should be the Frontend
+// returned by HandleUpstreamAuth to share the same buffered reader.
+func ForwardPostAuth(fe *pgproto3.Frontend, client net.Conn) error {
 	for {
 		msg, err := fe.Receive()
 		if err != nil {

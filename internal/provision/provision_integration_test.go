@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/redis/go-redis/v9"
 	"github.com/redoapp/waypoint/internal/auth"
+	"github.com/redoapp/waypoint/internal/metrics"
 	"github.com/redoapp/waypoint/internal/restrict"
 	"github.com/redoapp/waypoint/internal/testutil"
 )
@@ -19,7 +20,7 @@ import (
 func setupProvisioner(t *testing.T) *Provisioner {
 	t.Helper()
 	rdb := testutil.RedisClient(t)
-	store := restrict.NewRedisStore(rdb, "inttest:")
+	store := restrict.NewRedisStore(rdb, "inttest:", metrics.Noop())
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
 	_, backend := testutil.PostgresBackend(t)
 	return NewProvisioner("admin", "adminpass", "waypoint_test", backend, "wp_", store, logger)

@@ -186,7 +186,7 @@ func TestForwardPostAuth(t *testing.T) {
 	// ForwardPostAuth should relay all to client.
 	done := make(chan error, 1)
 	go func() {
-		done <- ForwardPostAuth(upstream, client)
+		done <- ForwardPostAuth(pgproto3.NewFrontend(upstream, upstream), client)
 	}()
 
 	// Read from client side.
