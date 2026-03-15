@@ -29,17 +29,20 @@
   '';
 
   scripts.coverage.exec = ''
-    mkdir -p coverage
-    go test -coverprofile=coverage/coverage.out -covermode=atomic ./... "$@"
-    go tool cover -func=coverage/coverage.out
-    go tool cover -html=coverage/coverage.out -o coverage/coverage.html
-    echo ""
-    echo "Coverage report: coverage/coverage.html"
+    bash scripts/coverage.sh "$@"
+  '';
+
+  scripts.coverage-unit.exec = ''
+    SKIP_INTEGRATION=1 bash scripts/coverage.sh "$@"
+  '';
+
+  scripts.coverage-serve.exec = ''
+    SERVE=":8080" bash scripts/coverage.sh "$@"
   '';
 
   enterShell = ''
     echo "Go: $(go version)"
     echo "Valkey service configured (start with 'devenv up')"
-    echo "Commands: test, coverage"
+    echo "Commands: test, coverage, coverage-unit, coverage-serve"
   '';
 }

@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 jobs:
-  test:
+  unit-tests:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -18,15 +18,111 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Run tests with coverage
-        run: go test -coverprofile=coverage.out -covermode=atomic -race ./...
+      - name: Run unit tests with coverage
+        run: |
+          mkdir -p coverage
+          go test -coverprofile=coverage/unit.raw -covermode=atomic -race ./...
 
-      - name: Display coverage summary
-        run: go tool cover -func=coverage.out
+      - name: Filter coverage profile
+        run: |
+          pattern=$(grep -v '^#' .coverignore | grep -v '^$' | paste -sd'|' -)
+          grep -v -E "$pattern" coverage/unit.raw > coverage/unit.out
 
-      - name: Upload coverage artifact
+      - name: Display unit coverage summary
+        run: go tool cover -func=coverage/unit.out | tail -1
+
+      - name: Upload unit coverage
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-unit
+          path: coverage/unit.out
+          retention-days: 30
+
+  integration-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Run integration tests with coverage
+        run: |
+          mkdir -p coverage
+          go test -tags integration -run 'TestIntegration' -coverprofile=coverage/integration.raw -covermode=atomic -race ./...
+
+      - name: Filter coverage profile
+        run: |
+          pattern=$(grep -v '^#' .coverignore | grep -v '^$' | paste -sd'|' -)
+          grep -v -E "$pattern" coverage/integration.raw > coverage/integration.out
+
+      - name: Display integration coverage summary
+        run: go tool cover -func=coverage/integration.out | tail -1
+
+      - name: Upload integration coverage
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-integration
+          path: coverage/integration.out
+          retention-days: 30
+
+  coverage-summary:
+    needs: [unit-tests, integration-tests]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Download unit coverage
+        uses: actions/download-artifact@v4
+        with:
+          name: coverage-unit
+          path: coverage
+
+      - name: Download integration coverage
+        uses: actions/download-artifact@v4
+        with:
+          name: coverage-integration
+          path: coverage
+
+      - name: Merge coverage profiles
+        run: |
+          head -1 coverage/unit.out > coverage/total.out
+          tail -n +2 coverage/unit.out >> coverage/total.out
+          tail -n +2 coverage/integration.out >> coverage/total.out
+
+      - name: Generate coverage summary
+        run: |
+          UNIT_COV=$(go tool cover -func=coverage/unit.out | tail -1 | awk '{print $NF}')
+          INT_COV=$(go tool cover -func=coverage/integration.out | tail -1 | awk '{print $NF}')
+          TOTAL_COV=$(go tool cover -func=coverage/total.out | tail -1 | awk '{print $NF}')
+
+          {
+            echo "## Coverage Summary"
+            echo ""
+            echo "| Type | Coverage |"
+            echo "|------|----------|"
+            echo "| Unit | ${UNIT_COV} |"
+            echo "| Integration | ${INT_COV} |"
+            echo "| **Total** | **${TOTAL_COV}** |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "Unit: $UNIT_COV | Integration: $INT_COV | Total: $TOTAL_COV"
+
+      - name: Generate HTML report
+        run: go run ./cmd/covreport -o coverage/report.html unit=coverage/unit.out integration=coverage/integration.out
+
+      - name: Upload coverage report
         uses: actions/upload-artifact@v7
         with:
           name: coverage-report
-          path: coverage.out
+          path: |
+            coverage/report.html
+            coverage/unit.out
+            coverage/integration.out
+            coverage/total.out
           retention-days: 30

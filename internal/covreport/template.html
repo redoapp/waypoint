@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Coverage Report</title>
+<style>
+body {
+	font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+	margin: 0;
+	padding: 0;
+	background: #fff;
+	display: flex;
+	flex-direction: column;
+	height: 100vh;
+}
+#header {
+	background: #f6f8fa;
+	border-bottom: 1px solid #d0d7de;
+	padding: 12px 20px;
+	flex-shrink: 0;
+}
+.legend {
+	display: inline-flex;
+	gap: 16px;
+	align-items: center;
+	font-size: 13px;
+}
+.legend-item {
+	display: flex;
+	align-items: center;
+	gap: 4px;
+}
+.legend-swatch {
+	display: inline-block;
+	width: 14px;
+	height: 14px;
+	border: 1px solid #ccc;
+	border-radius: 2px;
+}
+#stats {
+	padding: 8px 20px;
+	font-size: 13px;
+	background: #fafbfc;
+	border-bottom: 1px solid #eee;
+	flex-shrink: 0;
+}
+#stats table {
+	border-collapse: collapse;
+}
+#stats td, #stats th {
+	padding: 2px 12px 2px 0;
+	text-align: left;
+}
+#main {
+	display: flex;
+	flex: 1;
+	overflow: hidden;
+}
+#sidebar {
+	width: 320px;
+	min-width: 220px;
+	border-right: 1px solid #d0d7de;
+	overflow-y: auto;
+	background: #f6f8fa;
+	font-size: 13px;
+	flex-shrink: 0;
+}
+#sidebar ul {
+	list-style: none;
+	margin: 0;
+	padding: 0;
+}
+#sidebar li {
+	border-bottom: 1px solid #eaeef2;
+}
+#sidebar .tree-item {
+	display: flex;
+	align-items: center;
+	padding: 4px 8px;
+	cursor: pointer;
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+#sidebar .tree-item:hover {
+	background: #ddf4ff;
+}
+#sidebar .tree-item.active {
+	background: #0969da;
+	color: #fff;
+}
+#sidebar .tree-item.active .pct {
+	color: #fff;
+}
+#sidebar .tree-toggle {
+	width: 20px;
+	text-align: center;
+	flex-shrink: 0;
+	user-select: none;
+	font-size: 16px;
+	line-height: 1;
+	color: #656d76;
+}
+#sidebar .tree-label {
+	flex: 1;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+#sidebar .pct {
+	margin-left: 8px;
+	color: #656d76;
+	flex-shrink: 0;
+	font-variant-numeric: tabular-nums;
+}
+#sidebar .children {
+	display: none;
+}
+#sidebar .children.open {
+	display: block;
+}
+#content {
+	flex: 1;
+	overflow: auto;
+}
+pre {
+	margin: 0;
+	padding: 16px 20px;
+	font-size: 13px;
+	line-height: 1.5;
+	tab-size: 4;
+}
+.cov-none { background: rgb(255, 200, 200); }
+.cov-unit { background: rgb(194, 255, 194); }
+.cov-integration { background: rgb(194, 220, 255); }
+.cov-both { background: rgb(220, 194, 255); }
+.cov-e2e { background: rgb(255, 255, 194); }
+span[title] { cursor: help; }
+.syn-kw { color: #0033b3; font-weight: 600; }
+.syn-str { color: #067d17; }
+.syn-cmt { color: #8c8c8c; font-style: italic; }
+.syn-num { color: #1750eb; }
+.syn-typ { color: #008080; }
+.syn-bfn { color: #7c4dff; }
+.content-section { display: none; }
+.content-section.active { display: block; }
+.dir-summary { padding: 20px; }
+.dir-summary h2 { margin-top: 0; font-size: 16px; }
+.dir-summary table {
+	border-collapse: collapse;
+	width: 100%;
+	max-width: 700px;
+	font-size: 13px;
+}
+.dir-summary th, .dir-summary td {
+	padding: 6px 12px;
+	text-align: left;
+	border-bottom: 1px solid #eee;
+}
+.dir-summary th { font-weight: 600; }
+.dir-summary .bar-cell { width: 200px; }
+.cov-bar {
+	height: 12px;
+	border-radius: 3px;
+	background: #eee;
+	overflow: hidden;
+}
+.cov-bar-fill {
+	height: 100%;
+	border-radius: 3px;
+	background: #2da44e;
+}
+</style>
+</head>
+<body>
+<div id="header">
+	<span class="legend">
+		<span class="legend-item"><span class="legend-swatch cov-unit"></span> Unit</span>
+		<span class="legend-item"><span class="legend-swatch cov-integration"></span> Integration</span>
+		<span class="legend-item"><span class="legend-swatch cov-both"></span> Both</span>
+		<span class="legend-item"><span class="legend-swatch cov-none"></span> Not covered</span>
+	</span>
+</div>
+<div id="stats">
+	<table>
+		<tr><th>Type</th><th>Stmts</th><th>Covered</th><th>Pct</th></tr>
+		{{range .Summary}}
+		<tr><td>{{.Name}}</td><td>{{.TotalStmts}}</td><td>{{.CoveredStmts}}</td><td>{{.Pct}}%</td></tr>
+		{{end}}
+	</table>
+</div>
+<div id="main">
+	<div id="sidebar">
+		{{.SidebarHTML}}
+	</div>
+	<div id="content">
+		{{- range .Dirs}}
+		<div class="content-section" id="{{.ID}}">
+			<div class="dir-summary">
+				<h2>{{.Name}}/</h2>
+				<table>
+					<tr><th>Path</th><th>Stmts</th><th>Covered</th><th>Coverage</th><th class="bar-cell"></th></tr>
+					{{range .Children}}
+					<tr>
+						<td><a href="#" onclick="showSection('{{.ID}}');return false;">{{.Name}}</a></td>
+						<td>{{.TotalStmts}}</td>
+						<td>{{.CoveredStmts}}</td>
+						<td>{{.Pct}}%</td>
+						<td class="bar-cell"><div class="cov-bar"><div class="cov-bar-fill" style="width:{{.Pct}}%"></div></div></td>
+					</tr>
+					{{end}}
+				</table>
+			</div>
+		</div>
+		{{- end}}
+		{{- range .Files}}
+		<div class="content-section" id="{{.ID}}">
+			<pre>{{range .Lines}}<span class="{{.Class}}" title="{{.Title}}">{{.Text}}
+</span>{{end}}</pre>
+		</div>
+		{{- end}}
+	</div>
+</div>
+<script>
+function showSection(id) {
+	var sections = document.querySelectorAll('.content-section');
+	for (var i = 0; i < sections.length; i++) {
+		sections[i].classList.remove('active');
+	}
+	var el = document.getElementById(id);
+	if (el) el.classList.add('active');
+
+	var items = document.querySelectorAll('#sidebar .tree-item');
+	for (var i = 0; i < items.length; i++) {
+		items[i].classList.remove('active');
+		if (items[i].getAttribute('data-target') === id) {
+			items[i].classList.add('active');
+		}
+	}
+}
+function toggleChildren(ev, id) {
+	ev.stopPropagation();
+	var ul = document.getElementById('children-' + id);
+	if (ul) ul.classList.toggle('open');
+	var arrow = ev.currentTarget;
+	arrow.textContent = ul && ul.classList.contains('open') ? '\u25BC' : '\u25BA';
+}
+// Show first file on load.
+var first = document.querySelector('.content-section');
+if (first) {
+	first.classList.add('active');
+	var item = document.querySelector('#sidebar .tree-item[data-target="' + first.id + '"]');
+	if (item) item.classList.add('active');
+}
+// Expand root directories by default.
+var roots = document.querySelectorAll('#sidebar > ul > li > .children');
+for (var i = 0; i < roots.length; i++) {
+	roots[i].classList.add('open');
+	var toggle = roots[i].parentElement.querySelector('.tree-toggle');
+	if (toggle) toggle.textContent = '\u25BC';
+}
+</script>
+</body>
+</html>

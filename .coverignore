@@ -1,0 +1,5 @@
+cmd/waypoint/
+cmd/waypoint-monitor/
+cmd/covreport/
+internal/admin/
+internal/testutil/
