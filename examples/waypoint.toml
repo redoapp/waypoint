@@ -61,3 +61,11 @@ name = "raw-mysql"
 listen = ":3306"
 mode = "tcp"
 backend = "10.0.1.5:3306"
+
+# Example: backend reachable only via Tailscale (MagicDNS name or 100.x.y.z IP).
+# [[listeners]]
+# name = "ts-backend"
+# listen = ":6379"
+# mode = "tcp"
+# backend = "my-redis.tail-scale.ts.net:6379"
+# backend_via_tailscale = true

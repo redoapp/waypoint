@@ -27,6 +27,7 @@ type PostgresProxy struct {
 	PGConfig      *config.PostgresAdmin
 	RevalInterval time.Duration
 	Logger        *slog.Logger
+	Dialer        func(ctx context.Context, network, addr string) (net.Conn, error)
 	BytesRead     *atomic.Int64 // optional: aggregate byte counter
 	BytesWritten  *atomic.Int64 // optional: aggregate byte counter
 }
@@ -121,7 +122,14 @@ func (p *PostgresProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 	}
 
 	// Step 6: Connect to upstream PG with provisioned credentials.
-	backendConn, err := net.DialTimeout("tcp", p.Backend, 10*time.Second)
+	var backendConn net.Conn
+	if p.Dialer != nil {
+		dialCtx, dialCancel := context.WithTimeout(ctx, 10*time.Second)
+		defer dialCancel()
+		backendConn, err = p.Dialer(dialCtx, "tcp", p.Backend)
+	} else {
+		backendConn, err = net.DialTimeout("tcp", p.Backend, 10*time.Second)
+	}
 	if err != nil {
 		p.Logger.Error("backend dial failed", "backend", p.Backend, "error", err)
 		pgwire.SendErrorResponse(clientConn, "FATAL", "08006", "backend unavailable")

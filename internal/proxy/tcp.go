@@ -19,6 +19,7 @@ type TCPProxy struct {
 	Tracker      *restrict.Tracker
 	Metrics      *metrics.Metrics
 	Logger       *slog.Logger
+	Dialer       func(ctx context.Context, network, addr string) (net.Conn, error)
 	BytesRead    *atomic.Int64 // optional: aggregate byte counter
 	BytesWritten *atomic.Int64 // optional: aggregate byte counter
 }
@@ -69,7 +70,14 @@ func (p *TCPProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 			m.Attrs("waypoint.conn.duration", listenerAttr, metrics.AttrUser.String(result.LoginName)))
 	}()
 
-	backendConn, err := net.DialTimeout("tcp", p.Backend, 10*time.Second)
+	var backendConn net.Conn
+	if p.Dialer != nil {
+		dialCtx, dialCancel := context.WithTimeout(ctx, 10*time.Second)
+		defer dialCancel()
+		backendConn, err = p.Dialer(dialCtx, "tcp", p.Backend)
+	} else {
+		backendConn, err = net.DialTimeout("tcp", p.Backend, 10*time.Second)
+	}
 	if err != nil {
 		p.Logger.Error("backend dial failed", "backend", p.Backend, "error", err)
 		return

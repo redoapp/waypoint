@@ -131,6 +131,11 @@ func main() {
 		}
 		listeners = append(listeners, ln)
 
+		var dialer func(ctx context.Context, network, addr string) (net.Conn, error)
+		if lCfg.BackendViaTailscale {
+			dialer = srv.Dial
+		}
+
 		switch mode {
 		case "tcp":
 			p := &proxy.TCPProxy{
@@ -140,6 +145,7 @@ func main() {
 				Tracker:      tracker,
 				Metrics:      m,
 				Logger:       logger.With("listener", lCfg.Name),
+				Dialer:       dialer,
 				BytesRead:    &bytesRead,
 				BytesWritten: &bytesWritten,
 			}
@@ -171,6 +177,7 @@ func main() {
 				PGConfig:      lCfg.Postgres,
 				RevalInterval: revalInterval,
 				Logger:        logger.With("listener", lCfg.Name),
+				Dialer:        dialer,
 				BytesRead:     &bytesRead,
 				BytesWritten:  &bytesWritten,
 			}

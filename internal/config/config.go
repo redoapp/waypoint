@@ -52,11 +52,12 @@ type DefaultLimitsConfig struct {
 }
 
 type ListenerConfig struct {
-	Name     string         `toml:"name"`
-	Listen   string         `toml:"listen"`
-	Mode     string         `toml:"mode"`
-	Backend  string         `toml:"backend"`
-	Postgres *PostgresAdmin `toml:"postgres"`
+	Name                string         `toml:"name"`
+	Listen              string         `toml:"listen"`
+	Mode                string         `toml:"mode"`
+	Backend             string         `toml:"backend"`
+	BackendViaTailscale bool           `toml:"backend_via_tailscale"`
+	Postgres            *PostgresAdmin `toml:"postgres"`
 }
 
 type PostgresAdmin struct {

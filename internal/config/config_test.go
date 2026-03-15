@@ -318,3 +318,34 @@ func TestPostgresAdmin_UserTTLCustom(t *testing.T) {
 		t.Errorf("expected 6h, got %v", p.UserTTLDuration())
 	}
 }
+
+func TestLoad_BackendViaTailscale(t *testing.T) {
+	content := `
+[tailscale]
+hostname = "waypoint-test"
+
+[[listeners]]
+name = "ts-backend"
+listen = ":6379"
+mode = "tcp"
+backend = "my-redis.ts.net:6379"
+backend_via_tailscale = true
+
+[[listeners]]
+name = "normal"
+listen = ":3306"
+mode = "tcp"
+backend = "10.0.0.1:3306"
+`
+	path := writeTestConfig(t, content)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Listeners[0].BackendViaTailscale {
+		t.Error("expected BackendViaTailscale to be true for ts-backend listener")
+	}
+	if cfg.Listeners[1].BackendViaTailscale {
+		t.Error("expected BackendViaTailscale to default to false for normal listener")
+	}
+}
