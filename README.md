@@ -98,4 +98,4 @@ Integration tests use [testcontainers](https://golang.testcontainers.org/) and r
 
 ## License
 
-Proprietary — internal use only.
+MIT — see [LICENSE](LICENSE).
