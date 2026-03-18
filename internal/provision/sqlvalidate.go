@@ -26,15 +26,6 @@ var allowedPrivileges = map[privilege.Kind]bool{
 	privilege.TRIGGER: true,
 }
 
-// pgOnlyPrivileges are PostgreSQL privileges not recognized by the CockroachDB parser.
-// We validate these ourselves and substitute them before parsing.
-var pgOnlyPrivileges = map[string]string{
-	"truncate":   "SELECT",
-	"references": "SELECT",
-	"temporary":  "CONNECT",
-	"temp":       "CONNECT",
-}
-
 // maxStatementLen limits the total length of a single SQL statement
 // to prevent resource abuse.
 const maxStatementLen = 4096
@@ -53,22 +44,12 @@ func validateSQL(statements []string) error {
 			return fmt.Errorf("sql statement too long (%d chars, max %d)", len(trimmed), maxStatementLen)
 		}
 
-		// Reject dangerous characters before parsing. The parser would accept
-		// some of these (comments, quoted identifiers) but we reject them
-		// as a defense-in-depth measure.
-		if err := rejectDangerousInput(trimmed, stmt); err != nil {
-			return err
-		}
-
-		// Pre-validate and substitute PG-only privilege keywords and other
-		// syntax not recognized by the CockroachDB parser.
-		prepared, err := prepareForParsing(trimmed)
-		if err != nil {
-			return fmt.Errorf("invalid sql %q: %w", stmt, err)
+		if strings.ContainsRune(trimmed, 0) {
+			return fmt.Errorf("null bytes are not allowed: %s", stmt)
 		}
 
 		// Render template placeholders with valid identifiers for parsing.
-		prepared, err = renderSQL(prepared, SQLTemplateData{Role: rolePlaceholder})
+		prepared, err := renderSQL(trimmed, SQLTemplateData{Role: rolePlaceholder})
 		if err != nil {
 			return fmt.Errorf("invalid sql %q: %w", stmt, err)
 		}
@@ -83,188 +64,6 @@ func validateSQL(statements []string) error {
 		}
 	}
 	return nil
-}
-
-// rejectDangerousInput checks for characters and patterns that the parser
-// would accept but that we want to reject for security reasons.
-func rejectDangerousInput(sql, original string) error {
-	if strings.Contains(sql, "\"") {
-		return fmt.Errorf("quoted identifiers are not allowed: %s", original)
-	}
-	if strings.Contains(sql, "--") {
-		return fmt.Errorf("comments are not allowed: %s", original)
-	}
-	if strings.Contains(sql, "/*") {
-		return fmt.Errorf("comments are not allowed: %s", original)
-	}
-	if strings.ContainsRune(sql, 0) {
-		return fmt.Errorf("null bytes are not allowed: %s", original)
-	}
-	if strings.Contains(sql, ";") {
-		return fmt.Errorf("semicolons are not allowed: %s", original)
-	}
-	return nil
-}
-
-// prepareForParsing handles syntax differences between PostgreSQL and
-// CockroachDB. It validates PG-only privilege keywords against our allowlist,
-// substitutes them with CockroachDB equivalents, and transforms unsupported
-// syntax like ALL ROUTINES IN SCHEMA.
-func prepareForParsing(sql string) (string, error) {
-	upper := strings.ToUpper(sql)
-
-	// Handle ROUTINES -> FUNCTIONS.
-	// CockroachDB parser doesn't support the ROUTINES keyword.
-	// This covers both "ALL ROUTINES IN SCHEMA" and "ON ROUTINES" in ALTER DEFAULT PRIVILEGES.
-	if idx := indexOfWord(upper, "ROUTINES", 0); idx >= 0 {
-		sql = sql[:idx] + "FUNCTIONS" + sql[idx+len("ROUTINES"):]
-		upper = strings.ToUpper(sql)
-	}
-
-	// Find the privilege list region: between GRANT/REVOKE and ON.
-	// For ALTER DEFAULT PRIVILEGES, look for the inner GRANT/REVOKE.
-	privStart, privEnd := findPrivilegeRegion(upper)
-	if privStart < 0 || privEnd < 0 {
-		// No privilege region found — let the parser handle it.
-		return sql, nil
-	}
-
-	// Extract and validate each privilege word.
-	privRegion := sql[privStart:privEnd]
-	words := splitPrivilegeWords(privRegion)
-
-	var result []byte
-	result = append(result, sql[:privStart]...)
-
-	for _, w := range words {
-		lower := strings.ToLower(strings.TrimSpace(w.text))
-
-		if w.isSeparator {
-			result = append(result, w.text...)
-			continue
-		}
-
-		// "privileges" is allowed after ALL.
-		if lower == "privileges" {
-			result = append(result, w.text...)
-			continue
-		}
-
-		if sub, ok := pgOnlyPrivileges[lower]; ok {
-			result = append(result, sub...)
-			// Pad with spaces if the replacement is shorter to maintain alignment.
-			for j := len(sub); j < len(w.text); j++ {
-				result = append(result, ' ')
-			}
-			continue
-		}
-
-		// Not a PG-only privilege; keep as-is. The parser will validate it.
-		result = append(result, w.text...)
-	}
-
-	result = append(result, sql[privEnd:]...)
-	return string(result), nil
-}
-
-type privWord struct {
-	text        string
-	isSeparator bool // comma or whitespace
-}
-
-// splitPrivilegeWords splits a privilege region into words and separators,
-// preserving the original text for reconstruction.
-func splitPrivilegeWords(region string) []privWord {
-	var words []privWord
-	i := 0
-	for i < len(region) {
-		// Consume whitespace/commas as separators.
-		if region[i] == ' ' || region[i] == '\t' || region[i] == '\n' || region[i] == '\r' || region[i] == ',' {
-			start := i
-			for i < len(region) && (region[i] == ' ' || region[i] == '\t' || region[i] == '\n' || region[i] == '\r' || region[i] == ',') {
-				i++
-			}
-			words = append(words, privWord{text: region[start:i], isSeparator: true})
-			continue
-		}
-		// Consume a word.
-		start := i
-		for i < len(region) && region[i] != ' ' && region[i] != '\t' && region[i] != '\n' && region[i] != '\r' && region[i] != ',' {
-			i++
-		}
-		words = append(words, privWord{text: region[start:i], isSeparator: false})
-	}
-	return words
-}
-
-// findPrivilegeRegion returns the byte offsets [start, end) of the privilege
-// list in a SQL statement. The region is between GRANT/REVOKE and the
-// following ON keyword.
-func findPrivilegeRegion(upper string) (int, int) {
-	// For ALTER DEFAULT PRIVILEGES, find the inner GRANT/REVOKE.
-	searchFrom := 0
-	if strings.HasPrefix(upper, "ALTER") {
-		// Find GRANT or REVOKE after the ALTER DEFAULT PRIVILEGES prefix.
-		idx := strings.Index(upper, "GRANT")
-		if idx < 5 { // Must be after ALTER
-			idx = strings.Index(upper, "REVOKE")
-		}
-		if idx < 0 {
-			return -1, -1
-		}
-		searchFrom = idx
-	}
-
-	// Find GRANT or REVOKE keyword.
-	grantIdx := indexOfWord(upper, "GRANT", searchFrom)
-	revokeIdx := indexOfWord(upper, "REVOKE", searchFrom)
-
-	kwIdx := -1
-	kwLen := 0
-	if grantIdx >= 0 && (revokeIdx < 0 || grantIdx < revokeIdx) {
-		kwIdx = grantIdx
-		kwLen = 5
-	} else if revokeIdx >= 0 {
-		kwIdx = revokeIdx
-		kwLen = 6
-	}
-	if kwIdx < 0 {
-		return -1, -1
-	}
-
-	privStart := kwIdx + kwLen
-
-	// Find ON keyword after the privilege list.
-	onIdx := indexOfWord(upper, "ON", privStart)
-	if onIdx < 0 {
-		return -1, -1
-	}
-
-	return privStart, onIdx
-}
-
-// indexOfWord finds the index of a keyword in the string, ensuring it's a whole word
-// (not part of a larger identifier).
-func indexOfWord(upper string, word string, from int) int {
-	for i := from; i <= len(upper)-len(word); {
-		idx := strings.Index(upper[i:], word)
-		if idx < 0 {
-			return -1
-		}
-		pos := i + idx
-		// Check word boundaries.
-		before := pos == 0 || !isIdentChar(upper[pos-1])
-		after := pos+len(word) >= len(upper) || !isIdentChar(upper[pos+len(word)])
-		if before && after {
-			return pos
-		}
-		i = pos + 1
-	}
-	return -1
-}
-
-func isIdentChar(b byte) bool {
-	return (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z') || (b >= '0' && b <= '9') || b == '_'
 }
 
 // validateAST dispatches to type-specific validation.
