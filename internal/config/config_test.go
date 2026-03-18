@@ -319,6 +319,115 @@ func TestPostgresAdmin_UserTTLCustom(t *testing.T) {
 	}
 }
 
+func TestLoad_TailscaleOAuth(t *testing.T) {
+	content := `
+[tailscale]
+hostname = "waypoint-test"
+client_secret = "tskey-client-abc123"
+advertise_tags = ["tag:server", "tag:prod"]
+ephemeral = true
+
+[[listeners]]
+name = "test-tcp"
+listen = ":9999"
+mode = "tcp"
+backend = "10.0.0.1:5432"
+`
+	path := writeTestConfig(t, content)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Tailscale.ClientSecret != "tskey-client-abc123" {
+		t.Errorf("client_secret = %q", cfg.Tailscale.ClientSecret)
+	}
+	if len(cfg.Tailscale.AdvertiseTags) != 2 {
+		t.Fatalf("advertise_tags len = %d", len(cfg.Tailscale.AdvertiseTags))
+	}
+	if cfg.Tailscale.AdvertiseTags[0] != "tag:server" {
+		t.Errorf("advertise_tags[0] = %q", cfg.Tailscale.AdvertiseTags[0])
+	}
+	if !cfg.Tailscale.Ephemeral {
+		t.Error("ephemeral should be true")
+	}
+}
+
+func TestLoad_TailscaleWIF(t *testing.T) {
+	content := `
+[tailscale]
+hostname = "waypoint-test"
+client_id = "client-123"
+id_token = "eyJhbGci..."
+audience = "https://login.tailscale.com"
+advertise_tags = ["tag:server"]
+
+[[listeners]]
+name = "test-tcp"
+listen = ":9999"
+mode = "tcp"
+backend = "10.0.0.1:5432"
+`
+	path := writeTestConfig(t, content)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Tailscale.ClientID != "client-123" {
+		t.Errorf("client_id = %q", cfg.Tailscale.ClientID)
+	}
+	if cfg.Tailscale.IDToken != "eyJhbGci..." {
+		t.Errorf("id_token = %q", cfg.Tailscale.IDToken)
+	}
+	if cfg.Tailscale.Audience != "https://login.tailscale.com" {
+		t.Errorf("audience = %q", cfg.Tailscale.Audience)
+	}
+}
+
+func TestLoad_TailscaleConflictingAuth(t *testing.T) {
+	content := `
+[tailscale]
+hostname = "waypoint-test"
+auth_key = "tskey-auth-abc"
+client_secret = "tskey-client-abc"
+advertise_tags = ["tag:server"]
+
+[[listeners]]
+name = "test-tcp"
+listen = ":9999"
+mode = "tcp"
+backend = "10.0.0.1:5432"
+`
+	path := writeTestConfig(t, content)
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "only one auth method") {
+		t.Errorf("expected conflicting auth error, got: %v", err)
+	}
+}
+
+func TestLoad_TailscaleAuthKeyEnvExpansion(t *testing.T) {
+	t.Setenv("TEST_TS_AUTHKEY", "tskey-auth-expanded")
+
+	content := `
+[tailscale]
+hostname = "waypoint-test"
+auth_key = "${TEST_TS_AUTHKEY}"
+
+[[listeners]]
+name = "test-tcp"
+listen = ":9999"
+mode = "tcp"
+backend = "10.0.0.1:5432"
+`
+	path := writeTestConfig(t, content)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Tailscale.AuthKey != "tskey-auth-expanded" {
+		t.Errorf("auth_key = %q, want tskey-auth-expanded", cfg.Tailscale.AuthKey)
+	}
+}
+
 func TestLoad_BackendViaTailscale(t *testing.T) {
 	content := `
 [tailscale]
@@ -347,5 +456,80 @@ backend = "10.0.0.1:3306"
 	}
 	if cfg.Listeners[1].BackendViaTailscale {
 		t.Error("expected BackendViaTailscale to default to false for normal listener")
+	}
+}
+
+func TestLoad_ServiceField(t *testing.T) {
+	content := `
+[tailscale]
+hostname = "waypoint-test"
+
+[[listeners]]
+name = "pg-svc"
+listen = ":5432"
+mode = "postgres"
+backend = "10.0.1.10:5432"
+service = "svc:waypoint-db"
+
+[[listeners]]
+name = "plain"
+listen = ":3306"
+mode = "tcp"
+backend = "10.0.0.1:3306"
+`
+	path := writeTestConfig(t, content)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Listeners[0].Service != "svc:waypoint-db" {
+		t.Errorf("service = %q, want svc:waypoint-db", cfg.Listeners[0].Service)
+	}
+	if cfg.Listeners[1].Service != "" {
+		t.Errorf("service should be empty, got %q", cfg.Listeners[1].Service)
+	}
+}
+
+func TestValidate_ServiceInvalidPrefix(t *testing.T) {
+	content := `
+[tailscale]
+hostname = "waypoint-test"
+
+[[listeners]]
+name = "bad-svc"
+listen = ":5432"
+mode = "tcp"
+backend = "10.0.0.1:5432"
+service = "waypoint-db"
+`
+	path := writeTestConfig(t, content)
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "svc:") {
+		t.Errorf("expected svc: prefix error, got: %v", err)
+	}
+}
+
+func TestListenerConfig_ListenPort(t *testing.T) {
+	tests := []struct {
+		listen  string
+		want    uint16
+		wantErr bool
+	}{
+		{":5432", 5432, false},
+		{"0.0.0.0:3306", 3306, false},
+		{":0", 0, false},
+		{"invalid", 0, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.listen, func(t *testing.T) {
+			l := &ListenerConfig{Listen: tt.listen}
+			got, err := l.ListenPort()
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("ListenPort() error = %v, wantErr = %v", err, tt.wantErr)
+			}
+			if got != tt.want {
+				t.Errorf("ListenPort() = %d, want %d", got, tt.want)
+			}
+		})
 	}
 }

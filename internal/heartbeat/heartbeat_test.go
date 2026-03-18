@@ -13,6 +13,24 @@ import (
 	"github.com/redoapp/waypoint/internal/config"
 )
 
+func TestKey(t *testing.T) {
+	tests := []struct {
+		prefix string
+		id     string
+		want   string
+	}{
+		{"", "abc-123", "waypoint:instance:abc-123"},
+		{"wp:", "abc-123", "wp:instance:abc-123"},
+		{"custom:", "node-1", "custom:instance:node-1"},
+	}
+	for _, tt := range tests {
+		got := Key(tt.prefix, tt.id)
+		if got != tt.want {
+			t.Errorf("Key(%q, %q) = %q, want %q", tt.prefix, tt.id, got, tt.want)
+		}
+	}
+}
+
 func TestHeartbeat(t *testing.T) {
 	mr := miniredis.RunT(t)
 	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})

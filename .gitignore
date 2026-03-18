@@ -5,9 +5,14 @@
 
 # test coverage
 coverage/
+coverage.out
+coverage_new.out
+coverage_new_tests.out
+covreport
 
 # binary
 /waypoint
+/waypoint-monitor
 
 # IDE / editor
 .idea/

@@ -2,6 +2,7 @@ package pgwire
 
 import (
 	"net"
+	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgproto3"
@@ -163,6 +164,97 @@ func TestSendErrorResponse(t *testing.T) {
 	}
 	if errResp.Message != "test error message" {
 		t.Errorf("message = %q", errResp.Message)
+	}
+}
+
+func TestReadStartupMessage_OversizedLength(t *testing.T) {
+	client, server := net.Pipe()
+	defer server.Close()
+
+	go func() {
+		// Length = 10241, which exceeds the 10240 limit.
+		client.Write([]byte{0, 0, 0x28, 0x01}) // 10241 in big-endian
+		client.Close()
+	}()
+
+	_, err := ReadStartupMessage(server)
+	if err == nil {
+		t.Fatal("expected error for oversized length")
+	}
+}
+
+func TestForwardPostAuth_ErrorResponse(t *testing.T) {
+	upstream, upstreamRemote := net.Pipe()
+	client, clientRemote := net.Pipe()
+	defer upstream.Close()
+	defer upstreamRemote.Close()
+	defer client.Close()
+	defer clientRemote.Close()
+
+	go func() {
+		be := pgproto3.NewBackend(upstreamRemote, upstreamRemote)
+		be.Send(&pgproto3.ErrorResponse{
+			Severity: "FATAL",
+			Code:     "28000",
+			Message:  "auth failed",
+		})
+		be.Flush()
+	}()
+
+	err := ForwardPostAuth(pgproto3.NewFrontend(upstream, upstream), client)
+	if err == nil {
+		t.Fatal("expected error from ErrorResponse")
+	}
+	if !strings.Contains(err.Error(), "auth failed") {
+		t.Errorf("error should contain message, got: %v", err)
+	}
+}
+
+func TestForwardPostAuth_UnknownMessageForwarded(t *testing.T) {
+	upstream, upstreamRemote := net.Pipe()
+	client, clientRemote := net.Pipe()
+	defer upstream.Close()
+	defer upstreamRemote.Close()
+	defer client.Close()
+	defer clientRemote.Close()
+
+	// Upstream sends a NoticeResponse (unknown to the switch) then ReadyForQuery.
+	go func() {
+		be := pgproto3.NewBackend(upstreamRemote, upstreamRemote)
+		be.Send(&pgproto3.NoticeResponse{
+			Severity: "WARNING",
+			Message:  "just a notice",
+		})
+		be.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'})
+		be.Flush()
+	}()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- ForwardPostAuth(pgproto3.NewFrontend(upstream, upstream), client)
+	}()
+
+	// Read from client side - should get the notice forwarded.
+	fe := pgproto3.NewFrontend(clientRemote, clientRemote)
+
+	msg1, err := fe.Receive()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := msg1.(*pgproto3.NoticeResponse); !ok {
+		t.Fatalf("expected NoticeResponse, got %T", msg1)
+	}
+
+	msg2, err := fe.Receive()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := msg2.(*pgproto3.ReadyForQuery); !ok {
+		t.Fatalf("expected ReadyForQuery, got %T", msg2)
+	}
+
+	if err := <-done; err != nil {
+		t.Fatalf("ForwardPostAuth returned error: %v", err)
 	}
 }
 

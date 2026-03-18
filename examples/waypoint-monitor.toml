@@ -1,7 +1,32 @@
 listen = ":8080"
 
+[tailscale]
+hostname = "waypoint-mgr"
+# state_dir = "/var/lib/waypoint-monitor/tsnet"
+# Auth key (or set TS_AUTHKEY env var):
+# auth_key = "${TS_AUTHKEY}"
+# control_url = "https://controlplane.tailscale.com"
+# ephemeral = false
+# advertise_tags = ["tag:waypoint-mgr"]
+#
+# OAuth client credentials (requires advertise_tags):
+# client_secret = "${TS_CLIENT_SECRET}"
+# advertise_tags = ["tag:waypoint-mgr"]
+#
+# Workload Identity Federation (requires client_id + advertise_tags):
+# client_id = "your-client-id"
+# id_token = "${WIF_ID_TOKEN}"
+# audience = "https://login.tailscale.com"
+# advertise_tags = ["tag:waypoint-mgr"]
+
 [redis]
 address = "localhost:6379"
 # password = ""
 # db = 0
 key_prefix = "waypoint:"
+
+# [ssh]
+# enabled = true
+# listen = ":22"
+# host_key = "/var/lib/waypoint-monitor/ssh_host_ed25519_key"
+# service = "svc:waypoint-mgr"   # register as a Tailscale Service

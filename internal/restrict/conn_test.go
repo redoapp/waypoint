@@ -26,6 +26,28 @@ func testLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
 }
 
+func TestConnLimits_BytesReadWritten(t *testing.T) {
+	store := setupConnTest(t)
+	cl := &ConnLimits{
+		store:         store,
+		user:          "alice",
+		logger:        testLogger(),
+		flushInterval: time.Hour,
+		done:          make(chan struct{}),
+	}
+
+	cl.ReportRead(100)
+	cl.ReportWrite(200)
+	cl.ReportRead(50)
+
+	if got := cl.BytesRead(); got != 150 {
+		t.Errorf("BytesRead() = %d, want 150", got)
+	}
+	if got := cl.BytesWritten(); got != 200 {
+		t.Errorf("BytesWritten() = %d, want 200", got)
+	}
+}
+
 func TestConnLimits_ByteLimit(t *testing.T) {
 	store := setupConnTest(t)
 	cl := &ConnLimits{

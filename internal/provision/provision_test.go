@@ -136,6 +136,36 @@ func TestFormatUsername_CustomPrefix(t *testing.T) {
 	}
 }
 
+func TestRoleLockKey_Deterministic(t *testing.T) {
+	k1 := roleLockKey("wp_alice_node_db")
+	k2 := roleLockKey("wp_alice_node_db")
+	if k1 != k2 {
+		t.Errorf("same input should produce same key: %d vs %d", k1, k2)
+	}
+}
+
+func TestRoleLockKey_UniqueForDifferentRoles(t *testing.T) {
+	k1 := roleLockKey("wp_alice_node_db1")
+	k2 := roleLockKey("wp_alice_node_db2")
+	if k1 == k2 {
+		t.Errorf("different roles should produce different keys: %d", k1)
+	}
+}
+
+func TestNewProvisioner_DefaultPrefix(t *testing.T) {
+	p := NewProvisioner("admin", "pass", "postgres", "localhost:5432", "", nil, nil)
+	if p.userPrefix != "wp_" {
+		t.Errorf("expected default prefix wp_, got %q", p.userPrefix)
+	}
+}
+
+func TestNewProvisioner_CustomPrefix(t *testing.T) {
+	p := NewProvisioner("admin", "pass", "postgres", "localhost:5432", "custom_", nil, nil)
+	if p.userPrefix != "custom_" {
+		t.Errorf("expected custom_, got %q", p.userPrefix)
+	}
+}
+
 func TestQuoteLiteral(t *testing.T) {
 	tests := []struct {
 		input, want string

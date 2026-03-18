@@ -2,6 +2,7 @@ package monitor
 
 import (
 	"context"
+	"strconv"
 	"testing"
 	"time"
 
@@ -15,6 +16,208 @@ func setupTest(t *testing.T) (*miniredis.Miniredis, *Store) {
 	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { rdb.Close() })
 	return mr, NewStore(rdb, "wp:")
+}
+
+func TestUptime(t *testing.T) {
+	info := InstanceInfo{StartedAt: time.Now().Add(-5 * time.Minute)}
+	uptime := info.Uptime()
+	if uptime < 4*time.Minute || uptime > 6*time.Minute {
+		t.Errorf("Uptime = %v, want ~5m", uptime)
+	}
+}
+
+func TestNewStore_DefaultPrefix(t *testing.T) {
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { rdb.Close() })
+
+	store := NewStore(rdb, "") // empty prefix should default to "waypoint:"
+	ctx := context.Background()
+
+	mr.HSet("waypoint:instance:def-456", "hostname", "default-host")
+	mr.HSet("waypoint:instance:def-456", "started_at", time.Now().UTC().Format(time.RFC3339))
+	mr.HSet("waypoint:instance:def-456", "heartbeat_at", time.Now().UTC().Format(time.RFC3339))
+	mr.HSet("waypoint:instance:def-456", "listeners", "[]")
+	mr.HSet("waypoint:instance:def-456", "active_conns", "0")
+	mr.HSet("waypoint:instance:def-456", "total_conns", "0")
+	mr.HSet("waypoint:instance:def-456", "bytes_read", "0")
+	mr.HSet("waypoint:instance:def-456", "bytes_written", "0")
+
+	instances, err := store.DiscoverInstances(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(instances) != 1 {
+		t.Fatalf("got %d instances, want 1", len(instances))
+	}
+	if instances[0].Hostname != "default-host" {
+		t.Errorf("Hostname = %q, want %q", instances[0].Hostname, "default-host")
+	}
+}
+
+func TestResetBandwidth(t *testing.T) {
+	mr, store := setupTest(t)
+	ctx := context.Background()
+
+	mr.HSet("wp:bw:alice@example.com:3600", "100", "5000")
+
+	if err := store.ResetBandwidth(ctx, "alice@example.com", 3600); err != nil {
+		t.Fatal(err)
+	}
+	if mr.Exists("wp:bw:alice@example.com:3600") {
+		t.Error("bandwidth key should be deleted")
+	}
+}
+
+func TestResetAll_WithBandwidth(t *testing.T) {
+	mr, store := setupTest(t)
+	ctx := context.Background()
+
+	mr.Set("wp:conns:alice@example.com", "5")
+	mr.Set("wp:bytes:alice@example.com", "999999")
+	mr.HSet("wp:bw:alice@example.com:3600", "100", "5000")
+
+	if err := store.ResetAll(ctx, "alice@example.com"); err != nil {
+		t.Fatal(err)
+	}
+
+	if mr.Exists("wp:conns:alice@example.com") {
+		t.Error("conns key should be deleted")
+	}
+	if mr.Exists("wp:bytes:alice@example.com") {
+		t.Error("bytes key should be deleted")
+	}
+	if mr.Exists("wp:bw:alice@example.com:3600") {
+		t.Error("bandwidth key should be deleted")
+	}
+}
+
+func TestGetUserStats_WithBandwidth(t *testing.T) {
+	mr, store := setupTest(t)
+	ctx := context.Background()
+
+	mr.Set("wp:conns:alice@example.com", "2")
+	mr.Set("wp:bytes:alice@example.com", "10000")
+
+	// Set up bandwidth hash with a bucket that falls within the sliding window.
+	now := time.Now().Unix()
+	bSize := int64(10) // for 3600s period: 3600/360 = 10
+	currentBucket := now / bSize
+	mr.HSet("wp:bw:alice@example.com:3600",
+		strconv.FormatInt(currentBucket, 10), "5000",
+		strconv.FormatInt(currentBucket-1, 10), "3000",
+	)
+
+	stats, err := store.GetUserStats(ctx, "alice@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.ActiveConns != 2 {
+		t.Errorf("ActiveConns = %d, want 2", stats.ActiveConns)
+	}
+	if stats.TotalBytes != 10000 {
+		t.Errorf("TotalBytes = %d, want 10000", stats.TotalBytes)
+	}
+	if len(stats.Bandwidth) != 1 {
+		t.Fatalf("got %d bandwidth entries, want 1", len(stats.Bandwidth))
+	}
+	bw := stats.Bandwidth[0]
+	if bw.Bytes != 8000 {
+		t.Errorf("Bandwidth.Bytes = %d, want 8000", bw.Bytes)
+	}
+	if bw.PeriodStr != "1 hour" {
+		t.Errorf("PeriodStr = %q, want %q", bw.PeriodStr, "1 hour")
+	}
+}
+
+func TestGetUserStats_MultiplePeriods(t *testing.T) {
+	mr, store := setupTest(t)
+	ctx := context.Background()
+
+	now := time.Now().Unix()
+
+	// 1h period: bSize = 3600/360 = 10
+	bSize1h := int64(10)
+	bucket1h := now / bSize1h
+	mr.HSet("wp:bw:alice@example.com:3600",
+		strconv.FormatInt(bucket1h, 10), "1000",
+	)
+
+	// 1d period: bSize = 86400/360 = 240
+	bSize1d := int64(240)
+	bucket1d := now / bSize1d
+	mr.HSet("wp:bw:alice@example.com:86400",
+		strconv.FormatInt(bucket1d, 10), "9000",
+	)
+
+	stats, err := store.GetUserStats(ctx, "alice@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stats.Bandwidth) != 2 {
+		t.Fatalf("got %d bandwidth entries, want 2", len(stats.Bandwidth))
+	}
+	// Should be sorted by period: 1h first, then 1d.
+	if stats.Bandwidth[0].PeriodStr != "1 hour" {
+		t.Errorf("first period = %q, want %q", stats.Bandwidth[0].PeriodStr, "1 hour")
+	}
+	if stats.Bandwidth[1].PeriodStr != "1 day" {
+		t.Errorf("second period = %q, want %q", stats.Bandwidth[1].PeriodStr, "1 day")
+	}
+	if stats.Bandwidth[0].Bytes != 1000 {
+		t.Errorf("1h bytes = %d, want 1000", stats.Bandwidth[0].Bytes)
+	}
+	if stats.Bandwidth[1].Bytes != 9000 {
+		t.Errorf("1d bytes = %d, want 9000", stats.Bandwidth[1].Bytes)
+	}
+}
+
+func TestListUsers_WithBandwidth(t *testing.T) {
+	mr, store := setupTest(t)
+	ctx := context.Background()
+
+	mr.Set("wp:conns:alice@example.com", "1")
+	mr.Set("wp:conns:bob@example.com", "2")
+
+	now := time.Now().Unix()
+	bSize := int64(10)
+	bucket := now / bSize
+
+	mr.HSet("wp:bw:alice@example.com:3600",
+		strconv.FormatInt(bucket, 10), "4000",
+	)
+	mr.HSet("wp:bw:bob@example.com:3600",
+		strconv.FormatInt(bucket, 10), "6000",
+	)
+
+	users, err := store.ListUsers(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(users) != 2 {
+		t.Fatalf("got %d users, want 2", len(users))
+	}
+
+	// Sorted by name: alice first.
+	if users[0].LoginName != "alice@example.com" {
+		t.Errorf("first user = %q, want alice@example.com", users[0].LoginName)
+	}
+	if len(users[0].Bandwidth) != 1 {
+		t.Fatalf("alice bandwidth entries = %d, want 1", len(users[0].Bandwidth))
+	}
+	if users[0].Bandwidth[0].Bytes != 4000 {
+		t.Errorf("alice bandwidth bytes = %d, want 4000", users[0].Bandwidth[0].Bytes)
+	}
+
+	if users[1].LoginName != "bob@example.com" {
+		t.Errorf("second user = %q, want bob@example.com", users[1].LoginName)
+	}
+	if len(users[1].Bandwidth) != 1 {
+		t.Fatalf("bob bandwidth entries = %d, want 1", len(users[1].Bandwidth))
+	}
+	if users[1].Bandwidth[0].Bytes != 6000 {
+		t.Errorf("bob bandwidth bytes = %d, want 6000", users[1].Bandwidth[0].Bytes)
+	}
 }
 
 func TestDiscoverInstances(t *testing.T) {

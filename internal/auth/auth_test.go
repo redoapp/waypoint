@@ -230,6 +230,66 @@ func TestMergeLimits_InvalidDurationIgnored(t *testing.T) {
 	}
 }
 
+func TestMergeLimits_BandwidthInvalidPeriodSkipped(t *testing.T) {
+	var m MergedLimits
+
+	mergeLimits(&m, &LimitsCap{
+		Bandwidth: []BandwidthCap{
+			{Bytes: 1_000_000, Period: "not-a-duration"},
+			{Bytes: 500_000, Period: "1h"}, // valid, should still be added
+		},
+	})
+
+	if len(m.BandwidthTiers) != 1 {
+		t.Fatalf("expected 1 tier (invalid period skipped), got %d", len(m.BandwidthTiers))
+	}
+	if m.BandwidthTiers[0].Bytes != 500_000 {
+		t.Errorf("expected 500000, got %d", m.BandwidthTiers[0].Bytes)
+	}
+}
+
+func TestMergeLimits_BandwidthZeroBytesSkipped(t *testing.T) {
+	var m MergedLimits
+
+	mergeLimits(&m, &LimitsCap{
+		Bandwidth: []BandwidthCap{
+			{Bytes: 0, Period: "1h"},
+		},
+	})
+
+	if len(m.BandwidthTiers) != 0 {
+		t.Fatalf("expected 0 tiers (zero bytes skipped), got %d", len(m.BandwidthTiers))
+	}
+}
+
+func TestMergeLimits_BandwidthNegativeBytesSkipped(t *testing.T) {
+	var m MergedLimits
+
+	mergeLimits(&m, &LimitsCap{
+		Bandwidth: []BandwidthCap{
+			{Bytes: -100, Period: "1h"},
+		},
+	})
+
+	if len(m.BandwidthTiers) != 0 {
+		t.Fatalf("expected 0 tiers (negative bytes skipped), got %d", len(m.BandwidthTiers))
+	}
+}
+
+func TestMergeLimits_BandwidthEmptyPeriodSkipped(t *testing.T) {
+	var m MergedLimits
+
+	mergeLimits(&m, &LimitsCap{
+		Bandwidth: []BandwidthCap{
+			{Bytes: 1_000_000, Period: ""},
+		},
+	})
+
+	if len(m.BandwidthTiers) != 0 {
+		t.Fatalf("expected 0 tiers (empty period skipped), got %d", len(m.BandwidthTiers))
+	}
+}
+
 func TestDatabasePermissions_ExactMatch(t *testing.T) {
 	result := &AuthResult{
 		MatchedRules: []CapRule{{

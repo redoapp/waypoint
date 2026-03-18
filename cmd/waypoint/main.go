@@ -93,13 +93,8 @@ func main() {
 	logger.Info("heartbeat started", "instance_id", instanceID)
 
 	// tsnet server.
-	srv := &tsnet.Server{
-		Hostname: cfg.Tailscale.Hostname,
-		Dir:      cfg.Tailscale.StateDir,
-	}
-	if authKey := os.Getenv("TS_AUTHKEY"); authKey != "" {
-		srv.AuthKey = authKey
-	}
+	srv := new(tsnet.Server)
+	cfg.Tailscale.Apply(srv)
 
 	if err := srv.Start(); err != nil {
 		logger.Error("tsnet start failed", "error", err)
@@ -124,10 +119,27 @@ func main() {
 		lCfg := lCfg
 		mode := strings.ToLower(lCfg.Mode)
 
-		ln, err := srv.Listen("tcp", lCfg.Listen)
-		if err != nil {
-			logger.Error("listen failed", "name", lCfg.Name, "addr", lCfg.Listen, "error", err)
-			os.Exit(1)
+		var ln net.Listener
+		if lCfg.Service != "" {
+			port, err := lCfg.ListenPort()
+			if err != nil {
+				logger.Error("invalid listen port for service", "name", lCfg.Name, "error", err)
+				os.Exit(1)
+			}
+			svcLn, err := srv.ListenService(lCfg.Service, tsnet.ServiceModeTCP{Port: port})
+			if err != nil {
+				logger.Error("listen service failed", "name", lCfg.Name, "service", lCfg.Service, "error", err)
+				os.Exit(1)
+			}
+			ln = svcLn
+			logger.Info("registered tailscale service", "name", lCfg.Name, "service", lCfg.Service, "fqdn", svcLn.FQDN)
+		} else {
+			var err error
+			ln, err = srv.Listen("tcp", lCfg.Listen)
+			if err != nil {
+				logger.Error("listen failed", "name", lCfg.Name, "addr", lCfg.Listen, "error", err)
+				os.Exit(1)
+			}
 		}
 		listeners = append(listeners, ln)
 

@@ -2,26 +2,24 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/BurntSushi/toml"
 	"github.com/redoapp/waypoint/internal/metrics"
+	"github.com/redoapp/waypoint/internal/tsconfig"
 )
 
 type Config struct {
-	Tailscale    TailscaleConfig    `toml:"tailscale"`
-	Redis        RedisConfig        `toml:"redis"`
-	Revalidation RevalidationConfig `toml:"revalidation"`
-	Defaults     DefaultsConfig     `toml:"defaults"`
-	Metrics      metrics.Config     `toml:"metrics"`
-	Listeners    []ListenerConfig   `toml:"listeners"`
-}
-
-type TailscaleConfig struct {
-	Hostname string `toml:"hostname"`
-	StateDir string `toml:"state_dir"`
+	Tailscale    tsconfig.TailscaleConfig `toml:"tailscale"`
+	Redis        RedisConfig              `toml:"redis"`
+	Revalidation RevalidationConfig       `toml:"revalidation"`
+	Defaults     DefaultsConfig           `toml:"defaults"`
+	Metrics      metrics.Config           `toml:"metrics"`
+	Listeners    []ListenerConfig         `toml:"listeners"`
 }
 
 type RedisConfig struct {
@@ -57,7 +55,21 @@ type ListenerConfig struct {
 	Mode                string         `toml:"mode"`
 	Backend             string         `toml:"backend"`
 	BackendViaTailscale bool           `toml:"backend_via_tailscale"`
+	Service             string         `toml:"service"`
 	Postgres            *PostgresAdmin `toml:"postgres"`
+}
+
+// ListenPort extracts the numeric port from the Listen address (e.g. ":5432" → 5432).
+func (l *ListenerConfig) ListenPort() (uint16, error) {
+	_, portStr, err := net.SplitHostPort(l.Listen)
+	if err != nil {
+		return 0, fmt.Errorf("invalid listen address %q: %w", l.Listen, err)
+	}
+	port, err := strconv.ParseUint(portStr, 10, 16)
+	if err != nil {
+		return 0, fmt.Errorf("invalid port in %q: %w", l.Listen, err)
+	}
+	return uint16(port), nil
 }
 
 type PostgresAdmin struct {
@@ -104,6 +116,9 @@ func validate(cfg *Config) error {
 	if cfg.Tailscale.Hostname == "" {
 		return fmt.Errorf("tailscale.hostname is required")
 	}
+	if err := cfg.Tailscale.Validate(); err != nil {
+		return err
+	}
 	if len(cfg.Listeners) == 0 {
 		return fmt.Errorf("at least one [[listeners]] is required")
 	}
@@ -125,6 +140,9 @@ func validate(cfg *Config) error {
 		}
 		if l.Backend == "" {
 			return fmt.Errorf("listeners[%d].backend is required", i)
+		}
+		if l.Service != "" && !strings.HasPrefix(l.Service, "svc:") {
+			return fmt.Errorf("listeners[%d].service must start with \"svc:\", got %q", i, l.Service)
 		}
 	}
 	return nil

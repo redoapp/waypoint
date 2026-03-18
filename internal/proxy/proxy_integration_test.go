@@ -1224,3 +1224,201 @@ func TestIntegration_TailscaleAuthorizer_NoCapability(t *testing.T) {
 		t.Fatalf("expected 'authentication failed' error, got: %v", err)
 	}
 }
+
+// setNodeTags sets ACL tags on a tsnet node via the test control plane and
+// waits for the node to see the updated tags.
+func setNodeTags(t *testing.T, ctx context.Context, control *testcontrol.Server, srv *tsnet.Server, tags []string) {
+	t.Helper()
+	lc, err := srv.LocalClient()
+	if err != nil {
+		t.Fatalf("local client: %v", err)
+	}
+	st, err := lc.Status(ctx)
+	if err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	nodeKey := st.Self.PublicKey
+	node := control.Node(nodeKey)
+	if node == nil {
+		t.Fatal("node not found in control")
+	}
+	node.Tags = tags
+	control.UpdateNode(node)
+
+	// Wait for the node to see its updated tags.
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		st, err = lc.Status(ctx)
+		if err != nil {
+			t.Fatalf("status poll: %v", err)
+		}
+		if st.Self.Tags != nil && st.Self.Tags.Len() > 0 {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatal("timed out waiting for node to see its tags")
+}
+
+// startTaggedTSNode starts a tsnet.Server and assigns it ACL tags via the control plane.
+func startTaggedTSNode(t *testing.T, ctx context.Context, controlURL string, control *testcontrol.Server, hostname string, tags []string) *tsnet.Server {
+	t.Helper()
+	srv := startTSNode(t, ctx, controlURL, hostname)
+	setNodeTags(t, ctx, control, srv, tags)
+	return srv
+}
+
+// TestIntegration_ListenService_TaggedNode verifies that ListenService succeeds
+// on a tagged node and that the returned ServiceListener works as a net.Listener.
+func TestIntegration_ListenService_TaggedNode(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	controlURL, control := startTailscaleControl(t)
+
+	proxyNode := startTaggedTSNode(t, ctx, controlURL, control, "svc-proxy", []string{"tag:waypoint"})
+
+	svcLn, err := proxyNode.ListenService("svc:echo-test", tsnet.ServiceModeTCP{Port: 7777})
+	if err != nil {
+		t.Fatalf("ListenService: %v", err)
+	}
+	defer svcLn.Close()
+
+	// Verify the ServiceListener has a valid FQDN.
+	if svcLn.FQDN == "" {
+		t.Error("expected non-empty FQDN on ServiceListener")
+	}
+	t.Logf("service FQDN: %s", svcLn.FQDN)
+
+	// Verify the ServiceListener works as a net.Listener by connecting
+	// to its local address directly.
+	go func() {
+		conn, err := svcLn.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		io.Copy(conn, conn)
+	}()
+
+	localAddr := svcLn.Listener.Addr().String()
+	conn, err := net.DialTimeout("tcp", localAddr, 5*time.Second)
+	if err != nil {
+		t.Fatalf("dial local listener: %v", err)
+	}
+	defer conn.Close()
+
+	msg := "hello-service"
+	if _, err := conn.Write([]byte(msg)); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	conn.(*net.TCPConn).CloseWrite()
+
+	buf := make([]byte, len(msg))
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if string(buf) != msg {
+		t.Errorf("echo = %q, want %q", buf, msg)
+	}
+}
+
+// TestIntegration_ListenService_UntaggedNodeFails verifies that ListenService
+// returns ErrUntaggedServiceHost when the node has no ACL tags.
+func TestIntegration_ListenService_UntaggedNodeFails(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	controlURL, _ := startTailscaleControl(t)
+
+	// Start a node without tags.
+	untaggedNode := startTSNode(t, ctx, controlURL, "svc-untagged")
+
+	_, err := untaggedNode.ListenService("svc:test", tsnet.ServiceModeTCP{Port: 9999})
+	if !errors.Is(err, tsnet.ErrUntaggedServiceHost) {
+		t.Fatalf("expected ErrUntaggedServiceHost, got: %v", err)
+	}
+}
+
+// TestIntegration_ListenService_MultiInstance verifies that multiple tagged nodes
+// can each register as hosts for the same Tailscale Service name.
+func TestIntegration_ListenService_MultiInstance(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	controlURL, control := startTailscaleControl(t)
+
+	proxyNode1 := startTaggedTSNode(t, ctx, controlURL, control, "svc-proxy-1", []string{"tag:waypoint"})
+	proxyNode2 := startTaggedTSNode(t, ctx, controlURL, control, "svc-proxy-2", []string{"tag:waypoint"})
+
+	// Both nodes register the same service.
+	svcLn1, err := proxyNode1.ListenService("svc:echo-multi", tsnet.ServiceModeTCP{Port: 8888})
+	if err != nil {
+		t.Fatalf("ListenService proxy1: %v", err)
+	}
+	defer svcLn1.Close()
+
+	svcLn2, err := proxyNode2.ListenService("svc:echo-multi", tsnet.ServiceModeTCP{Port: 8888})
+	if err != nil {
+		t.Fatalf("ListenService proxy2: %v", err)
+	}
+	defer svcLn2.Close()
+
+	// Each echo server tags its responses to identify the instance.
+	serveEchoTagged := func(ln net.Listener, tag string) {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				buf := make([]byte, 256)
+				n, err := conn.Read(buf)
+				if err != nil {
+					return
+				}
+				conn.Write([]byte(tag + ":" + string(buf[:n])))
+			}()
+		}
+	}
+	go serveEchoTagged(svcLn1, "node1")
+	go serveEchoTagged(svcLn2, "node2")
+
+	// Connect to each local listener and verify distinct responses.
+	checkInstance := func(svcLn *tsnet.ServiceListener, expectedTag string) {
+		t.Helper()
+		localAddr := svcLn.Listener.Addr().String()
+		conn, err := net.DialTimeout("tcp", localAddr, 5*time.Second)
+		if err != nil {
+			t.Fatalf("dial %s: %v", expectedTag, err)
+		}
+		defer conn.Close()
+
+		msg := "ping"
+		if _, err := conn.Write([]byte(msg)); err != nil {
+			t.Fatalf("write %s: %v", expectedTag, err)
+		}
+		conn.(*net.TCPConn).CloseWrite()
+
+		buf := make([]byte, 256)
+		n, err := conn.Read(buf)
+		if err != nil {
+			t.Fatalf("read %s: %v", expectedTag, err)
+		}
+		resp := string(buf[:n])
+		expected := expectedTag + ":" + msg
+		if resp != expected {
+			t.Errorf("%s: got %q, want %q", expectedTag, resp, expected)
+		}
+	}
+
+	checkInstance(svcLn1, "node1")
+	checkInstance(svcLn2, "node2")
+
+	// Both FQDNs should match since they're the same service.
+	if svcLn1.FQDN != svcLn2.FQDN {
+		t.Errorf("FQDNs should match: %q vs %q", svcLn1.FQDN, svcLn2.FQDN)
+	}
+	t.Logf("both instances registered as %s", svcLn1.FQDN)
+}

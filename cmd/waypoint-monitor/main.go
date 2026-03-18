@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -47,13 +48,8 @@ func main() {
 
 	// Start tsnet + SSH TUI if enabled.
 	if cfg.SSH.Enabled {
-		tsSrv := &tsnet.Server{
-			Hostname: cfg.Tailscale.Hostname,
-			Dir:      cfg.Tailscale.StateDir,
-		}
-		if authKey := os.Getenv("TS_AUTHKEY"); authKey != "" {
-			tsSrv.AuthKey = authKey
-		}
+		tsSrv := new(tsnet.Server)
+		cfg.Tailscale.Apply(tsSrv)
 		if err := tsSrv.Start(); err != nil {
 			logger.Error("tsnet start failed", "error", err)
 			os.Exit(1)
@@ -77,13 +73,29 @@ func main() {
 			os.Exit(1)
 		}
 
-		sshLn, err := tsSrv.Listen("tcp", cfg.SSH.Listen)
-		if err != nil {
-			logger.Error("ssh listen failed", "error", err)
-			os.Exit(1)
+		var sshLn net.Listener
+		if cfg.SSH.Service != "" {
+			port, err := cfg.sshListenPort()
+			if err != nil {
+				logger.Error("invalid ssh listen port for service", "error", err)
+				os.Exit(1)
+			}
+			svcLn, err := tsSrv.ListenService(cfg.SSH.Service, tsnet.ServiceModeTCP{Port: port})
+			if err != nil {
+				logger.Error("ssh listen service failed", "service", cfg.SSH.Service, "error", err)
+				os.Exit(1)
+			}
+			sshLn = svcLn
+			logger.Info("starting SSH TUI (service)", "service", cfg.SSH.Service, "fqdn", svcLn.FQDN)
+		} else {
+			var err error
+			sshLn, err = tsSrv.Listen("tcp", cfg.SSH.Listen)
+			if err != nil {
+				logger.Error("ssh listen failed", "error", err)
+				os.Exit(1)
+			}
+			logger.Info("starting SSH TUI", "hostname", cfg.Tailscale.Hostname, "listen", cfg.SSH.Listen)
 		}
-
-		logger.Info("starting SSH TUI", "hostname", cfg.Tailscale.Hostname, "listen", cfg.SSH.Listen)
 		go adminSrv.Serve(ctx, sshLn)
 	}
 
