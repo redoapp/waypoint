@@ -56,13 +56,19 @@ Access is controlled by Tailscale ACL capability grants. Example policy snippet:
   "grants": [{
     "src": ["group:backend"],
     "dst": ["tag:waypoint"],
-    "cap": {
+    "app": {
       "redo.com/cap/waypoint": [{
         "backends": ["pg-main"],
         "pg": {
           "databases": {
-            "myapp": { "permissions": ["SELECT", "INSERT", "UPDATE"] },
-            "*":     { "permissions": ["SELECT"] }
+            "myapp": {
+              "permissions": ["SELECT", "INSERT", "UPDATE"],
+              "sql": [
+                "GRANT USAGE ON SCHEMA analytics TO {role}",
+                "GRANT SELECT ON ALL TABLES IN SCHEMA analytics TO {role}"
+              ]
+            },
+            "*": { "permissions": ["SELECT"] }
           }
         },
         "limits": {
