@@ -125,7 +125,10 @@ func (p *Provisioner) EnsureUser(ctx context.Context, loginName, nodeName, datab
 			return "", "", fmt.Errorf("invalid sql in permissions: %w", err)
 		}
 		for _, raw := range perms.SQL {
-			resolved := strings.ReplaceAll(raw, "{role}", sanitizedRole)
+			resolved, err := renderSQL(raw, SQLTemplateData{Role: sanitizedRole})
+			if err != nil {
+				return "", "", fmt.Errorf("invalid sql template %q: %w", raw, err)
+			}
 			if _, err := conn.Exec(ctx, resolved); err != nil {
 				p.logger.Warn("sql statement failed", "role", pgUser, "sql", raw, "error", err)
 			}

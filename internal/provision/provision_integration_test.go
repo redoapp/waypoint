@@ -292,7 +292,7 @@ func TestIntegration_EnsureUser_SQLStatements(t *testing.T) {
 
 	perms := &auth.DBPermissions{
 		SQL: []string{
-			"GRANT SELECT ON public.sql_test_table TO {role}",
+			"GRANT SELECT ON public.sql_test_table TO {{.Role}}",
 		},
 	}
 	pgUser, password, err := p.EnsureUser(ctx, "sqltest@example.com", "sql-node", "waypoint_test", perms)

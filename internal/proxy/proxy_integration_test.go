@@ -400,8 +400,8 @@ func TestIntegration_Proxy_RawSQLPermissions(t *testing.T) {
 
 	result := makeAuthResult("waypoint_test", auth.DBPermissions{
 		SQL: []string{
-			"GRANT USAGE ON SCHEMA public TO {role}",
-			"GRANT SELECT ON public.acl_test TO {role}",
+			"GRANT USAGE ON SCHEMA public TO {{.Role}}",
+			"GRANT SELECT ON public.acl_test TO {{.Role}}",
 		},
 	}, nil)
 

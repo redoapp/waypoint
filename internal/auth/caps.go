@@ -15,6 +15,8 @@ type PGCap struct {
 }
 
 // DBPermissions lists SQL GRANT statements and raw SQL for a database.
+// SQL entries are Go text/template strings. Available variables:
+//   - {{.Role}} — the sanitized PG role identifier for the connecting user
 type DBPermissions struct {
 	Permissions []string `json:"permissions"`
 	SQL         []string `json:"sql,omitempty"`

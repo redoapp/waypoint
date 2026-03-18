@@ -64,8 +64,8 @@ Access is controlled by Tailscale ACL capability grants. Example policy snippet:
             "myapp": {
               "permissions": ["SELECT", "INSERT", "UPDATE"],
               "sql": [
-                "GRANT USAGE ON SCHEMA analytics TO {role}",
-                "GRANT SELECT ON ALL TABLES IN SCHEMA analytics TO {role}"
+                "GRANT USAGE ON SCHEMA analytics TO {{.Role}}",
+                "GRANT SELECT ON ALL TABLES IN SCHEMA analytics TO {{.Role}}"
               ]
             },
             "*": { "permissions": ["SELECT"] }

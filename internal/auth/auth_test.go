@@ -419,7 +419,7 @@ func TestDatabasePermissions_SQLFieldMerge(t *testing.T) {
 					Databases: map[string]DBPermissions{
 						"app_db": {
 							Permissions: []string{"SELECT ON public.users"},
-							SQL:         []string{"GRANT USAGE ON SCHEMA analytics TO {role}"},
+							SQL:         []string{"GRANT USAGE ON SCHEMA analytics TO {{.Role}}"},
 						},
 					},
 				},
@@ -429,10 +429,10 @@ func TestDatabasePermissions_SQLFieldMerge(t *testing.T) {
 				PG: &PGCap{
 					Databases: map[string]DBPermissions{
 						"app_db": {
-							SQL: []string{"ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO {role}"},
+							SQL: []string{"ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO {{.Role}}"},
 						},
 						"*": {
-							SQL: []string{"GRANT USAGE ON SCHEMA public TO {role}"},
+							SQL: []string{"GRANT USAGE ON SCHEMA public TO {{.Role}}"},
 						},
 					},
 				},
@@ -459,7 +459,7 @@ func TestDatabasePermissions_SQLOnlyAccess(t *testing.T) {
 			PG: &PGCap{
 				Databases: map[string]DBPermissions{
 					"app_db": {
-						SQL: []string{"GRANT SELECT ON public.users TO {role}"},
+						SQL: []string{"GRANT SELECT ON public.users TO {{.Role}}"},
 					},
 				},
 			},
@@ -473,7 +473,7 @@ func TestDatabasePermissions_SQLOnlyAccess(t *testing.T) {
 	if len(dbPerms.Permissions) != 0 {
 		t.Errorf("expected 0 permissions, got %d", len(dbPerms.Permissions))
 	}
-	if len(dbPerms.SQL) != 1 || dbPerms.SQL[0] != "GRANT SELECT ON public.users TO {role}" {
+	if len(dbPerms.SQL) != 1 || dbPerms.SQL[0] != "GRANT SELECT ON public.users TO {{.Role}}" {
 		t.Errorf("unexpected SQL: %v", dbPerms.SQL)
 	}
 }

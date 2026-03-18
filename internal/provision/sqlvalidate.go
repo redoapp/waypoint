@@ -9,7 +9,7 @@ import (
 	"github.com/cockroachdb/cockroachdb-parser/pkg/sql/sem/tree"
 )
 
-// rolePlaceholder replaces {role} before parsing so the parser sees a valid identifier.
+// rolePlaceholder is substituted for {{.Role}} before parsing so the parser sees a valid identifier.
 const rolePlaceholder = "__wp_role_placeholder__"
 
 // allowedPrivileges is the set of privilege kinds we permit (CockroachDB-recognized subset).
@@ -67,8 +67,11 @@ func validateSQL(statements []string) error {
 			return fmt.Errorf("invalid sql %q: %w", stmt, err)
 		}
 
-		// Replace {role} placeholder with a valid identifier.
-		prepared = strings.ReplaceAll(prepared, "{role}", rolePlaceholder)
+		// Render template placeholders with valid identifiers for parsing.
+		prepared, err = renderSQL(prepared, SQLTemplateData{Role: rolePlaceholder})
+		if err != nil {
+			return fmt.Errorf("invalid sql %q: %w", stmt, err)
+		}
 
 		parsed, err := parser.ParseOne(prepared)
 		if err != nil {
@@ -351,13 +354,13 @@ func validateAlterDefault(stmt *tree.AlterDefaultPrivileges, original string) er
 // validateGrantees ensures exactly one grantee matching our placeholder.
 func validateGrantees(grantees tree.RoleSpecList, original string) error {
 	if len(grantees) != 1 {
-		return fmt.Errorf("role reference must be exactly {role}: %s", original)
+		return fmt.Errorf("role reference must be exactly {{.Role}}: %s", original)
 	}
 	if grantees[0].RoleSpecType != tree.RoleName {
-		return fmt.Errorf("role reference must be exactly {role}: %s", original)
+		return fmt.Errorf("role reference must be exactly {{.Role}}: %s", original)
 	}
 	if !strings.EqualFold(grantees[0].Name, rolePlaceholder) {
-		return fmt.Errorf("role reference must be {role}: %s", original)
+		return fmt.Errorf("role reference must be {{.Role}}: %s", original)
 	}
 	return nil
 }
@@ -404,7 +407,7 @@ func validateTargets(targets *tree.GrantTargetList, original string) error {
 			// Check that none of the name parts match the role placeholder.
 			for i := 0; i < t.NumParts; i++ {
 				if strings.EqualFold(t.Parts[i], rolePlaceholder) {
-					return fmt.Errorf("{role} placeholder not allowed in target: %s", original)
+					return fmt.Errorf("{{.Role}} placeholder not allowed in target: %s", original)
 				}
 			}
 		case *tree.AllTablesSelector:
@@ -419,14 +422,14 @@ func validateTargets(targets *tree.GrantTargetList, original string) error {
 			return fmt.Errorf("catalog-qualified schema names are not allowed: %s", original)
 		}
 		if strings.EqualFold(string(s.SchemaName), rolePlaceholder) {
-			return fmt.Errorf("{role} placeholder not allowed in target: %s", original)
+			return fmt.Errorf("{{.Role}} placeholder not allowed in target: %s", original)
 		}
 	}
 
 	// Reject placeholder in database targets.
 	for _, d := range targets.Databases {
 		if strings.EqualFold(string(d), rolePlaceholder) {
-			return fmt.Errorf("{role} placeholder not allowed in target: %s", original)
+			return fmt.Errorf("{{.Role}} placeholder not allowed in target: %s", original)
 		}
 	}
 
