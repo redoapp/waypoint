@@ -7,7 +7,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/docker/go-connections/nat"
 	"github.com/jackc/pgx/v5"
 	"github.com/redis/go-redis/v9"
 	"github.com/testcontainers/testcontainers-go"
@@ -164,19 +163,43 @@ func CockroachDBBackend(t *testing.T) (connStr string, backend string) {
 
 	crdbOnce.Do(func() {
 		ctx := context.Background()
+
+		// Generate certs and start in secure mode so passwords work.
+		// --accept-sql-without-tls lets clients connect over plain TCP.
+		initScript := `#!/bin/sh
+set -e
+mkdir -p /cockroach/certs /cockroach/ca-key
+cockroach cert create-ca --certs-dir=/cockroach/certs --ca-key=/cockroach/ca-key/ca.key
+cockroach cert create-node localhost 127.0.0.1 --certs-dir=/cockroach/certs --ca-key=/cockroach/ca-key/ca.key
+cockroach cert create-client root --certs-dir=/cockroach/certs --ca-key=/cockroach/ca-key/ca.key
+exec cockroach start-single-node --certs-dir=/cockroach/certs --accept-sql-without-tls
+`
 		container, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
 			ContainerRequest: testcontainers.ContainerRequest{
 				Image:        "cockroachdb/cockroach:latest-v24.3",
 				ExposedPorts: []string{"26257/tcp"},
-				Cmd:          []string{"start-single-node", "--insecure", "--store=type=mem,size=256MiB"},
-				WaitingFor: wait.ForSQL("26257/tcp", "pgx", func(host string, port nat.Port) string {
-					return fmt.Sprintf("postgres://root@%s:%s/defaultdb?sslmode=disable", host, port.Port())
-				}).WithStartupTimeout(2 * time.Minute),
+				Entrypoint:   []string{"/bin/sh", "-c", initScript},
+				WaitingFor: wait.ForLog("CockroachDB node starting at").
+					WithStartupTimeout(2 * time.Minute),
 			},
 			Started: true,
 		})
 		if err != nil {
 			crdbErr = fmt.Errorf("start cockroachdb container: %w", err)
+			return
+		}
+
+		// Set root password via exec so we can connect over plaintext TCP.
+		code, _, execErr := container.Exec(ctx, []string{
+			"cockroach", "sql", "--certs-dir=/cockroach/certs",
+			"-e", "ALTER USER root WITH PASSWORD 'rootpass'",
+		})
+		if execErr != nil {
+			crdbErr = fmt.Errorf("cockroachdb set root password: %w", execErr)
+			return
+		}
+		if code != 0 {
+			crdbErr = fmt.Errorf("cockroachdb set root password: exit code %d", code)
 			return
 		}
 
@@ -192,7 +215,7 @@ func CockroachDBBackend(t *testing.T) (connStr string, backend string) {
 			return
 		}
 
-		cs := fmt.Sprintf("postgres://root@%s:%s/defaultdb?sslmode=disable", host, port.Port())
+		cs := fmt.Sprintf("postgres://root:rootpass@%s:%s/defaultdb?sslmode=disable", host, port.Port())
 
 		// Create a test database and admin user with password.
 		var conn *pgx.Conn
@@ -209,11 +232,12 @@ func CockroachDBBackend(t *testing.T) (connStr string, backend string) {
 		}
 
 		// Create database and admin role.
+		// Use "wpadmin" because "admin" is a built-in CockroachDB role.
 		stmts := []string{
 			"CREATE DATABASE IF NOT EXISTS waypoint_test",
-			"CREATE USER IF NOT EXISTS admin WITH PASSWORD 'adminpass'",
-			"GRANT admin TO root",
-			"GRANT ALL ON DATABASE waypoint_test TO admin",
+			"CREATE USER IF NOT EXISTS wpadmin WITH PASSWORD 'adminpass'",
+			"GRANT admin TO wpadmin",
+			"GRANT ALL ON DATABASE waypoint_test TO wpadmin",
 		}
 		for _, stmt := range stmts {
 			if _, err := conn.Exec(ctx, stmt); err != nil {
@@ -224,7 +248,7 @@ func CockroachDBBackend(t *testing.T) (connStr string, backend string) {
 		}
 		conn.Close(ctx)
 
-		crdbConnStr = fmt.Sprintf("postgres://admin:adminpass@%s:%s/waypoint_test?sslmode=disable", host, port.Port())
+		crdbConnStr = fmt.Sprintf("postgres://wpadmin:adminpass@%s:%s/waypoint_test?sslmode=disable", host, port.Port())
 		crdbBackend = fmt.Sprintf("%s:%s", host, port.Port())
 
 		// Verify admin connection works.

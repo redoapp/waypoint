@@ -19,9 +19,11 @@ import (
 
 // dbBackend describes a database backend for parameterized tests.
 type dbBackend struct {
-	name    string
-	connStr string
-	backend string
+	name      string
+	connStr   string
+	backend   string
+	adminUser string
+	adminPass string
 }
 
 func testBackends(t *testing.T) []dbBackend {
@@ -29,10 +31,10 @@ func testBackends(t *testing.T) []dbBackend {
 	backends := make([]dbBackend, 0, 2)
 
 	pgConnStr, pgBackend := testutil.PostgresBackend(t)
-	backends = append(backends, dbBackend{name: "postgres", connStr: pgConnStr, backend: pgBackend})
+	backends = append(backends, dbBackend{name: "postgres", connStr: pgConnStr, backend: pgBackend, adminUser: "admin", adminPass: "adminpass"})
 
 	crdbConnStr, crdbBackend := testutil.CockroachDBBackend(t)
-	backends = append(backends, dbBackend{name: "cockroachdb", connStr: crdbConnStr, backend: crdbBackend})
+	backends = append(backends, dbBackend{name: "cockroachdb", connStr: crdbConnStr, backend: crdbBackend, adminUser: "wpadmin", adminPass: "adminpass"})
 
 	return backends
 }
@@ -42,7 +44,7 @@ func setupProvisionerFor(t *testing.T, db dbBackend) *Provisioner {
 	rdb := testutil.RedisClient(t)
 	store := restrict.NewRedisStore(rdb, "inttest:", metrics.Noop())
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	return NewProvisioner("admin", "adminpass", "waypoint_test", db.backend, "wp_", store, logger)
+	return NewProvisioner(db.adminUser, db.adminPass, "waypoint_test", db.backend, "wp_", store, logger)
 }
 
 func adminConnFor(t *testing.T, db dbBackend) *pgx.Conn {
