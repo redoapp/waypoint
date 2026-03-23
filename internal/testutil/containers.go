@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/docker/go-connections/nat"
 	"github.com/jackc/pgx/v5"
 	"github.com/redis/go-redis/v9"
 	"github.com/testcontainers/testcontainers-go"
@@ -168,8 +169,9 @@ func CockroachDBBackend(t *testing.T) (connStr string, backend string) {
 				Image:        "cockroachdb/cockroach:latest-v24.3",
 				ExposedPorts: []string{"26257/tcp"},
 				Cmd:          []string{"start-single-node", "--insecure", "--store=type=mem,size=256MiB"},
-				WaitingFor: wait.ForLog("CockroachDB node starting at").
-					WithStartupTimeout(2 * time.Minute),
+				WaitingFor: wait.ForSQL("26257/tcp", "pgx", func(host string, port nat.Port) string {
+					return fmt.Sprintf("postgres://root@%s:%s/defaultdb?sslmode=disable", host, port.Port())
+				}).WithStartupTimeout(2 * time.Minute),
 			},
 			Started: true,
 		})
