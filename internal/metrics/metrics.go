@@ -49,10 +49,6 @@ type Metrics struct {
 	ProvisionLatency metric.Float64Histogram
 	ProvisionErrors  metric.Int64Counter
 
-	// Cleanup metrics.
-	CleanupRuns    metric.Int64Counter
-	CleanupDropped metric.Int64Counter
-
 	// Redis metrics.
 	RedisOpDuration metric.Float64Histogram
 	RedisErrors     metric.Int64Counter
@@ -196,12 +192,6 @@ func (m *Metrics) init() (*Metrics, error) {
 		return nil, err
 	}
 	if m.ProvisionErrors, err = meter("waypoint.provision.errors").Int64Counter("waypoint.provision.errors"); err != nil {
-		return nil, err
-	}
-	if m.CleanupRuns, err = meter("waypoint.cleanup.runs").Int64Counter("waypoint.cleanup.runs"); err != nil {
-		return nil, err
-	}
-	if m.CleanupDropped, err = meter("waypoint.cleanup.dropped").Int64Counter("waypoint.cleanup.dropped"); err != nil {
 		return nil, err
 	}
 	if m.RedisOpDuration, err = meter("waypoint.redis.op_duration").Float64Histogram("waypoint.redis.op_duration", metric.WithUnit("s")); err != nil {

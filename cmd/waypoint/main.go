@@ -194,20 +194,6 @@ func main() {
 				BytesWritten:  &bytesWritten,
 			}
 			go acceptLoop(ctx, &wg, ln, p.HandleConn, logger.With("listener", lCfg.Name))
-
-			// Start cleanup goroutine.
-			cleaner := provision.NewCleaner(
-				lCfg.Postgres.AdminUser,
-				lCfg.Postgres.AdminPassword,
-				lCfg.Postgres.AdminDatabase,
-				lCfg.Backend,
-				lCfg.Postgres.UserPrefix,
-				lCfg.Postgres.UserTTLDuration(),
-				store,
-				m,
-				logger.With("component", "cleaner", "listener", lCfg.Name),
-			)
-			go cleaner.Run(ctx)
 		}
 
 		m.SystemListeners.Add(ctx, 1, m.Attrs("waypoint.system.listeners"))

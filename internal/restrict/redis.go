@@ -250,3 +250,44 @@ func (s *RedisStore) GetLastUsed(ctx context.Context, pgUser string) (time.Time,
 	s.recordOp(ctx, "get_last_used", start, nil)
 	return time.Unix(val, 0), nil
 }
+
+// releaseLockScript atomically checks the token before deleting the lock key.
+var releaseLockScript = redis.NewScript(`
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+    return redis.call("DEL", KEYS[1])
+end
+return 0
+`)
+
+// AcquireLock attempts to acquire a distributed lock using Redis SET NX EX.
+// Returns a token that must be passed to ReleaseLock, or empty string if not acquired.
+func (s *RedisStore) AcquireLock(ctx context.Context, name string, ttl time.Duration) (string, error) {
+	start := time.Now()
+	token := fmt.Sprintf("%d:%d", time.Now().UnixNano(), start.UnixNano())
+	key := s.key("lock", name)
+	result, err := s.client.SetArgs(ctx, key, token, redis.SetArgs{Mode: "NX", TTL: ttl}).Result()
+	s.recordOp(ctx, "acquire_lock", start, err)
+	if err == redis.Nil {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	if result != "OK" {
+		return "", nil
+	}
+	return token, nil
+}
+
+// ReleaseLock releases a distributed lock acquired by AcquireLock.
+// The token must match the one returned by AcquireLock.
+func (s *RedisStore) ReleaseLock(ctx context.Context, name string, token string) error {
+	start := time.Now()
+	key := s.key("lock", name)
+	err := releaseLockScript.Run(ctx, s.client, []string{key}, token).Err()
+	if err == redis.Nil {
+		err = nil // lock already expired or released
+	}
+	s.recordOp(ctx, "release_lock", start, err)
+	return err
+}

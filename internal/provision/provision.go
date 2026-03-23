@@ -6,21 +6,14 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"hash/fnv"
 	"log/slog"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/redoapp/waypoint/internal/auth"
 	"github.com/redoapp/waypoint/internal/restrict"
 )
-
-// roleLockKey computes a stable advisory lock key from a role name using FNV-1a.
-func roleLockKey(roleName string) int64 {
-	h := fnv.New64a()
-	h.Write([]byte(roleName))
-	return int64(h.Sum64())
-}
 
 // Provisioner manages dynamic PostgreSQL user lifecycle.
 type Provisioner struct {
@@ -50,26 +43,45 @@ func NewProvisioner(adminUser, adminPassword, adminDatabase, backend, userPrefix
 func (p *Provisioner) EnsureUser(ctx context.Context, loginName, nodeName, database string, perms *auth.DBPermissions) (string, string, error) {
 	pgUser := p.formatUsername(loginName, nodeName, database)
 
+	// Acquire a distributed lock via Redis to serialize concurrent EnsureUser
+	// calls for the same role. This works with both PostgreSQL and CockroachDB.
+	const lockTTL = 30 * time.Second
+	const maxRetries = 10
+	const retryDelay = 100 * time.Millisecond
+
+	var lockToken string
+	for i := 0; i < maxRetries; i++ {
+		token, err := p.store.AcquireLock(ctx, "role:"+pgUser, lockTTL)
+		if err != nil {
+			return "", "", fmt.Errorf("acquire lock: %w", err)
+		}
+		if token != "" {
+			lockToken = token
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return "", "", ctx.Err()
+		case <-time.After(retryDelay):
+		}
+	}
+	if lockToken == "" {
+		return "", "", fmt.Errorf("could not acquire lock for role %q", pgUser)
+	}
+	defer p.store.ReleaseLock(ctx, "role:"+pgUser, lockToken)
+
 	conn, err := pgx.Connect(ctx, p.adminConnStr)
 	if err != nil {
 		return "", "", fmt.Errorf("admin connect: %w", err)
 	}
 	defer conn.Close(ctx)
 
-	// Acquire a session-level advisory lock keyed on the role name to serialize
-	// concurrent EnsureUser calls for the same role.
-	lockKey := roleLockKey(pgUser)
-	if _, err := conn.Exec(ctx, "SELECT pg_advisory_lock($1)", lockKey); err != nil {
-		return "", "", fmt.Errorf("advisory lock: %w", err)
-	}
-	defer func() {
-		conn.Exec(ctx, "SELECT pg_advisory_unlock($1)", lockKey)
-	}()
+	// Detect database dialect (PostgreSQL vs CockroachDB).
+	dialect := detectDialect(ctx, conn, p.adminConnStr)
 
 	// Check if user exists.
 	var exists bool
-	err = conn.QueryRow(ctx,
-		"SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname = $1)", pgUser).Scan(&exists)
+	err = conn.QueryRow(ctx, roleExistsQuery(dialect), pgUser).Scan(&exists)
 	if err != nil {
 		return "", "", fmt.Errorf("check role: %w", err)
 	}

@@ -24,6 +24,11 @@ var (
 	pgConnStr string
 	pgBackend string
 	pgErr     error
+
+	crdbOnce    sync.Once
+	crdbConnStr string
+	crdbBackend string
+	crdbErr     error
 )
 
 // RedisClient starts a shared Redis 7-alpine container (once per test binary)
@@ -149,4 +154,95 @@ func PostgresBackend(t *testing.T) (connStr string, backend string) {
 	}
 
 	return pgConnStr, pgBackend
+}
+
+// CockroachDBBackend starts a shared single-node CockroachDB container (once per test binary)
+// and returns the admin connection string and host:port backend address.
+func CockroachDBBackend(t *testing.T) (connStr string, backend string) {
+	t.Helper()
+
+	crdbOnce.Do(func() {
+		ctx := context.Background()
+		container, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
+			ContainerRequest: testcontainers.ContainerRequest{
+				Image:        "cockroachdb/cockroach:latest-v24.3",
+				ExposedPorts: []string{"26257/tcp"},
+				Cmd:          []string{"start-single-node", "--insecure", "--store=type=mem,size=256MiB"},
+				WaitingFor: wait.ForLog("CockroachDB node starting at").
+					WithStartupTimeout(2 * time.Minute),
+			},
+			Started: true,
+		})
+		if err != nil {
+			crdbErr = fmt.Errorf("start cockroachdb container: %w", err)
+			return
+		}
+
+		host, err := container.Host(ctx)
+		if err != nil {
+			crdbErr = fmt.Errorf("cockroachdb host: %w", err)
+			return
+		}
+
+		port, err := container.MappedPort(ctx, "26257/tcp")
+		if err != nil {
+			crdbErr = fmt.Errorf("cockroachdb port: %w", err)
+			return
+		}
+
+		cs := fmt.Sprintf("postgres://root@%s:%s/defaultdb?sslmode=disable", host, port.Port())
+
+		// Create a test database and admin user with password.
+		var conn *pgx.Conn
+		for i := 0; i < 10; i++ {
+			conn, err = pgx.Connect(ctx, cs)
+			if err == nil {
+				break
+			}
+			time.Sleep(500 * time.Millisecond)
+		}
+		if err != nil {
+			crdbErr = fmt.Errorf("cockroachdb connect after retries: %w", err)
+			return
+		}
+
+		// Create database and admin role.
+		stmts := []string{
+			"CREATE DATABASE IF NOT EXISTS waypoint_test",
+			"CREATE USER IF NOT EXISTS admin WITH PASSWORD 'adminpass'",
+			"GRANT admin TO root",
+			"GRANT ALL ON DATABASE waypoint_test TO admin",
+		}
+		for _, stmt := range stmts {
+			if _, err := conn.Exec(ctx, stmt); err != nil {
+				crdbErr = fmt.Errorf("cockroachdb setup %q: %w", stmt, err)
+				conn.Close(ctx)
+				return
+			}
+		}
+		conn.Close(ctx)
+
+		crdbConnStr = fmt.Sprintf("postgres://admin:adminpass@%s:%s/waypoint_test?sslmode=disable", host, port.Port())
+		crdbBackend = fmt.Sprintf("%s:%s", host, port.Port())
+
+		// Verify admin connection works.
+		for i := 0; i < 10; i++ {
+			conn, err = pgx.Connect(ctx, crdbConnStr)
+			if err == nil {
+				conn.Close(ctx)
+				break
+			}
+			time.Sleep(500 * time.Millisecond)
+		}
+		if err != nil {
+			crdbErr = fmt.Errorf("cockroachdb admin connect after retries: %w", err)
+			return
+		}
+	})
+
+	if crdbErr != nil {
+		t.Fatalf("cockroachdb container: %v", crdbErr)
+	}
+
+	return crdbConnStr, crdbBackend
 }
