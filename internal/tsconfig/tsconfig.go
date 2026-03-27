@@ -2,6 +2,7 @@ package tsconfig
 
 import (
 	"fmt"
+	"os"
 	"strings"
 
 	"tailscale.com/tsnet"
@@ -101,7 +102,17 @@ func (c *TailscaleConfig) Apply(srv *tsnet.Server) {
 		srv.ClientID = c.ClientID
 	}
 	if c.IDToken != "" {
-		srv.IDToken = c.IDToken
+		// If id_token looks like a file path, read the token from the file.
+		if strings.HasPrefix(c.IDToken, "/") {
+			data, err := os.ReadFile(c.IDToken)
+			if err == nil {
+				srv.IDToken = strings.TrimSpace(string(data))
+			} else {
+				srv.IDToken = c.IDToken
+			}
+		} else {
+			srv.IDToken = c.IDToken
+		}
 	}
 	if c.Audience != "" {
 		srv.Audience = c.Audience
