@@ -26,6 +26,7 @@ type RedisConfig struct {
 	Address   string `toml:"address"`
 	Password  string `toml:"password"`
 	DB        int    `toml:"db"`
+	TLS       bool   `toml:"tls"`
 	KeyPrefix string `toml:"key_prefix"`
 }
 

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"flag"
 	"log/slog"
 	"net"
@@ -58,11 +59,15 @@ func main() {
 	if redisAddr == "" {
 		redisAddr = "localhost:6379"
 	}
-	rdb := redis.NewClient(&redis.Options{
+	opts := &redis.Options{
 		Addr:     redisAddr,
 		Password: cfg.Redis.Password,
 		DB:       cfg.Redis.DB,
-	})
+	}
+	if cfg.Redis.TLS {
+		opts.TLSConfig = &tls.Config{}
+	}
+	rdb := redis.NewClient(opts)
 	if err := rdb.Ping(ctx).Err(); err != nil {
 		logger.Error("redis connection failed", "error", err)
 		os.Exit(1)

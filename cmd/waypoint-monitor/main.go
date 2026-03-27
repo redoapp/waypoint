@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"flag"
 	"log/slog"
 	"net"
@@ -33,11 +34,15 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	rdb := redis.NewClient(&redis.Options{
+	opts := &redis.Options{
 		Addr:     cfg.Redis.Address,
 		Password: cfg.Redis.Password,
 		DB:       cfg.Redis.DB,
-	})
+	}
+	if cfg.Redis.TLS {
+		opts.TLSConfig = &tls.Config{}
+	}
+	rdb := redis.NewClient(opts)
 	if err := rdb.Ping(ctx).Err(); err != nil {
 		logger.Error("redis connection failed", "error", err)
 		os.Exit(1)
