@@ -509,6 +509,44 @@ service = "waypoint-db"
 	}
 }
 
+func TestValidate_ServiceHostnameCollision(t *testing.T) {
+	content := `
+[tailscale]
+hostname = "waypoint-db"
+
+[[listeners]]
+name = "pg-svc"
+listen = ":5432"
+mode = "tcp"
+backend = "10.0.0.1:5432"
+service = "svc:waypoint-db"
+`
+	path := writeTestConfig(t, content)
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "conflicts with tailscale.hostname") {
+		t.Errorf("expected hostname collision error, got: %v", err)
+	}
+}
+
+func TestValidate_ServiceHostnameNoCollision(t *testing.T) {
+	content := `
+[tailscale]
+hostname = "waypoint-proxy"
+
+[[listeners]]
+name = "pg-svc"
+listen = ":5432"
+mode = "tcp"
+backend = "10.0.0.1:5432"
+service = "svc:waypoint-db"
+`
+	path := writeTestConfig(t, content)
+	_, err := Load(path)
+	if err != nil {
+		t.Errorf("expected no error, got: %v", err)
+	}
+}
+
 func TestListenerConfig_ListenPort(t *testing.T) {
 	tests := []struct {
 		listen  string

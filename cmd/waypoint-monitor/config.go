@@ -69,6 +69,9 @@ func loadConfig(path string) (*MonitorConfig, error) {
 	if cfg.SSH.Service != "" && !strings.HasPrefix(cfg.SSH.Service, "svc:") {
 		return nil, fmt.Errorf("ssh.service must start with \"svc:\", got %q", cfg.SSH.Service)
 	}
+	if cfg.SSH.Service != "" && strings.TrimPrefix(cfg.SSH.Service, "svc:") == cfg.Tailscale.Hostname {
+		return nil, fmt.Errorf("ssh.service %q conflicts with tailscale.hostname %q — the service name (without \"svc:\" prefix) must differ from the hostname to avoid DNS shadowing", cfg.SSH.Service, cfg.Tailscale.Hostname)
+	}
 
 	return &cfg, nil
 }

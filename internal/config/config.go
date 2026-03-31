@@ -145,6 +145,9 @@ func validate(cfg *Config) error {
 		if l.Service != "" && !strings.HasPrefix(l.Service, "svc:") {
 			return fmt.Errorf("listeners[%d].service must start with \"svc:\", got %q", i, l.Service)
 		}
+		if l.Service != "" && strings.TrimPrefix(l.Service, "svc:") == cfg.Tailscale.Hostname {
+			return fmt.Errorf("listeners[%d].service %q conflicts with tailscale.hostname %q — the service name (without \"svc:\" prefix) must differ from the hostname to avoid DNS shadowing", i, l.Service, cfg.Tailscale.Hostname)
+		}
 	}
 	return nil
 }
