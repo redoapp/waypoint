@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"flag"
+	"fmt"
 	"log/slog"
 	"net"
 	"os"
@@ -14,6 +15,7 @@ import (
 	"syscall"
 
 	"github.com/google/uuid"
+	proxyproto "github.com/pires/go-proxyproto"
 	"github.com/redis/go-redis/v9"
 	"github.com/redoapp/waypoint/internal/config"
 	"github.com/redoapp/waypoint/internal/heartbeat"
@@ -37,20 +39,32 @@ func main() {
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
-	cfg, err := config.Load(*configPath)
-	if err != nil {
-		logger.Error("failed to load config", "error", err)
-		os.Exit(1)
-	}
-
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
+
+	if err := run(ctx, *configPath, logger); err != nil {
+		logger.Error("fatal", "error", err)
+		os.Exit(1)
+	}
+}
+
+func run(ctx context.Context, configPath string, logger *slog.Logger) error {
+	return runServer(ctx, configPath, logger, nil)
+}
+
+// runServer starts waypoint. If afterTSStart is non-nil, it is called after the
+// tsnet server connects but before listeners are created. Tests use this to set
+// node tags on the test control plane.
+func runServer(ctx context.Context, configPath string, logger *slog.Logger, afterTSStart func(*tsnet.Server) error) error {
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		return fmt.Errorf("load config: %w", err)
+	}
 
 	// Metrics.
 	m, err := metrics.New(ctx, cfg.Metrics)
 	if err != nil {
-		logger.Error("failed to initialize metrics", "error", err)
-		os.Exit(1)
+		return fmt.Errorf("initialize metrics: %w", err)
 	}
 	defer m.Shutdown(ctx)
 
@@ -69,8 +83,7 @@ func main() {
 	}
 	rdb := redis.NewClient(opts)
 	if err := rdb.Ping(ctx).Err(); err != nil {
-		logger.Error("redis connection failed", "error", err)
-		os.Exit(1)
+		return fmt.Errorf("redis connection: %w", err)
 	}
 	defer rdb.Close()
 
@@ -102,15 +115,19 @@ func main() {
 	cfg.Tailscale.Apply(srv)
 
 	if err := srv.Start(); err != nil {
-		logger.Error("tsnet start failed", "error", err)
-		os.Exit(1)
+		return fmt.Errorf("tsnet start: %w", err)
 	}
 	defer srv.Close()
 
+	if afterTSStart != nil {
+		if err := afterTSStart(srv); err != nil {
+			return fmt.Errorf("after tsnet start: %w", err)
+		}
+	}
+
 	lc, err := srv.LocalClient()
 	if err != nil {
-		logger.Error("failed to get local client", "error", err)
-		os.Exit(1)
+		return fmt.Errorf("local client: %w", err)
 	}
 
 	// Track active connections for graceful shutdown.
@@ -128,22 +145,22 @@ func main() {
 		if lCfg.Service != "" {
 			port, err := lCfg.ListenPort()
 			if err != nil {
-				logger.Error("invalid listen port for service", "name", lCfg.Name, "error", err)
-				os.Exit(1)
+				return fmt.Errorf("invalid listen port for service %s: %w", lCfg.Name, err)
 			}
-			svcLn, err := srv.ListenService(lCfg.Service, tsnet.ServiceModeTCP{Port: port})
+			svcLn, err := srv.ListenService(lCfg.Service, tsnet.ServiceModeTCP{
+				Port:                 port,
+				PROXYProtocolVersion: 2,
+			})
 			if err != nil {
-				logger.Error("listen service failed", "name", lCfg.Name, "service", lCfg.Service, "error", err)
-				os.Exit(1)
+				return fmt.Errorf("listen service %s (%s): %w", lCfg.Name, lCfg.Service, err)
 			}
-			ln = svcLn
 			logger.Info("registered tailscale service", "name", lCfg.Name, "service", lCfg.Service, "fqdn", svcLn.FQDN)
+			ln = &proxyproto.Listener{Listener: svcLn}
 		} else {
 			var err error
 			ln, err = srv.Listen("tcp", lCfg.Listen)
 			if err != nil {
-				logger.Error("listen failed", "name", lCfg.Name, "addr", lCfg.Listen, "error", err)
-				os.Exit(1)
+				return fmt.Errorf("listen %s (%s): %w", lCfg.Name, lCfg.Listen, err)
 			}
 		}
 		listeners = append(listeners, ln)
@@ -170,8 +187,7 @@ func main() {
 
 		case "postgres":
 			if lCfg.Postgres == nil {
-				logger.Error("postgres listener requires [listeners.postgres] config", "name", lCfg.Name)
-				os.Exit(1)
+				return fmt.Errorf("postgres listener %s requires [listeners.postgres] config", lCfg.Name)
 			}
 
 			provisioner := provision.NewProvisioner(
@@ -216,6 +232,7 @@ func main() {
 	// Wait for active connections to finish.
 	wg.Wait()
 	logger.Info("shutdown complete")
+	return nil
 }
 
 func acceptLoop(ctx context.Context, wg *sync.WaitGroup, ln net.Listener, handler func(context.Context, net.Conn), logger *slog.Logger) {
