@@ -44,7 +44,7 @@ func setupProvisionerFor(t *testing.T, db dbBackend) *Provisioner {
 	rdb := testutil.RedisClient(t)
 	store := restrict.NewRedisStore(rdb, "inttest:", metrics.Noop())
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	return NewProvisioner(db.adminUser, db.adminPass, "waypoint_test", db.backend, "wp_", store, logger, nil)
+	return NewProvisioner(db.adminUser, db.adminPass, "waypoint_test", db.backend, "wp_", store, logger, nil, nil)
 }
 
 func adminConnFor(t *testing.T, db dbBackend) *pgx.Conn {

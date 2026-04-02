@@ -17,12 +17,14 @@ import (
 
 	"github.com/redoapp/waypoint/internal/auth"
 	"github.com/redoapp/waypoint/internal/testutil"
+	"github.com/redoapp/waypoint/internal/tsdns"
 	"tailscale.com/ipn/store/mem"
 	"tailscale.com/net/netns"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tsnet"
 	"tailscale.com/tstest/integration"
 	"tailscale.com/tstest/integration/testcontrol"
+	"tailscale.com/types/dnstype"
 	"tailscale.com/types/logger"
 )
 
@@ -254,5 +256,107 @@ backend = "%s"
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("timed out waiting for shutdown")
+	}
+}
+
+// TestE2E_SplitDNS_ResolveViaTailscale verifies that the tsdns package
+// correctly resolves hostnames through the Tailscale local API when DNS
+// extra records are configured on the fake control plane. This is a
+// regression test for tailscale/tailscale#5840 where tsnet.Server.Dial
+// falls back to the system resolver for non-tailnet names.
+func TestE2E_SplitDNS_ResolveViaTailscale(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	// --- Fake Tailscale control plane with extra DNS records ---
+
+	netns.SetEnabled(false)
+	t.Cleanup(func() { netns.SetEnabled(true) })
+
+	derpMap := integration.RunDERPAndSTUN(t, logger.Discard, "127.0.0.1")
+	control := &testcontrol.Server{
+		DERPMap: derpMap,
+		DNSConfig: &tailcfg.DNSConfig{
+			Proxied: true,
+			// Route the suffix through MagicDNS (empty resolver list =
+			// handled by the built-in resolver using ExtraRecords).
+			Routes: map[string][]*dnstype.Resolver{
+				"example.com": {},
+			},
+			ExtraRecords: []tailcfg.DNSRecord{
+				{Name: "db.example.com.", Value: "10.77.1.50"},
+			},
+		},
+		MagicDNSDomain: "tail-scale.ts.net",
+	}
+	control.HTTPTestServer = httptest.NewUnstartedServer(control)
+	control.HTTPTestServer.Start()
+	t.Cleanup(control.HTTPTestServer.Close)
+
+	// --- Start a tsnet node ---
+
+	stateDir := filepath.Join(t.TempDir(), "dns-test")
+	os.MkdirAll(stateDir, 0755)
+
+	srv := &tsnet.Server{
+		Dir:        stateDir,
+		ControlURL: control.HTTPTestServer.URL,
+		Hostname:   "dns-test-node",
+		Store:      new(mem.Store),
+		Ephemeral:  true,
+	}
+	t.Cleanup(func() { srv.Close() })
+
+	if _, err := srv.Up(ctx); err != nil {
+		t.Fatalf("tsnet Up: %v", err)
+	}
+
+	lc, err := srv.LocalClient()
+	if err != nil {
+		t.Fatalf("LocalClient: %v", err)
+	}
+
+	// --- Verify: lc.QueryDNS resolves the extra record ---
+
+	queryDNS := func(ctx context.Context, name, qtype string) ([]byte, error) {
+		raw, _, err := lc.QueryDNS(ctx, name, qtype)
+		return raw, err
+	}
+
+	ips, err := tsdns.LookupHost(ctx, queryDNS, "db.example.com")
+	if err != nil {
+		t.Fatalf("tsdns.LookupHost failed: %v", err)
+	}
+	if len(ips) == 0 {
+		t.Fatal("expected at least one IP")
+	}
+	if ips[0] != "10.77.1.50" {
+		t.Fatalf("expected 10.77.1.50, got %s", ips[0])
+	}
+
+	// --- Verify: srv.Dial WITHOUT tsdns fails (demonstrates the bug) ---
+
+	// The raw srv.Dial goes through userDialResolve which falls back to
+	// the system resolver for non-tailnet names. This should fail because
+	// the system resolver doesn't know about our DNS extra record.
+	dialCtx, dialCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer dialCancel()
+	_, srvDialErr := srv.Dial(dialCtx, "tcp", "db.example.com:5432")
+	if srvDialErr == nil {
+		// If srv.Dial succeeds, the upstream bug may have been fixed.
+		t.Log("srv.Dial succeeded directly — tailscale/tailscale#5840 may be fixed")
+	} else {
+		t.Logf("srv.Dial failed as expected (confirms #5840): %v", srvDialErr)
+	}
+
+	// --- Verify: tsdns.NewDialer resolves correctly ---
+
+	lookupFunc := tsdns.NewLookupFunc(queryDNS)
+	resolved, err := lookupFunc(ctx, "db.example.com")
+	if err != nil {
+		t.Fatalf("tsdns lookupFunc failed: %v", err)
+	}
+	if resolved[0] != "10.77.1.50" {
+		t.Fatalf("expected 10.77.1.50, got %s", resolved[0])
 	}
 }

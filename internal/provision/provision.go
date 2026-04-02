@@ -23,10 +23,11 @@ type Provisioner struct {
 	store        *restrict.RedisStore
 	logger       *slog.Logger
 	dialFunc     func(ctx context.Context, network, addr string) (net.Conn, error)
+	lookupFunc   func(ctx context.Context, host string) ([]string, error)
 }
 
 // NewProvisioner creates a new Provisioner.
-func NewProvisioner(adminUser, adminPassword, adminDatabase, backend, userPrefix string, store *restrict.RedisStore, logger *slog.Logger, dialFunc func(ctx context.Context, network, addr string) (net.Conn, error)) *Provisioner {
+func NewProvisioner(adminUser, adminPassword, adminDatabase, backend, userPrefix string, store *restrict.RedisStore, logger *slog.Logger, dialFunc func(ctx context.Context, network, addr string) (net.Conn, error), lookupFunc func(ctx context.Context, host string) ([]string, error)) *Provisioner {
 	connStr := fmt.Sprintf("postgres://%s:%s@%s/%s?sslmode=disable",
 		adminUser, adminPassword, backend, adminDatabase)
 	if userPrefix == "" {
@@ -38,6 +39,7 @@ func NewProvisioner(adminUser, adminPassword, adminDatabase, backend, userPrefix
 		store:        store,
 		logger:       logger,
 		dialFunc:     dialFunc,
+		lookupFunc:   lookupFunc,
 	}
 }
 
@@ -81,13 +83,9 @@ func (p *Provisioner) EnsureUser(ctx context.Context, loginName, nodeName, datab
 	}
 	if p.dialFunc != nil {
 		connCfg.DialFunc = p.dialFunc
-		// Skip pgx's default DNS lookup — the custom DialFunc (e.g. Tailscale's
-		// srv.Dial) resolves hostnames internally. Without this, pgx uses Go's
-		// net.Resolver which routes through MagicDNS and cannot resolve external
-		// private hostnames.
-		connCfg.LookupFunc = func(_ context.Context, host string) ([]string, error) {
-			return []string{host}, nil
-		}
+	}
+	if p.lookupFunc != nil {
+		connCfg.LookupFunc = p.lookupFunc
 	}
 	conn, err := pgx.ConnectConfig(ctx, connCfg)
 	if err != nil {

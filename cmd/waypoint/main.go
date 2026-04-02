@@ -24,6 +24,7 @@ import (
 	"github.com/redoapp/waypoint/internal/provision"
 	"github.com/redoapp/waypoint/internal/proxy"
 	"github.com/redoapp/waypoint/internal/restrict"
+	"github.com/redoapp/waypoint/internal/tsdns"
 	"tailscale.com/tsnet"
 )
 
@@ -184,8 +185,18 @@ func runServer(ctx context.Context, configPath string, logger *slog.Logger, leve
 		listeners = append(listeners, ln)
 
 		var dialer func(ctx context.Context, network, addr string) (net.Conn, error)
+		var lookupFunc func(ctx context.Context, host string) ([]string, error)
 		if lCfg.BackendViaTailscale {
-			dialer = srv.Dial
+			// Work around tailscale/tailscale#5840: tsnet.Server.Dial does
+			// not use MagicDNS for split DNS domains. Resolve hostnames
+			// via the Tailscale local API (which goes through the full DNS
+			// stack including split DNS), then dial the resolved IP.
+			queryDNS := func(ctx context.Context, name, qtype string) ([]byte, error) {
+				raw, _, err := lc.QueryDNS(ctx, name, qtype)
+				return raw, err
+			}
+			lookupFunc = tsdns.NewLookupFunc(queryDNS)
+			dialer = tsdns.NewDialer(srv.Dial, queryDNS)
 		}
 
 		switch mode {
@@ -217,6 +228,7 @@ func runServer(ctx context.Context, configPath string, logger *slog.Logger, leve
 				store,
 				logger.With("component", "provisioner", "listener", lCfg.Name),
 				dialer,
+				lookupFunc,
 			)
 
 			p := &proxy.PostgresProxy{
