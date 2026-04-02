@@ -67,8 +67,38 @@ jobs:
           path: coverage/integration.out
           retention-days: 30
 
+  e2e-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Run e2e tests with coverage
+        run: |
+          mkdir -p coverage
+          go test -tags integration -run 'TestE2E' -coverprofile=coverage/e2e.raw -covermode=atomic -race -timeout 120s ./...
+
+      - name: Filter coverage profile
+        run: |
+          pattern=$(grep -v '^#' .coverignore | grep -v '^$' | paste -sd'|' -)
+          grep -v -E "$pattern" coverage/e2e.raw > coverage/e2e.out
+
+      - name: Display e2e coverage summary
+        run: go tool cover -func=coverage/e2e.out | tail -1
+
+      - name: Upload e2e coverage
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-e2e
+          path: coverage/e2e.out
+          retention-days: 30
+
   coverage-summary:
-    needs: [unit-tests, integration-tests]
+    if: always()
+    needs: [unit-tests, integration-tests, e2e-tests]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -89,16 +119,24 @@ jobs:
           name: coverage-integration
           path: coverage
 
+      - name: Download e2e coverage
+        uses: actions/download-artifact@v4
+        with:
+          name: coverage-e2e
+          path: coverage
+
       - name: Merge coverage profiles
         run: |
           head -1 coverage/unit.out > coverage/total.out
           tail -n +2 coverage/unit.out >> coverage/total.out
           tail -n +2 coverage/integration.out >> coverage/total.out
+          tail -n +2 coverage/e2e.out >> coverage/total.out
 
       - name: Generate coverage summary
         run: |
           UNIT_COV=$(go tool cover -func=coverage/unit.out | tail -1 | awk '{print $NF}')
           INT_COV=$(go tool cover -func=coverage/integration.out | tail -1 | awk '{print $NF}')
+          E2E_COV=$(go tool cover -func=coverage/e2e.out | tail -1 | awk '{print $NF}')
           TOTAL_COV=$(go tool cover -func=coverage/total.out | tail -1 | awk '{print $NF}')
 
           {
@@ -108,13 +146,14 @@ jobs:
             echo "|------|----------|"
             echo "| Unit | ${UNIT_COV} |"
             echo "| Integration | ${INT_COV} |"
+            echo "| E2E | ${E2E_COV} |"
             echo "| **Total** | **${TOTAL_COV}** |"
           } >> "$GITHUB_STEP_SUMMARY"
 
-          echo "Unit: $UNIT_COV | Integration: $INT_COV | Total: $TOTAL_COV"
+          echo "Unit: $UNIT_COV | Integration: $INT_COV | E2E: $E2E_COV | Total: $TOTAL_COV"
 
       - name: Generate HTML report
-        run: go run ./cmd/covreport -o coverage/report.html unit=coverage/unit.out integration=coverage/integration.out
+        run: go run ./cmd/covreport -o coverage/report.html unit=coverage/unit.out integration=coverage/integration.out e2e=coverage/e2e.out
 
       - name: Upload coverage report
         uses: actions/upload-artifact@v7
@@ -124,5 +163,6 @@ jobs:
             coverage/report.html
             coverage/unit.out
             coverage/integration.out
+            coverage/e2e.out
             coverage/total.out
           retention-days: 30
