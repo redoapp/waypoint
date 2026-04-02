@@ -808,7 +808,7 @@ func TestIntegration_TailscaleAuthorizer_RealPipeline(t *testing.T) {
 	if err != nil {
 		t.Fatalf("proxy LocalClient: %v", err)
 	}
-	authorizer := &proxy.TailscaleAuthorizer{LC: proxyLC}
+	authorizer := &proxy.TailscaleAuthorizer{LC: proxyLC, Logger: slog.Default()}
 
 	// Listen on the proxy node's tailnet address.
 	ln, err := proxyNode.Listen("tcp", ":5432")
@@ -1162,7 +1162,7 @@ func TestIntegration_TailscaleAuthorizer_NoCapability(t *testing.T) {
 	if err != nil {
 		t.Fatalf("proxy LocalClient: %v", err)
 	}
-	authorizer := &proxy.TailscaleAuthorizer{LC: proxyLC}
+	authorizer := &proxy.TailscaleAuthorizer{LC: proxyLC, Logger: slog.Default()}
 
 	ln, err := proxyNode.Listen("tcp", ":5432")
 	if err != nil {
