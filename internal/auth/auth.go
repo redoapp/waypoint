@@ -54,7 +54,12 @@ func Authorize(ctx context.Context, lc *local.Client, remoteAddr string, backend
 
 	logger.Info("WhoIs identity",
 		"login", who.UserProfile.LoginName,
+		"display_name", who.UserProfile.DisplayName,
+		"user_id", who.UserProfile.ID,
 		"node", nodeName,
+		"node_id", who.Node.ID,
+		"node_stable_id", who.Node.StableID,
+		"tags", who.Node.Tags,
 		"remote", remoteAddr,
 	)
 
@@ -63,12 +68,25 @@ func Authorize(ctx context.Context, lc *local.Client, remoteAddr string, backend
 		return nil, fmt.Errorf("unmarshal capabilities: %w", err)
 	}
 	if len(rules) == 0 {
+		// Collect all capability keys the peer has for diagnostics.
+		var peerCaps []string
+		for cap := range who.CapMap {
+			peerCaps = append(peerCaps, string(cap))
+		}
+
 		logger.Info("access denied: no capability rules",
 			"login", who.UserProfile.LoginName,
+			"display_name", who.UserProfile.DisplayName,
 			"node", nodeName,
+			"tags", who.Node.Tags,
 			"cap", WaypointCap,
+			"backend", backend,
+			"peer_caps", peerCaps,
 		)
-		return nil, errors.New("not authorized for access to waypoint")
+		return nil, fmt.Errorf(
+			"no %s capability rules for user %s (node %s, tags %v); ensure a Tailscale ACL grant assigns this capability to the destination service",
+			WaypointCap, who.UserProfile.LoginName, nodeName, who.Node.Tags,
+		)
 	}
 
 	// Filter rules matching the requested backend and merge.
@@ -98,7 +116,10 @@ func Authorize(ctx context.Context, lc *local.Client, remoteAddr string, backend
 			"backend", backend,
 			"available_backends", availableBackends,
 		)
-		return nil, fmt.Errorf("not authorized for backend %q", backend)
+		return nil, fmt.Errorf(
+			"user %s (node %s) not authorized for backend %q; authorized backends: %v",
+			who.UserProfile.LoginName, nodeName, backend, availableBackends,
+		)
 	}
 
 	perms, limits := mergeRules(matched)

@@ -137,14 +137,14 @@ func TestFormatUsername_CustomPrefix(t *testing.T) {
 }
 
 func TestNewProvisioner_DefaultPrefix(t *testing.T) {
-	p := NewProvisioner("admin", "pass", "postgres", "localhost:5432", "", nil, nil)
+	p := NewProvisioner("admin", "pass", "postgres", "localhost:5432", "", nil, nil, nil)
 	if p.userPrefix != "wp_" {
 		t.Errorf("expected default prefix wp_, got %q", p.userPrefix)
 	}
 }
 
 func TestNewProvisioner_CustomPrefix(t *testing.T) {
-	p := NewProvisioner("admin", "pass", "postgres", "localhost:5432", "custom_", nil, nil)
+	p := NewProvisioner("admin", "pass", "postgres", "localhost:5432", "custom_", nil, nil, nil)
 	if p.userPrefix != "custom_" {
 		t.Errorf("expected custom_, got %q", p.userPrefix)
 	}

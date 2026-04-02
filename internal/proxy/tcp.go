@@ -46,7 +46,7 @@ func (p *TCPProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 	if err != nil {
 		m.AuthFailures.Add(ctx, 1, m.Attrs("waypoint.auth.failures", listenerAttr))
 		m.ConnRejected.Add(ctx, 1, m.Attrs("waypoint.conn.rejected", listenerAttr, modeAttr))
-		log.Warn("auth failed", "error", err)
+		log.Warn("auth failed", "error", err, "listener", p.Name)
 		return
 	}
 

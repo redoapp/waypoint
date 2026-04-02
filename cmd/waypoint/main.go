@@ -216,6 +216,7 @@ func runServer(ctx context.Context, configPath string, logger *slog.Logger, leve
 				lCfg.Postgres.UserPrefix,
 				store,
 				logger.With("component", "provisioner", "listener", lCfg.Name),
+				dialer,
 			)
 
 			p := &proxy.PostgresProxy{

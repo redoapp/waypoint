@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log/slog"
+	"net"
 	"strings"
 	"time"
 
@@ -21,10 +22,11 @@ type Provisioner struct {
 	userPrefix   string
 	store        *restrict.RedisStore
 	logger       *slog.Logger
+	dialFunc     func(ctx context.Context, network, addr string) (net.Conn, error)
 }
 
 // NewProvisioner creates a new Provisioner.
-func NewProvisioner(adminUser, adminPassword, adminDatabase, backend, userPrefix string, store *restrict.RedisStore, logger *slog.Logger) *Provisioner {
+func NewProvisioner(adminUser, adminPassword, adminDatabase, backend, userPrefix string, store *restrict.RedisStore, logger *slog.Logger, dialFunc func(ctx context.Context, network, addr string) (net.Conn, error)) *Provisioner {
 	connStr := fmt.Sprintf("postgres://%s:%s@%s/%s?sslmode=disable",
 		adminUser, adminPassword, backend, adminDatabase)
 	if userPrefix == "" {
@@ -35,6 +37,7 @@ func NewProvisioner(adminUser, adminPassword, adminDatabase, backend, userPrefix
 		userPrefix:   userPrefix,
 		store:        store,
 		logger:       logger,
+		dialFunc:     dialFunc,
 	}
 }
 
@@ -72,7 +75,14 @@ func (p *Provisioner) EnsureUser(ctx context.Context, loginName, nodeName, datab
 	defer p.store.ReleaseLock(ctx, "role:"+pgUser, lockToken)
 	p.logger.Debug("acquired lock", "role", pgUser)
 
-	conn, err := pgx.Connect(ctx, p.adminConnStr)
+	connCfg, err := pgx.ParseConfig(p.adminConnStr)
+	if err != nil {
+		return "", "", fmt.Errorf("parse admin conn config: %w", err)
+	}
+	if p.dialFunc != nil {
+		connCfg.DialFunc = p.dialFunc
+	}
+	conn, err := pgx.ConnectConfig(ctx, connCfg)
 	if err != nil {
 		return "", "", fmt.Errorf("admin connect: %w", err)
 	}
