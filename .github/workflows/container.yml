@@ -81,8 +81,11 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
 
       - name: Retag existing image with semver tags
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
         run: |
-          for TAG in ${{ steps.meta.outputs.tags }}; do
+          echo "$TAGS" | while read -r TAG; do
+            [ -z "$TAG" ] && continue
             docker buildx imagetools create \
               --tag "$TAG" \
               ghcr.io/redoapp/${{ matrix.image.name }}:sha-${GITHUB_SHA::7}
