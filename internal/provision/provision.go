@@ -81,6 +81,13 @@ func (p *Provisioner) EnsureUser(ctx context.Context, loginName, nodeName, datab
 	}
 	if p.dialFunc != nil {
 		connCfg.DialFunc = p.dialFunc
+		// Skip pgx's default DNS lookup — the custom DialFunc (e.g. Tailscale's
+		// srv.Dial) resolves hostnames internally. Without this, pgx uses Go's
+		// net.Resolver which routes through MagicDNS and cannot resolve external
+		// private hostnames.
+		connCfg.LookupFunc = func(_ context.Context, host string) ([]string, error) {
+			return []string{host}, nil
+		}
 	}
 	conn, err := pgx.ConnectConfig(ctx, connCfg)
 	if err != nil {
