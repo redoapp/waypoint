@@ -47,11 +47,27 @@ func Authorize(ctx context.Context, lc *local.Client, remoteAddr string, backend
 		return nil, errors.New("no user profile in WhoIs response")
 	}
 
+	nodeName := who.Node.ComputedName
+	if nodeName == "" && len(who.Node.Name) > 0 {
+		nodeName = strings.Split(who.Node.Name, ".")[0]
+	}
+
+	logger.Info("WhoIs identity",
+		"login", who.UserProfile.LoginName,
+		"node", nodeName,
+		"remote", remoteAddr,
+	)
+
 	rules, err := tailcfg.UnmarshalCapJSON[CapRule](who.CapMap, WaypointCap)
 	if err != nil {
 		return nil, fmt.Errorf("unmarshal capabilities: %w", err)
 	}
 	if len(rules) == 0 {
+		logger.Info("access denied: no capability rules",
+			"login", who.UserProfile.LoginName,
+			"node", nodeName,
+			"cap", WaypointCap,
+		)
 		return nil, errors.New("not authorized for access to waypoint")
 	}
 
@@ -66,21 +82,48 @@ func Authorize(ctx context.Context, lc *local.Client, remoteAddr string, backend
 		}
 	}
 	if len(matched) == 0 {
+		var availableBackends []string
+		seen := make(map[string]bool)
+		for _, r := range rules {
+			for _, b := range r.Backends {
+				if !seen[b] {
+					availableBackends = append(availableBackends, b)
+					seen[b] = true
+				}
+			}
+		}
+		logger.Info("access denied: no rules for backend",
+			"login", who.UserProfile.LoginName,
+			"node", nodeName,
+			"backend", backend,
+			"available_backends", availableBackends,
+		)
 		return nil, fmt.Errorf("not authorized for backend %q", backend)
 	}
 
 	perms, limits := mergeRules(matched)
 
-	nodeName := who.Node.ComputedName
-	if nodeName == "" && len(who.Node.Name) > 0 {
-		nodeName = strings.Split(who.Node.Name, ".")[0]
-	}
-
-	logger.Debug("WhoIs result",
-		"login", who.UserProfile.LoginName,
-		"node", nodeName,
+	logger.Debug("capability rules matched",
 		"rules_matched", len(matched),
+		"permissions", perms,
 	)
+
+	var limitAttrs []any
+	if limits.MaxConns > 0 {
+		limitAttrs = append(limitAttrs, "max_conns", limits.MaxConns)
+	}
+	if limits.MaxBytesPerConn > 0 {
+		limitAttrs = append(limitAttrs, "max_bytes_per_conn", limits.MaxBytesPerConn)
+	}
+	if limits.MaxConnDuration > 0 {
+		limitAttrs = append(limitAttrs, "max_conn_duration", limits.MaxConnDuration)
+	}
+	if len(limits.BandwidthTiers) > 0 {
+		limitAttrs = append(limitAttrs, "bandwidth_tiers", len(limits.BandwidthTiers))
+	}
+	if len(limitAttrs) > 0 {
+		logger.Debug("effective limits", limitAttrs...)
+	}
 
 	return &AuthResult{
 		LoginName:    who.UserProfile.LoginName,

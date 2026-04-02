@@ -88,7 +88,7 @@ func (s *Server) handleConn(ctx context.Context, netConn net.Conn) {
 	defer sshConn.Close()
 
 	// Check manager capability via WhoIs.
-	result, err := auth.AuthorizeManager(ctx, s.lc, netConn.RemoteAddr().String())
+	result, err := auth.AuthorizeManager(ctx, s.lc, netConn.RemoteAddr().String(), s.logger)
 	if err != nil {
 		s.logger.Info("access denied", "remote", netConn.RemoteAddr(), "error", err)
 		// Try to send a message before closing.

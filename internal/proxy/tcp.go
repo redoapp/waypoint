@@ -64,6 +64,7 @@ func (p *TCPProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 		return
 	}
 	defer release()
+	log.Debug("connection slot acquired")
 
 	// Track connection.
 	connStart := time.Now()

@@ -74,6 +74,7 @@ func (p *PostgresProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 		return
 	}
 	defer release()
+	log.Debug("connection slot acquired")
 
 	// Track connection.
 	connStart := time.Now()
@@ -102,14 +103,34 @@ func (p *PostgresProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 	// Step 4: Check per-database permissions from cap rules.
 	dbPerms := auth.DatabasePermissions(result, requestedDB)
 	if dbPerms == nil {
+		var grantedDBs []string
+		seen := make(map[string]bool)
+		for _, r := range result.MatchedRules {
+			if r.PG == nil {
+				continue
+			}
+			for db := range r.PG.Databases {
+				if !seen[db] {
+					grantedDBs = append(grantedDBs, db)
+					seen[db] = true
+				}
+			}
+		}
 		log.Warn("no permissions for database",
 			"user", result.LoginName,
 			"database", requestedDB,
+			"granted_databases", grantedDBs,
 		)
 		pgwire.SendErrorResponse(clientConn, "FATAL", "42501",
 			"not authorized for database "+requestedDB)
 		return
 	}
+
+	log.Debug("database permissions resolved",
+		"database", requestedDB,
+		"permissions", dbPerms.Permissions,
+		"sql_count", len(dbPerms.SQL),
+	)
 
 	// Step 5: Provision dynamic PG user.
 	provStart := time.Now()
@@ -127,6 +148,8 @@ func (p *PostgresProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 		pgwire.SendErrorResponse(clientConn, "FATAL", "58000", "internal error")
 		return
 	}
+
+	log.Debug("user provisioned", "pg_user", pgUser, "database", requestedDB)
 
 	// Step 6: Connect to upstream PG with provisioned credentials.
 	var backendConn net.Conn
@@ -219,6 +242,7 @@ func (p *PostgresProxy) revalidateLoop(ctx context.Context, clientConn, backendC
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			log.Debug("revalidation check")
 			m.RevalAttempts.Add(ctx, 1, m.Attrs("waypoint.reval.attempts", listenerAttr))
 			result, err := p.Auth.Authorize(ctx, clientConn.RemoteAddr().String(), p.Name)
 			if err != nil {
