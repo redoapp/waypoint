@@ -19,6 +19,7 @@ import (
 	"github.com/redis/go-redis/v9"
 	"github.com/redoapp/waypoint/internal/config"
 	"github.com/redoapp/waypoint/internal/heartbeat"
+	"github.com/redoapp/waypoint/internal/logging"
 	"github.com/redoapp/waypoint/internal/metrics"
 	"github.com/redoapp/waypoint/internal/provision"
 	"github.com/redoapp/waypoint/internal/proxy"
@@ -37,28 +38,45 @@ func main() {
 	configPath := flag.String("config", "waypoint.toml", "path to config file")
 	flag.Parse()
 
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	var levelVar slog.LevelVar
+	levelVar.Set(slog.LevelInfo)
+	if envLevel := os.Getenv("WAYPOINT_LOG_LEVEL"); envLevel != "" {
+		if l, err := logging.ParseLevel(envLevel); err == nil {
+			levelVar.Set(l)
+		}
+	}
+	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: &levelVar}))
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	if err := run(ctx, *configPath, logger); err != nil {
+	if err := run(ctx, *configPath, logger, &levelVar); err != nil {
 		logger.Error("fatal", "error", err)
 		os.Exit(1)
 	}
 }
 
-func run(ctx context.Context, configPath string, logger *slog.Logger) error {
-	return runServer(ctx, configPath, logger, nil)
+func run(ctx context.Context, configPath string, logger *slog.Logger, levelVar *slog.LevelVar) error {
+	return runServer(ctx, configPath, logger, levelVar, nil)
 }
 
 // runServer starts waypoint. If afterTSStart is non-nil, it is called after the
 // tsnet server connects but before listeners are created. Tests use this to set
 // node tags on the test control plane.
-func runServer(ctx context.Context, configPath string, logger *slog.Logger, afterTSStart func(*tsnet.Server) error) error {
+func runServer(ctx context.Context, configPath string, logger *slog.Logger, levelVar *slog.LevelVar, afterTSStart func(*tsnet.Server) error) error {
 	cfg, err := config.Load(configPath)
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
+	}
+
+	if levelVar != nil {
+		level, err := logging.ResolveLevel(os.Getenv("WAYPOINT_LOG_LEVEL"), cfg.LogLevel, slog.LevelInfo)
+		if err != nil {
+			logger.Warn("invalid log level in config, using info", "error", err)
+			level = slog.LevelInfo
+		}
+		levelVar.Set(level)
+		logger.Debug("log level configured", "level", level.String())
 	}
 
 	// Metrics.
@@ -175,7 +193,7 @@ func runServer(ctx context.Context, configPath string, logger *slog.Logger, afte
 			p := &proxy.TCPProxy{
 				Backend:      lCfg.Backend,
 				Name:         lCfg.Name,
-				Auth:         &proxy.TailscaleAuthorizer{LC: lc},
+				Auth:         &proxy.TailscaleAuthorizer{LC: lc, Logger: logger.With("listener", lCfg.Name)},
 				Tracker:      tracker,
 				Metrics:      m,
 				Logger:       logger.With("listener", lCfg.Name),
@@ -203,7 +221,7 @@ func runServer(ctx context.Context, configPath string, logger *slog.Logger, afte
 			p := &proxy.PostgresProxy{
 				Backend:       lCfg.Backend,
 				Name:          lCfg.Name,
-				Auth:          &proxy.TailscaleAuthorizer{LC: lc},
+				Auth:          &proxy.TailscaleAuthorizer{LC: lc, Logger: logger.With("listener", lCfg.Name)},
 				Tracker:       tracker,
 				Provisioner:   provisioner,
 				Metrics:       m,

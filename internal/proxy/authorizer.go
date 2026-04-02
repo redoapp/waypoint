@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"log/slog"
 
 	"github.com/redoapp/waypoint/internal/auth"
 	"tailscale.com/client/local"
@@ -15,10 +16,11 @@ type Authorizer interface {
 
 // TailscaleAuthorizer implements Authorizer using the Tailscale local API.
 type TailscaleAuthorizer struct {
-	LC *local.Client
+	LC     *local.Client
+	Logger *slog.Logger
 }
 
 // Authorize delegates to auth.Authorize with the embedded local client.
 func (a *TailscaleAuthorizer) Authorize(ctx context.Context, remoteAddr string, backend string) (*auth.AuthResult, error) {
-	return auth.Authorize(ctx, a.LC, remoteAddr, backend)
+	return auth.Authorize(ctx, a.LC, remoteAddr, backend, a.Logger)
 }

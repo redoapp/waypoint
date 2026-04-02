@@ -158,10 +158,12 @@ backend = "%s"
 	runCtx, runCancel := context.WithCancel(ctx)
 	defer runCancel()
 
-	lgr := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	var testLevelVar slog.LevelVar
+	testLevelVar.Set(slog.LevelDebug)
+	lgr := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: &testLevelVar}))
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- runServer(runCtx, configPath, lgr, afterTSStart)
+		errCh <- runServer(runCtx, configPath, lgr, &testLevelVar, afterTSStart)
 	}()
 
 	// Check for early startup failure.

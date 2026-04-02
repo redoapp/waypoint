@@ -14,6 +14,7 @@ import (
 )
 
 type Config struct {
+	LogLevel     string                   `toml:"log_level"`
 	Tailscale    tsconfig.TailscaleConfig `toml:"tailscale"`
 	Redis        RedisConfig              `toml:"redis"`
 	Revalidation RevalidationConfig       `toml:"revalidation"`

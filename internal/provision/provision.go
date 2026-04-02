@@ -42,6 +42,7 @@ func NewProvisioner(adminUser, adminPassword, adminDatabase, backend, userPrefix
 // node, and database. Returns the PG username and password.
 func (p *Provisioner) EnsureUser(ctx context.Context, loginName, nodeName, database string, perms *auth.DBPermissions) (string, string, error) {
 	pgUser := p.formatUsername(loginName, nodeName, database)
+	p.logger.Debug("ensuring user", "login", loginName, "database", database)
 
 	// Acquire a distributed lock via Redis to serialize concurrent EnsureUser
 	// calls for the same role. This works with both PostgreSQL and CockroachDB.
@@ -69,15 +70,18 @@ func (p *Provisioner) EnsureUser(ctx context.Context, loginName, nodeName, datab
 		return "", "", fmt.Errorf("could not acquire lock for role %q", pgUser)
 	}
 	defer p.store.ReleaseLock(ctx, "role:"+pgUser, lockToken)
+	p.logger.Debug("acquired lock", "role", pgUser)
 
 	conn, err := pgx.Connect(ctx, p.adminConnStr)
 	if err != nil {
 		return "", "", fmt.Errorf("admin connect: %w", err)
 	}
 	defer conn.Close(ctx)
+	p.logger.Debug("connected to admin db")
 
 	// Detect database dialect (PostgreSQL vs CockroachDB).
 	dialect := detectDialect(ctx, conn, p.adminConnStr)
+	p.logger.Debug("detected dialect", "dialect", dialect)
 
 	// Check if user exists.
 	var exists bool

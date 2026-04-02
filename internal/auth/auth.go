@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -36,7 +37,8 @@ type MergedLimits struct {
 
 // Authorize checks the caller's Tailscale identity and capability grants
 // for the given backend listener name.
-func Authorize(ctx context.Context, lc *local.Client, remoteAddr string, backend string) (*AuthResult, error) {
+func Authorize(ctx context.Context, lc *local.Client, remoteAddr string, backend string, logger *slog.Logger) (*AuthResult, error) {
+	logger.Debug("WhoIs lookup", "remote", remoteAddr)
 	who, err := lc.WhoIs(ctx, remoteAddr)
 	if err != nil {
 		return nil, fmt.Errorf("WhoIs failed: %w", err)
@@ -73,6 +75,12 @@ func Authorize(ctx context.Context, lc *local.Client, remoteAddr string, backend
 	if nodeName == "" && len(who.Node.Name) > 0 {
 		nodeName = strings.Split(who.Node.Name, ".")[0]
 	}
+
+	logger.Debug("WhoIs result",
+		"login", who.UserProfile.LoginName,
+		"node", nodeName,
+		"rules_matched", len(matched),
+	)
 
 	return &AuthResult{
 		LoginName:    who.UserProfile.LoginName,

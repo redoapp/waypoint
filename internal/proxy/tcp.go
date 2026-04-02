@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/redoapp/waypoint/internal/logging"
 	"github.com/redoapp/waypoint/internal/metrics"
 	"github.com/redoapp/waypoint/internal/restrict"
 )
@@ -28,6 +29,10 @@ type TCPProxy struct {
 func (p *TCPProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 	defer clientConn.Close()
 
+	connID := logging.NewConnID()
+	log := p.Logger.With("conn_id", connID, "remote", clientConn.RemoteAddr())
+	log.Debug("connection accepted")
+
 	m := p.Metrics
 	listenerAttr := metrics.AttrListener.String(p.Name)
 	modeAttr := metrics.AttrMode.String("tcp")
@@ -41,11 +46,11 @@ func (p *TCPProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 	if err != nil {
 		m.AuthFailures.Add(ctx, 1, m.Attrs("waypoint.auth.failures", listenerAttr))
 		m.ConnRejected.Add(ctx, 1, m.Attrs("waypoint.conn.rejected", listenerAttr, modeAttr))
-		p.Logger.Warn("auth failed", "remote", clientConn.RemoteAddr(), "error", err)
+		log.Warn("auth failed", "error", err)
 		return
 	}
 
-	p.Logger.Info("authorized",
+	log.Info("authorized",
 		"user", result.LoginName,
 		"node", result.NodeName,
 		"backend", p.Name,
@@ -55,7 +60,7 @@ func (p *TCPProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 	release, err := p.Tracker.Acquire(ctx, result.LoginName, result.Limits)
 	if err != nil {
 		m.ConnRejected.Add(ctx, 1, m.Attrs("waypoint.conn.rejected", listenerAttr, modeAttr))
-		p.Logger.Warn("limit exceeded", "user", result.LoginName, "error", err)
+		log.Warn("limit exceeded", "user", result.LoginName, "error", err)
 		return
 	}
 	defer release()
@@ -79,7 +84,7 @@ func (p *TCPProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 		backendConn, err = net.DialTimeout("tcp", p.Backend, 10*time.Second)
 	}
 	if err != nil {
-		p.Logger.Error("backend dial failed", "backend", p.Backend, "error", err)
+		log.Error("backend dial failed", "backend", p.Backend, "error", err)
 		return
 	}
 	defer backendConn.Close()
@@ -87,7 +92,7 @@ func (p *TCPProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 	cl := p.Tracker.WrapConn(ctx, result.LoginName, result.Limits)
 
 	if err := restrict.Relay(clientConn, backendConn, cl); err != nil {
-		p.Logger.Debug("relay ended", "user", result.LoginName, "error", err)
+		log.Debug("relay ended", "user", result.LoginName, "error", err)
 	}
 
 	// Record byte counters after relay completes.
@@ -100,4 +105,6 @@ func (p *TCPProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 	if p.BytesWritten != nil {
 		p.BytesWritten.Add(bw)
 	}
+
+	log.Info("connection closed", "duration", time.Since(connStart), "bytes_read", br, "bytes_written", bw)
 }

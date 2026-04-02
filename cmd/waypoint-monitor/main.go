@@ -15,6 +15,7 @@ import (
 
 	"github.com/redis/go-redis/v9"
 	"github.com/redoapp/waypoint/internal/admin"
+	"github.com/redoapp/waypoint/internal/logging"
 	"github.com/redoapp/waypoint/internal/monitor"
 	"tailscale.com/tsnet"
 )
@@ -23,13 +24,28 @@ func main() {
 	configPath := flag.String("config", "waypoint-monitor.toml", "path to config file")
 	flag.Parse()
 
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	var levelVar slog.LevelVar
+	levelVar.Set(slog.LevelInfo)
+	if envLevel := os.Getenv("WAYPOINT_LOG_LEVEL"); envLevel != "" {
+		if l, err := logging.ParseLevel(envLevel); err == nil {
+			levelVar.Set(l)
+		}
+	}
+	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: &levelVar}))
 
 	cfg, err := loadConfig(*configPath)
 	if err != nil {
 		logger.Error("failed to load config", "error", err)
 		os.Exit(1)
 	}
+
+	level, err := logging.ResolveLevel(os.Getenv("WAYPOINT_LOG_LEVEL"), cfg.LogLevel, slog.LevelInfo)
+	if err != nil {
+		logger.Warn("invalid log level in config, using info", "error", err)
+		level = slog.LevelInfo
+	}
+	levelVar.Set(level)
+	logger.Debug("log level configured", "level", level.String())
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()

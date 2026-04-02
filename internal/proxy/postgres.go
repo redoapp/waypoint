@@ -9,6 +9,7 @@ import (
 
 	"github.com/redoapp/waypoint/internal/auth"
 	"github.com/redoapp/waypoint/internal/config"
+	"github.com/redoapp/waypoint/internal/logging"
 	"github.com/redoapp/waypoint/internal/metrics"
 	"github.com/redoapp/waypoint/internal/pgwire"
 	"github.com/redoapp/waypoint/internal/provision"
@@ -36,6 +37,10 @@ type PostgresProxy struct {
 func (p *PostgresProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 	defer clientConn.Close()
 
+	connID := logging.NewConnID()
+	log := p.Logger.With("conn_id", connID, "remote", clientConn.RemoteAddr())
+	log.Debug("connection accepted")
+
 	m := p.Metrics
 	listenerAttr := metrics.AttrListener.String(p.Name)
 	modeAttr := metrics.AttrMode.String("postgres")
@@ -49,12 +54,12 @@ func (p *PostgresProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 	if err != nil {
 		m.AuthFailures.Add(ctx, 1, m.Attrs("waypoint.auth.failures", listenerAttr))
 		m.ConnRejected.Add(ctx, 1, m.Attrs("waypoint.conn.rejected", listenerAttr, modeAttr))
-		p.Logger.Warn("auth failed", "remote", clientConn.RemoteAddr(), "error", err)
+		log.Warn("auth failed", "error", err)
 		pgwire.SendErrorResponse(clientConn, "FATAL", "28000", "authentication failed: "+err.Error())
 		return
 	}
 
-	p.Logger.Info("authorized",
+	log.Info("authorized",
 		"user", result.LoginName,
 		"node", result.NodeName,
 		"backend", p.Name,
@@ -64,7 +69,7 @@ func (p *PostgresProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 	release, err := p.Tracker.Acquire(ctx, result.LoginName, result.Limits)
 	if err != nil {
 		m.ConnRejected.Add(ctx, 1, m.Attrs("waypoint.conn.rejected", listenerAttr, modeAttr))
-		p.Logger.Warn("limit exceeded", "user", result.LoginName, "error", err)
+		log.Warn("limit exceeded", "user", result.LoginName, "error", err)
 		pgwire.SendErrorResponse(clientConn, "FATAL", "53300", "too many connections: "+err.Error())
 		return
 	}
@@ -83,7 +88,7 @@ func (p *PostgresProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 	// Step 3: Read client's StartupMessage to get requested database.
 	startup, err := pgwire.ReadStartupMessage(clientConn)
 	if err != nil {
-		p.Logger.Error("read startup failed", "error", err)
+		log.Error("read startup failed", "error", err)
 		return
 	}
 
@@ -92,10 +97,12 @@ func (p *PostgresProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 		requestedDB = startup.Parameters["user"]
 	}
 
+	log.Debug("startup message received", "database", requestedDB)
+
 	// Step 4: Check per-database permissions from cap rules.
 	dbPerms := auth.DatabasePermissions(result, requestedDB)
 	if dbPerms == nil {
-		p.Logger.Warn("no permissions for database",
+		log.Warn("no permissions for database",
 			"user", result.LoginName,
 			"database", requestedDB,
 		)
@@ -112,7 +119,7 @@ func (p *PostgresProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 		m.Attrs("waypoint.provision.latency", listenerAttr))
 	if err != nil {
 		m.ProvisionErrors.Add(ctx, 1, m.Attrs("waypoint.provision.errors", listenerAttr))
-		p.Logger.Error("provision failed",
+		log.Error("provision failed",
 			"user", result.LoginName,
 			"database", requestedDB,
 			"error", err,
@@ -131,15 +138,17 @@ func (p *PostgresProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 		backendConn, err = net.DialTimeout("tcp", p.Backend, 10*time.Second)
 	}
 	if err != nil {
-		p.Logger.Error("backend dial failed", "backend", p.Backend, "error", err)
+		log.Error("backend dial failed", "backend", p.Backend, "error", err)
 		pgwire.SendErrorResponse(clientConn, "FATAL", "08006", "backend unavailable")
 		return
 	}
 	defer backendConn.Close()
 
+	log.Debug("backend connected")
+
 	// Step 7: Send startup to upstream with provisioned user.
 	if err := pgwire.WriteStartupMessage(backendConn, pgUser, requestedDB, nil); err != nil {
-		p.Logger.Error("send startup failed", "error", err)
+		log.Error("send startup failed", "error", err)
 		pgwire.SendErrorResponse(clientConn, "FATAL", "08006", "backend error")
 		return
 	}
@@ -147,20 +156,22 @@ func (p *PostgresProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 	// Step 8: Handle upstream auth.
 	upstreamFE, err := pgwire.HandleUpstreamAuth(backendConn, pgUser, pgPass)
 	if err != nil {
-		p.Logger.Error("upstream auth failed", "user", pgUser, "error", err)
+		log.Error("upstream auth failed", "user", pgUser, "error", err)
 		pgwire.SendErrorResponse(clientConn, "FATAL", "28P01", "backend authentication failed")
 		return
 	}
 
+	log.Debug("upstream auth complete")
+
 	// Step 9: Send AuthenticationOk to client (Tailscale identity = their credential).
 	if err := pgwire.SendAuthOK(clientConn); err != nil {
-		p.Logger.Error("send auth ok failed", "error", err)
+		log.Error("send auth ok failed", "error", err)
 		return
 	}
 
 	// Step 10: Forward post-auth messages (ParameterStatus, BackendKeyData, ReadyForQuery).
 	if err := pgwire.ForwardPostAuth(upstreamFE, clientConn); err != nil {
-		p.Logger.Error("forward post-auth failed", "error", err)
+		log.Error("forward post-auth failed", "error", err)
 		return
 	}
 
@@ -171,11 +182,13 @@ func (p *PostgresProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 	revalCtx, revalCancel := context.WithCancel(ctx)
 	defer revalCancel()
 	if p.RevalInterval > 0 {
-		go p.revalidateLoop(revalCtx, clientConn, backendConn, result.LoginName, requestedDB)
+		go p.revalidateLoop(revalCtx, clientConn, backendConn, result.LoginName, requestedDB, log)
 	}
 
+	log.Debug("relay started")
+
 	if err := restrict.Relay(clientConn, backendConn, cl); err != nil {
-		p.Logger.Debug("relay ended", "user", result.LoginName, "error", err)
+		log.Debug("relay ended", "user", result.LoginName, "error", err)
 	}
 
 	// Record byte counters after relay completes.
@@ -188,11 +201,13 @@ func (p *PostgresProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 	if p.BytesWritten != nil {
 		p.BytesWritten.Add(bw)
 	}
+
+	log.Info("connection closed", "duration", time.Since(connStart), "bytes_read", br, "bytes_written", bw)
 }
 
 // revalidateLoop periodically re-checks WhoIs + caps. Closes connections
 // if the user's grant is revoked.
-func (p *PostgresProxy) revalidateLoop(ctx context.Context, clientConn, backendConn net.Conn, loginName, database string) {
+func (p *PostgresProxy) revalidateLoop(ctx context.Context, clientConn, backendConn net.Conn, loginName, database string, log *slog.Logger) {
 	ticker := time.NewTicker(p.RevalInterval)
 	defer ticker.Stop()
 
@@ -208,7 +223,7 @@ func (p *PostgresProxy) revalidateLoop(ctx context.Context, clientConn, backendC
 			result, err := p.Auth.Authorize(ctx, clientConn.RemoteAddr().String(), p.Name)
 			if err != nil {
 				m.RevalFailures.Add(ctx, 1, m.Attrs("waypoint.reval.failures", listenerAttr))
-				p.Logger.Warn("revalidation failed, closing connection",
+				log.Warn("revalidation failed, closing connection",
 					"user", loginName,
 					"error", err,
 				)
@@ -220,7 +235,7 @@ func (p *PostgresProxy) revalidateLoop(ctx context.Context, clientConn, backendC
 			dbPerms := auth.DatabasePermissions(result, database)
 			if dbPerms == nil {
 				m.RevalFailures.Add(ctx, 1, m.Attrs("waypoint.reval.failures", listenerAttr))
-				p.Logger.Warn("permissions revoked, closing connection",
+				log.Warn("permissions revoked, closing connection",
 					"user", loginName,
 					"database", database,
 				)
@@ -228,6 +243,8 @@ func (p *PostgresProxy) revalidateLoop(ctx context.Context, clientConn, backendC
 				backendConn.Close()
 				return
 			}
+
+			log.Debug("revalidation passed")
 		}
 	}
 }

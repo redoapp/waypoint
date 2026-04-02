@@ -12,6 +12,7 @@ import (
 )
 
 type MonitorConfig struct {
+	LogLevel  string                   `toml:"log_level"`
 	Listen    string                   `toml:"listen"`
 	Redis     RedisConfig              `toml:"redis"`
 	Tailscale tsconfig.TailscaleConfig `toml:"tailscale"`
