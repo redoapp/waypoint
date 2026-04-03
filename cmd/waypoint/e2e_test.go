@@ -138,9 +138,19 @@ backend = "%s"
 			return fmt.Errorf("status: %w", err)
 		}
 
-		node := control.Node(st.Self.PublicKey)
+		// runServer uses srv.Start() (not Up), so the node may still be
+		// registering with the control plane.  Poll until it appears.
+		var node *tailcfg.Node
+		regDeadline := time.Now().Add(10 * time.Second)
+		for time.Now().Before(regDeadline) {
+			node = control.Node(st.Self.PublicKey)
+			if node != nil {
+				break
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
 		if node == nil {
-			return fmt.Errorf("node not found in control")
+			return fmt.Errorf("node not found in control after 10s")
 		}
 		node.Tags = []string{"tag:waypoint"}
 		control.UpdateNode(node)
@@ -175,7 +185,7 @@ backend = "%s"
 	select {
 	case err := <-errCh:
 		t.Fatalf("runServer exited early: %v", err)
-	case <-time.After(1 * time.Second):
+	case <-time.After(5 * time.Second):
 		// Give it a moment — if it hasn't failed, it's likely starting up.
 	}
 
