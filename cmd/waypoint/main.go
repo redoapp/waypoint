@@ -150,6 +150,16 @@ func runServer(ctx context.Context, configPath string, logger *slog.Logger, leve
 		return fmt.Errorf("local client: %w", err)
 	}
 
+	// Accept subnet routes advertised by other nodes so we can reach
+	// resources (e.g. DNS resolvers) behind subnet routers.
+	if _, err := lc.EditPrefs(ctx, &ipn.MaskedPrefs{
+		RouteAllSet: true,
+		Prefs:       ipn.Prefs{RouteAll: true},
+	}); err != nil {
+		return fmt.Errorf("enable accept-routes: %w", err)
+	}
+	logger.Info("subnet routes accepted")
+
 	// Track active connections for graceful shutdown.
 	var wg sync.WaitGroup
 	var listeners []net.Listener
