@@ -133,24 +133,28 @@ backend = "%s"
 		if err != nil {
 			return fmt.Errorf("local client: %w", err)
 		}
-		st, err := lc.Status(ctx)
-		if err != nil {
-			return fmt.Errorf("status: %w", err)
-		}
 
 		// runServer uses srv.Start() (not Up), so the node may still be
-		// registering with the control plane.  Poll until it appears.
+		// logging in and registering with the control plane. Poll until
+		// the local status shows a Tailscale IP (meaning login completed)
+		// and the node appears in the control server.
 		var node *tailcfg.Node
-		regDeadline := time.Now().Add(10 * time.Second)
+		regDeadline := time.Now().Add(30 * time.Second)
 		for time.Now().Before(regDeadline) {
-			node = control.Node(st.Self.PublicKey)
-			if node != nil {
-				break
+			st, err := lc.Status(ctx)
+			if err != nil {
+				return fmt.Errorf("status: %w", err)
 			}
-			time.Sleep(100 * time.Millisecond)
+			if st.Self != nil && len(st.TailscaleIPs) > 0 && !st.Self.PublicKey.IsZero() {
+				node = control.Node(st.Self.PublicKey)
+				if node != nil {
+					break
+				}
+			}
+			time.Sleep(200 * time.Millisecond)
 		}
 		if node == nil {
-			return fmt.Errorf("node not found in control after 10s")
+			return fmt.Errorf("node not found in control after 30s")
 		}
 		node.Tags = []string{"tag:waypoint"}
 		control.UpdateNode(node)
@@ -158,7 +162,7 @@ backend = "%s"
 		// Wait for the node to see its updated tags.
 		deadline := time.Now().Add(10 * time.Second)
 		for time.Now().Before(deadline) {
-			st, err = lc.Status(ctx)
+			st, err := lc.Status(ctx)
 			if err != nil {
 				return fmt.Errorf("status poll: %w", err)
 			}
@@ -185,7 +189,7 @@ backend = "%s"
 	select {
 	case err := <-errCh:
 		t.Fatalf("runServer exited early: %v", err)
-	case <-time.After(5 * time.Second):
+	case <-time.After(2 * time.Second):
 		// Give it a moment — if it hasn't failed, it's likely starting up.
 	}
 
