@@ -67,11 +67,11 @@ func TestForwardQuery(t *testing.T) {
 	}()
 
 	ctx := context.Background()
-	dial := func(ctx context.Context, network, addr string) (net.Conn, error) {
-		return net.Dial(network, addr)
+	listenPacket := func(network, addr string) (net.PacketConn, error) {
+		return net.ListenPacket(network, "127.0.0.1:0")
 	}
 
-	raw, err := ForwardQuery(ctx, dial, pc.LocalAddr().String(), "test.example.", "A")
+	raw, err := ForwardQuery(ctx, listenPacket, pc.LocalAddr().String(), "test.example.", "A")
 	if err != nil {
 		t.Fatalf("ForwardQuery: %v", err)
 	}
@@ -122,8 +122,8 @@ func TestRoutedQueryFunc(t *testing.T) {
 		}
 	}()
 
-	dial := func(ctx context.Context, network, addr string) (net.Conn, error) {
-		return net.Dial(network, addr)
+	listenPacket := func(network, addr string) (net.PacketConn, error) {
+		return net.ListenPacket(network, "127.0.0.1:0")
 	}
 
 	routes := map[string][]string{
@@ -136,7 +136,7 @@ func TestRoutedQueryFunc(t *testing.T) {
 		return []byte("fallback"), nil
 	}
 
-	qf := NewRoutedQueryFunc(fallback, dial, routes)
+	qf := NewRoutedQueryFunc(fallback, listenPacket, routes)
 	ctx := context.Background()
 
 	// Should route through forwarder.

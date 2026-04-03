@@ -13,6 +13,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 
 	"github.com/google/uuid"
 	proxyproto "github.com/pires/go-proxyproto"
@@ -152,13 +153,66 @@ func runServer(ctx context.Context, configPath string, logger *slog.Logger, leve
 
 	// Accept subnet routes advertised by other nodes so we can reach
 	// resources (e.g. DNS resolvers) behind subnet routers.
-	if _, err := lc.EditPrefs(ctx, &ipn.MaskedPrefs{
+	updatedPrefs, err := lc.EditPrefs(ctx, &ipn.MaskedPrefs{
 		RouteAllSet: true,
 		Prefs:       ipn.Prefs{RouteAll: true},
-	}); err != nil {
+	})
+	if err != nil {
 		return fmt.Errorf("enable accept-routes: %w", err)
 	}
-	logger.Info("subnet routes accepted")
+	logger.Info("subnet routes accepted", "route_all", updatedPrefs.RouteAll)
+
+	// Log subnet route status after node reaches Running state.
+	go func() {
+		// Wait for the node to be running by polling status.
+		for {
+			st, err := lc.StatusWithoutPeers(ctx)
+			if err != nil {
+				logger.Warn("status check failed", "error", err)
+				return
+			}
+			if st.BackendState == "Running" {
+				break
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(500 * time.Millisecond):
+			}
+		}
+
+		// Re-apply EditPrefs now that the node is Running and has a netmap,
+		// so authReconfigLocked can actually rebuild the WireGuard config.
+		rePrefs, err := lc.EditPrefs(ctx, &ipn.MaskedPrefs{
+			RouteAllSet: true,
+			Prefs:       ipn.Prefs{RouteAll: true},
+		})
+		if err != nil {
+			logger.Warn("re-apply accept-routes failed", "error", err)
+		} else {
+			logger.Info("subnet routes re-applied after running", "route_all", rePrefs.RouteAll)
+		}
+
+		// Log peer subnet routes for diagnostics.
+		st, err := lc.Status(ctx)
+		if err != nil {
+			logger.Warn("status check for peers failed", "error", err)
+			return
+		}
+		for _, peer := range st.Peer {
+			if peer.PrimaryRoutes != nil && !peer.PrimaryRoutes.IsNil() && peer.PrimaryRoutes.Len() > 0 {
+				routes := make([]string, 0, peer.PrimaryRoutes.Len())
+				for i := range peer.PrimaryRoutes.Len() {
+					routes = append(routes, peer.PrimaryRoutes.At(i).String())
+				}
+				logger.Info("peer with subnet routes",
+					"peer", peer.HostName,
+					"routes", routes,
+					"online", peer.Online,
+				)
+			}
+		}
+	}()
 
 	// Track active connections for graceful shutdown.
 	var wg sync.WaitGroup
@@ -216,7 +270,15 @@ func runServer(ctx context.Context, configPath string, logger *slog.Logger, leve
 			if routeErr != nil {
 				logger.Warn("failed to fetch DNS routes, falling back to QueryDNS only", "error", routeErr)
 			}
-			queryDNS := tsdns.NewRoutedQueryFunc(fallbackDNS, srv.Dial, dnsRoutes)
+			// Use ListenPacket (not Dial) so both send and receive stay
+			// within gVisor's netstack. srv.Dial for UDP can fall through
+			// to a system socket whose responses are delivered to netstack,
+			// not the kernel, causing reads to time out.
+			v4, _ := srv.TailscaleIPs()
+			listenPacket := func(network, addr string) (net.PacketConn, error) {
+				return srv.ListenPacket(network, net.JoinHostPort(v4.String(), "0"))
+			}
+			queryDNS := tsdns.NewRoutedQueryFunc(fallbackDNS, listenPacket, dnsRoutes)
 			lookupFunc = tsdns.NewLookupFunc(queryDNS)
 			dialer = tsdns.NewDialer(srv.Dial, queryDNS)
 		}

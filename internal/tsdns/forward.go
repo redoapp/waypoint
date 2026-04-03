@@ -14,10 +14,17 @@ import (
 // DialFunc dials a network connection, matching tsnet.Server.Dial's signature.
 type DialFunc func(ctx context.Context, network, addr string) (net.Conn, error)
 
+// ListenPacketFunc creates a PacketConn, matching tsnet.Server.ListenPacket's signature.
+type ListenPacketFunc func(network, addr string) (net.PacketConn, error)
+
 // ForwardQuery builds a DNS query for fqdn/qtype, sends it to resolver via
-// dial (which routes through Tailscale's userspace network), and returns the
-// raw DNS response bytes.
-func ForwardQuery(ctx context.Context, dial DialFunc, resolver, fqdn, qtype string) ([]byte, error) {
+// listenPacket (which creates a UDP socket in Tailscale's userspace network
+// stack), and returns the raw DNS response bytes.
+//
+// Using ListenPacket instead of Dial ensures both send and receive stay
+// within gVisor's netstack, avoiding a mismatch where the response arrives
+// in userspace but the socket lives in the kernel.
+func ForwardQuery(ctx context.Context, listenPacket ListenPacketFunc, resolver, fqdn, qtype string) ([]byte, error) {
 	// Build the DNS query.
 	name, err := dnsmessage.NewName(fqdn)
 	if err != nil {
@@ -62,25 +69,30 @@ func ForwardQuery(ctx context.Context, dial DialFunc, resolver, fqdn, qtype stri
 
 	slog.Debug("forwarding DNS query", "fqdn", fqdn, "qtype", qtype, "resolver", resolver)
 
-	conn, err := dial(ctx, "udp", resolver)
+	pc, err := listenPacket("udp", ":0")
 	if err != nil {
-		return nil, fmt.Errorf("dial resolver %s: %w", resolver, err)
+		return nil, fmt.Errorf("listen packet for resolver %s: %w", resolver, err)
 	}
-	defer conn.Close()
+	defer pc.Close()
+
+	resolverAddr, err := net.ResolveUDPAddr("udp", resolver)
+	if err != nil {
+		return nil, fmt.Errorf("resolve resolver addr %s: %w", resolver, err)
+	}
 
 	// Always set a deadline: use context deadline or default 15s.
 	if deadline, ok := ctx.Deadline(); ok {
-		conn.SetDeadline(deadline)
+		pc.SetDeadline(deadline)
 	} else {
-		conn.SetDeadline(time.Now().Add(15 * time.Second))
+		pc.SetDeadline(time.Now().Add(15 * time.Second))
 	}
 
-	if _, err := conn.Write(packed); err != nil {
+	if _, err := pc.WriteTo(packed, resolverAddr); err != nil {
 		return nil, fmt.Errorf("write DNS query: %w", err)
 	}
 
 	buf := make([]byte, 512)
-	n, err := conn.Read(buf)
+	n, _, err := pc.ReadFrom(buf)
 	if err != nil {
 		return nil, fmt.Errorf("read DNS response from %s for %s: %w", resolver, fqdn, err)
 	}
@@ -113,9 +125,9 @@ func matchRoute(name string, routes map[string][]string) (resolvers []string, ok
 }
 
 // NewRoutedQueryFunc returns a QueryFunc that routes DNS queries matching
-// configured route suffixes through dial (Tailscale userspace network) and
-// falls back to fallback (typically lc.QueryDNS) for everything else.
-func NewRoutedQueryFunc(fallback QueryFunc, dial DialFunc, routes map[string][]string) QueryFunc {
+// configured route suffixes through listenPacket (Tailscale userspace network)
+// and falls back to fallback (typically lc.QueryDNS) for everything else.
+func NewRoutedQueryFunc(fallback QueryFunc, listenPacket ListenPacketFunc, routes map[string][]string) QueryFunc {
 	if len(routes) == 0 {
 		return fallback
 	}
@@ -129,7 +141,7 @@ func NewRoutedQueryFunc(fallback QueryFunc, dial DialFunc, routes map[string][]s
 		// Try each resolver; return first success.
 		var lastErr error
 		for _, r := range resolvers {
-			resp, err := ForwardQuery(ctx, dial, r, name, qtype)
+			resp, err := ForwardQuery(ctx, listenPacket, r, name, qtype)
 			if err == nil {
 				return resp, nil
 			}
