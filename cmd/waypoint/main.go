@@ -25,6 +25,7 @@ import (
 	"github.com/redoapp/waypoint/internal/proxy"
 	"github.com/redoapp/waypoint/internal/restrict"
 	"github.com/redoapp/waypoint/internal/tsdns"
+	"tailscale.com/ipn"
 	"tailscale.com/tsnet"
 )
 
@@ -191,10 +192,21 @@ func runServer(ctx context.Context, configPath string, logger *slog.Logger, leve
 			// not use MagicDNS for split DNS domains. Resolve hostnames
 			// via the Tailscale local API (which goes through the full DNS
 			// stack including split DNS), then dial the resolved IP.
-			queryDNS := func(ctx context.Context, name, qtype string) ([]byte, error) {
+			//
+			// For DNS servers behind subnet routes, lc.QueryDNS's UDP
+			// forwarder also fails (uses system stack). We detect these
+			// routes from the network map and forward via srv.Dial instead.
+			fallbackDNS := func(ctx context.Context, name, qtype string) ([]byte, error) {
 				raw, _, err := lc.QueryDNS(ctx, name, qtype)
 				return raw, err
 			}
+			dnsRoutes, routeErr := tsdns.FetchDNSRoutes(ctx, func(ctx context.Context, mask ipn.NotifyWatchOpt) (tsdns.IPNBusWatcher, error) {
+				return lc.WatchIPNBus(ctx, mask)
+			})
+			if routeErr != nil {
+				logger.Warn("failed to fetch DNS routes, falling back to QueryDNS only", "error", routeErr)
+			}
+			queryDNS := tsdns.NewRoutedQueryFunc(fallbackDNS, srv.Dial, dnsRoutes)
 			lookupFunc = tsdns.NewLookupFunc(queryDNS)
 			dialer = tsdns.NewDialer(srv.Dial, queryDNS)
 		}

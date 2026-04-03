@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http/httptest"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"testing"
@@ -18,6 +19,8 @@ import (
 	"github.com/redoapp/waypoint/internal/auth"
 	"github.com/redoapp/waypoint/internal/testutil"
 	"github.com/redoapp/waypoint/internal/tsdns"
+	"golang.org/x/net/dns/dnsmessage"
+	"tailscale.com/ipn"
 	"tailscale.com/ipn/store/mem"
 	"tailscale.com/net/netns"
 	"tailscale.com/tailcfg"
@@ -359,4 +362,274 @@ func TestE2E_SplitDNS_ResolveViaTailscale(t *testing.T) {
 	if resolved[0] != "10.77.1.50" {
 		t.Fatalf("expected 10.77.1.50, got %s", resolved[0])
 	}
+}
+
+// handleDNSQuery parses a raw DNS query and returns a response.
+// If the question is db.example.internal. type A, it returns 10.99.0.1.
+// Otherwise it returns NXDOMAIN.
+func handleDNSQuery(query []byte) []byte {
+	var parser dnsmessage.Parser
+	hdr, err := parser.Start(query)
+	if err != nil {
+		return nil
+	}
+
+	q, err := parser.Question()
+	if err != nil {
+		return nil
+	}
+
+	resp := dnsmessage.Message{
+		Header: dnsmessage.Header{
+			ID:       hdr.ID,
+			Response: true,
+		},
+		Questions: []dnsmessage.Question{q},
+	}
+
+	if q.Name.String() == "db.example.internal." && q.Type == dnsmessage.TypeA {
+		resp.Answers = []dnsmessage.Resource{{
+			Header: dnsmessage.ResourceHeader{
+				Name:  q.Name,
+				Type:  dnsmessage.TypeA,
+				Class: dnsmessage.ClassINET,
+				TTL:   300,
+			},
+			Body: &dnsmessage.AResource{A: [4]byte{10, 99, 0, 1}},
+		}}
+	} else {
+		resp.Header.RCode = dnsmessage.RCodeNameError
+	}
+
+	packed, _ := resp.Pack()
+	return packed
+}
+
+// serveDNSUDP reads UDP packets from pc, handles them as DNS queries, and
+// writes back responses. It returns when pc is closed.
+func serveDNSUDP(pc net.PacketConn) {
+	buf := make([]byte, 512)
+	for {
+		n, addr, err := pc.ReadFrom(buf)
+		if err != nil {
+			return
+		}
+		resp := handleDNSQuery(buf[:n])
+		if resp != nil {
+			pc.WriteTo(resp, addr)
+		}
+	}
+}
+
+// buildDNSAQuery builds a raw DNS A query packet for the given FQDN.
+func buildDNSAQuery(fqdn string) []byte {
+	name, _ := dnsmessage.NewName(fqdn)
+	msg := dnsmessage.Message{
+		Header: dnsmessage.Header{RecursionDesired: true},
+		Questions: []dnsmessage.Question{{
+			Name:  name,
+			Type:  dnsmessage.TypeA,
+			Class: dnsmessage.ClassINET,
+		}},
+	}
+	packed, _ := msg.Pack()
+	return packed
+}
+
+// TestE2E_SplitDNS_ForwarderTimeout proves that lc.QueryDNS cannot resolve
+// names forwarded to a DNS server behind a subnet router. The forwarder uses
+// net.ListenPacket (system stack) which cannot reach subnet-routed IPs in
+// tsnet's userspace mode. Direct Tailscale UDP to the same DNS server works.
+func TestE2E_SplitDNS_ForwarderTimeout(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	// --- Test infrastructure ---
+
+	netns.SetEnabled(false)
+	t.Cleanup(func() { netns.SetEnabled(true) })
+
+	derpMap := integration.RunDERPAndSTUN(t, logger.Discard, "127.0.0.1")
+	control := &testcontrol.Server{
+		DERPMap:        derpMap,
+		DNSConfig:      &tailcfg.DNSConfig{Proxied: true},
+		MagicDNSDomain: "tail-scale.ts.net",
+	}
+	control.HTTPTestServer = httptest.NewUnstartedServer(control)
+	control.HTTPTestServer.Start()
+	t.Cleanup(control.HTTPTestServer.Close)
+	controlURL := control.HTTPTestServer.URL
+
+	// --- Start "subnet-router" tsnet node ---
+
+	srDir := filepath.Join(t.TempDir(), "subnet-router")
+	os.MkdirAll(srDir, 0755)
+
+	srNode := &tsnet.Server{
+		Dir:        srDir,
+		ControlURL: controlURL,
+		Hostname:   "subnet-router",
+		Store:      new(mem.Store),
+		Ephemeral:  true,
+	}
+	t.Cleanup(func() { srNode.Close() })
+
+	if _, err := srNode.Up(ctx); err != nil {
+		t.Fatalf("subnet-router Up: %v", err)
+	}
+
+	srLC, err := srNode.LocalClient()
+	if err != nil {
+		t.Fatalf("subnet-router LocalClient: %v", err)
+	}
+
+	srStatus, err := srLC.Status(ctx)
+	if err != nil {
+		t.Fatalf("subnet-router Status: %v", err)
+	}
+	srTSIP := srStatus.TailscaleIPs[0].String() // 100.x.y.z
+
+	// Advertise subnet routes for this node.
+	control.SetSubnetRoutes(srStatus.Self.PublicKey, []netip.Prefix{
+		netip.MustParsePrefix("10.20.0.0/24"),
+	})
+
+	// --- Run DNS server on subnet-router's Tailscale IP ---
+
+	pc, err := srNode.ListenPacket("udp", net.JoinHostPort(srTSIP, "53"))
+	if err != nil {
+		t.Fatalf("ListenPacket on subnet-router: %v", err)
+	}
+	t.Cleanup(func() { pc.Close() })
+	go serveDNSUDP(pc)
+
+	// --- Configure DNS forwarding for example.internal → subnet-router ---
+
+	control.DNSConfig.Routes = map[string][]*dnstype.Resolver{
+		"example.internal": {{Addr: srTSIP}},
+	}
+
+	// --- Start "client" tsnet node ---
+
+	clientDir := filepath.Join(t.TempDir(), "client")
+	os.MkdirAll(clientDir, 0755)
+
+	clientNode := &tsnet.Server{
+		Dir:        clientDir,
+		ControlURL: controlURL,
+		Hostname:   "dns-fwd-client",
+		Store:      new(mem.Store),
+		Ephemeral:  true,
+	}
+	t.Cleanup(func() { clientNode.Close() })
+
+	if _, err := clientNode.Up(ctx); err != nil {
+		t.Fatalf("client Up: %v", err)
+	}
+
+	clientLC, err := clientNode.LocalClient()
+	if err != nil {
+		t.Fatalf("client LocalClient: %v", err)
+	}
+
+	// Wait for subnet-router peer to appear.
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		st, err := clientLC.Status(ctx)
+		if err != nil {
+			t.Fatalf("client status: %v", err)
+		}
+		for _, peer := range st.Peer {
+			if peer.HostName == "subnet-router" {
+				goto peerFound
+			}
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	t.Fatal("timed out waiting for subnet-router peer")
+peerFound:
+
+	// --- Assertion 1: Direct UDP to the DNS server works (positive control) ---
+
+	conn, err := clientNode.Dial(ctx, "udp", net.JoinHostPort(srTSIP, "53"))
+	if err != nil {
+		t.Fatalf("client Dial UDP to subnet-router DNS: %v", err)
+	}
+	defer conn.Close()
+
+	query := buildDNSAQuery("db.example.internal.")
+	if _, err := conn.Write(query); err != nil {
+		t.Fatalf("write DNS query: %v", err)
+	}
+
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	respBuf := make([]byte, 512)
+	n, err := conn.Read(respBuf)
+	if err != nil {
+		t.Fatalf("read DNS response: %v", err)
+	}
+
+	// Parse response to verify we got 10.99.0.1.
+	var respParser dnsmessage.Parser
+	if _, err := respParser.Start(respBuf[:n]); err != nil {
+		t.Fatalf("parse DNS response header: %v", err)
+	}
+	if err := respParser.SkipAllQuestions(); err != nil {
+		t.Fatalf("skip questions: %v", err)
+	}
+	ans, err := respParser.AllAnswers()
+	if err != nil {
+		t.Fatalf("parse answers: %v", err)
+	}
+	if len(ans) != 1 {
+		t.Fatalf("expected 1 answer, got %d", len(ans))
+	}
+	aBody, ok := ans[0].Body.(*dnsmessage.AResource)
+	if !ok {
+		t.Fatalf("expected A record, got %T", ans[0].Body)
+	}
+	if aBody.A != [4]byte{10, 99, 0, 1} {
+		t.Fatalf("expected 10.99.0.1, got %v", aBody.A)
+	}
+	t.Log("Assertion 1 passed: direct UDP DNS query to subnet-router resolved correctly")
+
+	// --- Assertion 2: lc.QueryDNS fails (the forwarding bug) ---
+
+	queryCtx, queryCancel := context.WithTimeout(ctx, 10*time.Second)
+	defer queryCancel()
+
+	_, _, queryErr := clientLC.QueryDNS(queryCtx, "db.example.internal.", "A")
+	if queryErr != nil {
+		t.Logf("Assertion 2 passed: lc.QueryDNS failed as expected (forwarder cannot reach subnet-routed IP): %v", queryErr)
+	} else {
+		t.Fatal("lc.QueryDNS unexpectedly succeeded — if this happens, the upstream Tailscale forwarder bug may be fixed; update the test")
+	}
+
+	// --- Assertion 3: NewRoutedQueryFunc succeeds via custom forwarder ---
+
+	dnsRoutes, err := tsdns.FetchDNSRoutes(ctx, func(ctx context.Context, mask ipn.NotifyWatchOpt) (tsdns.IPNBusWatcher, error) {
+		return clientLC.WatchIPNBus(ctx, mask)
+	})
+	if err != nil {
+		t.Fatalf("FetchDNSRoutes: %v", err)
+	}
+	t.Logf("DNS routes: %v", dnsRoutes)
+
+	fallback := func(ctx context.Context, name, qtype string) ([]byte, error) {
+		raw, _, err := clientLC.QueryDNS(ctx, name, qtype)
+		return raw, err
+	}
+	routedQuery := tsdns.NewRoutedQueryFunc(fallback, clientNode.Dial, dnsRoutes)
+
+	routedCtx, routedCancel := context.WithTimeout(ctx, 10*time.Second)
+	defer routedCancel()
+
+	ips, err := tsdns.LookupHost(routedCtx, routedQuery, "db.example.internal")
+	if err != nil {
+		t.Fatalf("Assertion 3 failed: routed query failed: %v", err)
+	}
+	if len(ips) == 0 || ips[0] != "10.99.0.1" {
+		t.Fatalf("Assertion 3 failed: expected 10.99.0.1, got %v", ips)
+	}
+	t.Log("Assertion 3 passed: NewRoutedQueryFunc resolved db.example.internal to 10.99.0.1 via custom forwarder")
 }
