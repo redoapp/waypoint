@@ -449,10 +449,22 @@ func TestE2E_SplitDNS_ForwarderTimeout(t *testing.T) {
 	netns.SetEnabled(false)
 	t.Cleanup(func() { netns.SetEnabled(true) })
 
+	// testcontrol assigns IPs as 100.64.{nodeID>>8}.{nodeID} where nodeID =
+	// len(nodes)+1 at registration time. The subnet-router registers first, so
+	// it gets nodeID=1 → 100.64.0.1.  We pre-set DNSConfig.Routes here, before
+	// any node connects, to avoid a data race between the test mutating Routes
+	// and testcontrol reading DNSConfig.Clone() in its map-response handler.
+	const predictedSRIP = "100.64.0.1"
+
 	derpMap := integration.RunDERPAndSTUN(t, logger.Discard, "127.0.0.1")
 	control := &testcontrol.Server{
-		DERPMap:        derpMap,
-		DNSConfig:      &tailcfg.DNSConfig{Proxied: true},
+		DERPMap: derpMap,
+		DNSConfig: &tailcfg.DNSConfig{
+			Proxied: true,
+			Routes: map[string][]*dnstype.Resolver{
+				"example.internal": {{Addr: predictedSRIP}},
+			},
+		},
 		MagicDNSDomain: "tail-scale.ts.net",
 	}
 	control.HTTPTestServer = httptest.NewUnstartedServer(control)
@@ -488,6 +500,9 @@ func TestE2E_SplitDNS_ForwarderTimeout(t *testing.T) {
 		t.Fatalf("subnet-router Status: %v", err)
 	}
 	srTSIP := srStatus.TailscaleIPs[0].String() // 100.x.y.z
+	if srTSIP != predictedSRIP {
+		t.Fatalf("subnet-router got IP %s, expected %s", srTSIP, predictedSRIP)
+	}
 
 	// Advertise subnet routes for this node.
 	control.SetSubnetRoutes(srStatus.Self.PublicKey, []netip.Prefix{
@@ -502,12 +517,6 @@ func TestE2E_SplitDNS_ForwarderTimeout(t *testing.T) {
 	}
 	t.Cleanup(func() { pc.Close() })
 	go serveDNSUDP(pc)
-
-	// --- Configure DNS forwarding for example.internal → subnet-router ---
-
-	control.DNSConfig.Routes = map[string][]*dnstype.Resolver{
-		"example.internal": {{Addr: srTSIP}},
-	}
 
 	// --- Start "client" tsnet node ---
 
