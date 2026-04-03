@@ -87,7 +87,14 @@ func (p *Provisioner) EnsureUser(ctx context.Context, loginName, nodeName, datab
 	if p.lookupFunc != nil {
 		connCfg.LookupFunc = p.lookupFunc
 	}
-	conn, err := pgx.ConnectConfig(ctx, connCfg)
+
+	// Bound the entire provisioning DB interaction (DNS + connect + SQL).
+	const provisionTimeout = 90 * time.Second
+	connCtx, connCancel := context.WithTimeout(ctx, provisionTimeout)
+	defer connCancel()
+
+	p.logger.Debug("connecting to admin db", "host", connCfg.Host, "database", connCfg.Database)
+	conn, err := pgx.ConnectConfig(connCtx, connCfg)
 	if err != nil {
 		return "", "", fmt.Errorf("admin connect: %w", err)
 	}

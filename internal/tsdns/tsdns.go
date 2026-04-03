@@ -8,6 +8,7 @@ package tsdns
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net"
 	"strings"
 
@@ -28,12 +29,21 @@ func LookupHost(ctx context.Context, query QueryFunc, host string) ([]string, er
 		fqdn += "."
 	}
 
+	slog.Debug("looking up host", "host", host)
+
 	raw, err := query(ctx, fqdn, "A")
 	if err != nil {
+		slog.Warn("DNS lookup failed", "host", host, "error", err)
 		return nil, err
 	}
 
-	return parseARecords(raw, host)
+	ips, err := parseARecords(raw, host)
+	if err != nil {
+		slog.Warn("DNS parse failed", "host", host, "error", err)
+		return nil, err
+	}
+	slog.Debug("DNS lookup resolved", "host", host, "ips", ips)
+	return ips, nil
 }
 
 // parseARecords extracts IPv4 addresses from a raw DNS response.

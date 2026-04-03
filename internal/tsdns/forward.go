@@ -3,8 +3,10 @@ package tsdns
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net"
 	"strings"
+	"time"
 
 	"golang.org/x/net/dns/dnsmessage"
 )
@@ -58,15 +60,19 @@ func ForwardQuery(ctx context.Context, dial DialFunc, resolver, fqdn, qtype stri
 		resolver = net.JoinHostPort(resolver, "53")
 	}
 
+	slog.Debug("forwarding DNS query", "fqdn", fqdn, "qtype", qtype, "resolver", resolver)
+
 	conn, err := dial(ctx, "udp", resolver)
 	if err != nil {
 		return nil, fmt.Errorf("dial resolver %s: %w", resolver, err)
 	}
 	defer conn.Close()
 
-	// Use context deadline if available.
+	// Always set a deadline: use context deadline or default 15s.
 	if deadline, ok := ctx.Deadline(); ok {
 		conn.SetDeadline(deadline)
+	} else {
+		conn.SetDeadline(time.Now().Add(15 * time.Second))
 	}
 
 	if _, err := conn.Write(packed); err != nil {
@@ -76,9 +82,10 @@ func ForwardQuery(ctx context.Context, dial DialFunc, resolver, fqdn, qtype stri
 	buf := make([]byte, 512)
 	n, err := conn.Read(buf)
 	if err != nil {
-		return nil, fmt.Errorf("read DNS response: %w", err)
+		return nil, fmt.Errorf("read DNS response from %s for %s: %w", resolver, fqdn, err)
 	}
 
+	slog.Debug("DNS query resolved", "fqdn", fqdn, "resolver", resolver, "response_bytes", n)
 	return buf[:n], nil
 }
 
@@ -115,8 +122,10 @@ func NewRoutedQueryFunc(fallback QueryFunc, dial DialFunc, routes map[string][]s
 	return func(ctx context.Context, name, qtype string) ([]byte, error) {
 		resolvers, ok := matchRoute(name, routes)
 		if !ok || len(resolvers) == 0 {
+			slog.Debug("DNS query using fallback (no route match)", "name", name, "qtype", qtype)
 			return fallback(ctx, name, qtype)
 		}
+		slog.Debug("DNS query matched route", "name", name, "qtype", qtype, "resolvers", resolvers)
 		// Try each resolver; return first success.
 		var lastErr error
 		for _, r := range resolvers {
@@ -124,6 +133,7 @@ func NewRoutedQueryFunc(fallback QueryFunc, dial DialFunc, routes map[string][]s
 			if err == nil {
 				return resp, nil
 			}
+			slog.Warn("DNS resolver failed", "name", name, "resolver", r, "error", err)
 			lastErr = err
 		}
 		return nil, fmt.Errorf("all resolvers failed for %s: %w", name, lastErr)
