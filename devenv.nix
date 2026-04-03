@@ -15,6 +15,9 @@
     GOPATH = "${config.devenv.state}/go";
     GOCACHE = "${config.devenv.state}/go-cache";
     GOMODCACHE = "${config.devenv.state}/go-mod-cache";
+    # Ryuk (testcontainers reaper) cannot access the Docker socket inside
+    # rootless Podman containers. Disable it; test cleanup handles teardown.
+    TESTCONTAINERS_RYUK_DISABLED = "true";
   };
 
   services.redis.enable = true;

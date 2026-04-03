@@ -28,7 +28,9 @@ import (
 	"tailscale.com/tstest/integration"
 	"tailscale.com/tstest/integration/testcontrol"
 	"tailscale.com/types/dnstype"
+	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
+	"tailscale.com/types/views"
 )
 
 // TestE2E_ServiceListener_ProxyProto is a full end-to-end test that calls the
@@ -125,9 +127,15 @@ backend = "%s"
 
 	// --- Start waypoint via the real run() code path ---
 
-	// afterTSStart sets tags on the waypoint node via the test control plane.
-	// The test control doesn't process AdvertiseTags, so tags must be set
-	// after the node registers but before ListenService is called.
+	const serviceName = tailcfg.ServiceName("svc:echo-e2e")
+	const serviceVIP = "100.11.22.33"
+
+	// afterTSStart configures the test control plane for services:
+	//   - tags the node (ListenService requires tagged nodes)
+	//   - sets NodeAttrServiceHost capability with VIP mapping
+	//   - advertises subnet route for the service VIP
+	//   - adds DNS record for the service FQDN
+	// This mirrors the setup in tsnet's TestListenService.
 	afterTSStart := func(srv *tsnet.Server) error {
 		lc, err := srv.LocalClient()
 		if err != nil {
@@ -139,6 +147,7 @@ backend = "%s"
 		// the local status shows a Tailscale IP (meaning login completed)
 		// and the node appears in the control server.
 		var node *tailcfg.Node
+		var nodeKey key.NodePublic
 		regDeadline := time.Now().Add(30 * time.Second)
 		for time.Now().Before(regDeadline) {
 			st, err := lc.Status(ctx)
@@ -146,7 +155,8 @@ backend = "%s"
 				return fmt.Errorf("status: %w", err)
 			}
 			if st.Self != nil && len(st.TailscaleIPs) > 0 && !st.Self.PublicKey.IsZero() {
-				node = control.Node(st.Self.PublicKey)
+				nodeKey = st.Self.PublicKey
+				node = control.Node(nodeKey)
 				if node != nil {
 					break
 				}
@@ -156,8 +166,38 @@ backend = "%s"
 		if node == nil {
 			return fmt.Errorf("node not found in control after 30s")
 		}
+
+		// Tag the node (required by ListenService).
 		node.Tags = []string{"tag:waypoint"}
 		control.UpdateNode(node)
+
+		// Set service-host capability: maps service name → VIP.
+		// Include the default testcontrol caps so the override doesn't clear them.
+		serviceHostCaps := map[tailcfg.ServiceName]views.Slice[netip.Addr]{
+			serviceName: views.SliceOf([]netip.Addr{netip.MustParseAddr(serviceVIP)}),
+		}
+		svcCapJSON, err := json.Marshal(serviceHostCaps)
+		if err != nil {
+			return fmt.Errorf("marshal service host caps: %w", err)
+		}
+		control.SetNodeCapMap(nodeKey, tailcfg.NodeCapMap{
+			tailcfg.NodeAttrServiceHost:                       {tailcfg.RawMessage(svcCapJSON)},
+			tailcfg.CapabilityHTTPS:                           {},
+			tailcfg.NodeAttrFunnel:                            {},
+			tailcfg.CapabilityFileSharing:                     {},
+			tailcfg.CapabilityFunnelPorts + "?ports=8080,443": {},
+		})
+
+		// Advertise subnet route for the service VIP.
+		control.SetSubnetRoutes(nodeKey, []netip.Prefix{
+			netip.MustParsePrefix(serviceVIP + "/32"),
+		})
+
+		// Add DNS record so the service FQDN resolves to the VIP.
+		control.AddDNSRecords(tailcfg.DNSRecord{
+			Name:  string(serviceName.WithoutPrefix()) + "." + control.MagicDNSDomain,
+			Value: serviceVIP,
+		})
 
 		// Wait for the node to see its updated tags.
 		deadline := time.Now().Add(10 * time.Second)
@@ -216,6 +256,14 @@ backend = "%s"
 		t.Fatalf("client LocalClient: %v", err)
 	}
 
+	// Accept routes advertised by the service host (equivalent to --accept-routes).
+	if _, err := clientLC.EditPrefs(ctx, &ipn.MaskedPrefs{
+		RouteAllSet: true,
+		Prefs:       ipn.Prefs{RouteAll: true},
+	}); err != nil {
+		t.Fatalf("client EditPrefs RouteAll: %v", err)
+	}
+
 	// Wait for the waypoint peer to appear.
 	var waypointIP string
 	deadline := time.Now().Add(30 * time.Second)
@@ -241,7 +289,18 @@ backend = "%s"
 
 	// --- Verify: dial the service and echo data ---
 
-	conn, err := clientNode.Dial(ctx, "tcp", fmt.Sprintf("%s:7778", waypointIP))
+	// Dial the service by its FQDN (the VIP), not the node's Tailscale IP.
+	// Retry because runServer may still be setting up the listener.
+	serviceFQDN := string(serviceName.WithoutPrefix()) + "." + control.MagicDNSDomain
+	var conn net.Conn
+	dialDeadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(dialDeadline) {
+		conn, err = clientNode.Dial(ctx, "tcp", fmt.Sprintf("%s:7778", serviceFQDN))
+		if err == nil {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
 	if err != nil {
 		t.Fatalf("client dial: %v", err)
 	}
@@ -265,6 +324,7 @@ backend = "%s"
 	}
 
 	// --- Shutdown ---
+	conn.Close() // close before cancel so the server doesn't block draining
 	runCancel()
 	select {
 	case err := <-errCh:
