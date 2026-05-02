@@ -7,6 +7,10 @@ import (
 	"log/slog"
 	"strings"
 
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 	"tailscale.com/client/local"
 	"tailscale.com/tailcfg"
 )
@@ -26,11 +30,20 @@ type ManagerAuthResult struct {
 
 // AuthorizeManager checks whether the caller has the waypointManager capability.
 func AuthorizeManager(ctx context.Context, lc *local.Client, remoteAddr string, logger *slog.Logger) (*ManagerAuthResult, error) {
+	tracer := otel.Tracer("waypoint")
+
 	logger.Debug("WhoIs lookup", "remote", remoteAddr)
+	ctx, whoIsSpan := tracer.Start(ctx, "tailscale.whois",
+		trace.WithAttributes(attribute.String("peer.service", "tailscale")),
+	)
 	who, err := lc.WhoIs(ctx, remoteAddr)
 	if err != nil {
+		whoIsSpan.RecordError(err)
+		whoIsSpan.SetStatus(codes.Error, "WhoIs failed")
+		whoIsSpan.End()
 		return nil, fmt.Errorf("WhoIs failed: %w", err)
 	}
+	whoIsSpan.End()
 	if who.UserProfile == nil {
 		return nil, errors.New("no user profile in WhoIs response")
 	}

@@ -12,6 +12,10 @@ import (
 	"net"
 	"strings"
 
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/net/dns/dnsmessage"
 )
 
@@ -23,6 +27,15 @@ type QueryFunc func(ctx context.Context, name, queryType string) ([]byte, error)
 // local.Client.QueryDNS (or equivalent) which goes through the full
 // Tailscale DNS stack including MagicDNS and split DNS.
 func LookupHost(ctx context.Context, query QueryFunc, host string) ([]string, error) {
+	tracer := otel.Tracer("waypoint")
+	ctx, span := tracer.Start(ctx, "tailscale.dns.lookup",
+		trace.WithAttributes(
+			attribute.String("peer.service", "tailscale"),
+			attribute.String("dns.question.name", host),
+		),
+	)
+	defer span.End()
+
 	// Ensure the name is FQDN (trailing dot).
 	fqdn := host
 	if !strings.HasSuffix(fqdn, ".") {
@@ -33,12 +46,16 @@ func LookupHost(ctx context.Context, query QueryFunc, host string) ([]string, er
 
 	raw, err := query(ctx, fqdn, "A")
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "DNS lookup failed")
 		slog.Warn("DNS lookup failed", "host", host, "error", err)
 		return nil, err
 	}
 
 	ips, err := parseARecords(raw, host)
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "DNS parse failed")
 		slog.Warn("DNS parse failed", "host", host, "error", err)
 		return nil, err
 	}
@@ -115,6 +132,21 @@ func newDialerWithLookup(tsDial func(ctx context.Context, network, addr string) 
 		if err != nil {
 			return nil, fmt.Errorf("tailscale DNS lookup %q: %w", host, err)
 		}
-		return tsDial(ctx, network, net.JoinHostPort(ips[0], port))
+
+		tracer := otel.Tracer("waypoint")
+		ctx, span := tracer.Start(ctx, "tailscale.dial",
+			trace.WithAttributes(
+				attribute.String("peer.service", "tailscale"),
+				attribute.String("net.peer.name", host),
+				attribute.String("net.peer.port", port),
+			),
+		)
+		conn, dialErr := tsDial(ctx, network, net.JoinHostPort(ips[0], port))
+		if dialErr != nil {
+			span.RecordError(dialErr)
+			span.SetStatus(codes.Error, "dial failed")
+		}
+		span.End()
+		return conn, dialErr
 	}
 }

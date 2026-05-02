@@ -27,6 +27,7 @@ address = "localhost:6379"
 # password = ""
 # db = 0
 key_prefix = "waypoint:"
+# service_name = "redis"   # peer.service for OTel traces (default: "redis")
 
 [revalidation]
 interval = "1m"
@@ -76,6 +77,7 @@ admin_password = "${PG_ADMIN_PASSWORD}"
 admin_database = "postgres"
 user_prefix = "wp_"
 user_ttl = "24h"
+# service_name = "my-prod-db"   # peer.service override for OTel (default: listener name)
 
 [[listeners]]
 name = "raw-mysql"

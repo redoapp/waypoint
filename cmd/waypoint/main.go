@@ -18,7 +18,10 @@ import (
 
 	"github.com/google/uuid"
 	proxyproto "github.com/pires/go-proxyproto"
+	"github.com/redis/go-redis/extra/redisotel/v9"
 	"github.com/redis/go-redis/v9"
+	"go.opentelemetry.io/otel/attribute"
+
 	"github.com/redoapp/waypoint/internal/config"
 	"github.com/redoapp/waypoint/internal/heartbeat"
 	"github.com/redoapp/waypoint/internal/logging"
@@ -106,6 +109,20 @@ func runServer(ctx context.Context, configPath string, logger *slog.Logger, leve
 		opts.TLSConfig = &tls.Config{}
 	}
 	rdb := redis.NewClient(opts)
+
+	redisServiceName := cfg.Redis.ServiceName
+	if redisServiceName == "" {
+		redisServiceName = "redis"
+	}
+	if err := redisotel.InstrumentTracing(rdb,
+		redisotel.WithAttributes(attribute.String("peer.service", redisServiceName)),
+	); err != nil {
+		return fmt.Errorf("redis otel tracing: %w", err)
+	}
+	if err := redisotel.InstrumentMetrics(rdb); err != nil {
+		return fmt.Errorf("redis otel metrics: %w", err)
+	}
+
 	if err := rdb.Ping(ctx).Err(); err != nil {
 		return fmt.Errorf("redis connection: %w", err)
 	}
@@ -333,6 +350,11 @@ func runServer(ctx context.Context, configPath string, logger *slog.Logger, leve
 				return fmt.Errorf("postgres listener %s requires [listeners.postgres] config", lCfg.Name)
 			}
 
+			pgPeerService := lCfg.Name
+			if lCfg.Postgres.ServiceName != "" {
+				pgPeerService = lCfg.Postgres.ServiceName
+			}
+
 			provisioner := provision.NewProvisioner(
 				lCfg.Postgres.AdminUser,
 				lCfg.Postgres.AdminPassword,
@@ -341,6 +363,7 @@ func runServer(ctx context.Context, configPath string, logger *slog.Logger, leve
 				lCfg.Postgres.UserPrefix,
 				lCfg.BackendTLS,
 				config.AllowRawSQLResolved(lCfg.Postgres, &cfg.Provisioning),
+				pgPeerService,
 				store,
 				logger.With("component", "provisioner", "listener", lCfg.Name),
 				dialer,

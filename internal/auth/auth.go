@@ -8,6 +8,10 @@ import (
 	"strings"
 	"time"
 
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 	"tailscale.com/client/local"
 	"tailscale.com/tailcfg"
 )
@@ -38,11 +42,20 @@ type MergedLimits struct {
 // Authorize checks the caller's Tailscale identity and capability grants
 // for the given backend listener name.
 func Authorize(ctx context.Context, lc *local.Client, remoteAddr string, backend string, logger *slog.Logger) (*AuthResult, error) {
+	tracer := otel.Tracer("waypoint")
+
 	logger.Debug("WhoIs lookup", "remote", remoteAddr)
+	ctx, whoIsSpan := tracer.Start(ctx, "tailscale.whois",
+		trace.WithAttributes(attribute.String("peer.service", "tailscale")),
+	)
 	who, err := lc.WhoIs(ctx, remoteAddr)
 	if err != nil {
+		whoIsSpan.RecordError(err)
+		whoIsSpan.SetStatus(codes.Error, "WhoIs failed")
+		whoIsSpan.End()
 		return nil, fmt.Errorf("WhoIs failed: %w", err)
 	}
+	whoIsSpan.End()
 	if who.UserProfile == nil {
 		return nil, errors.New("no user profile in WhoIs response")
 	}

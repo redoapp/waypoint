@@ -29,11 +29,12 @@ type ProvisioningConfig struct {
 }
 
 type RedisConfig struct {
-	Address   string `toml:"address"`
-	Password  string `toml:"password"`
-	DB        int    `toml:"db"`
-	TLS       bool   `toml:"tls"`
-	KeyPrefix string `toml:"key_prefix"`
+	Address     string `toml:"address"`
+	Password    string `toml:"password"`
+	DB          int    `toml:"db"`
+	TLS         bool   `toml:"tls"`
+	KeyPrefix   string `toml:"key_prefix"`
+	ServiceName string `toml:"service_name"` // peer.service for OTel traces (default: "redis")
 }
 
 type RevalidationConfig struct {
@@ -87,6 +88,7 @@ type PostgresAdmin struct {
 	UserPrefix    string `toml:"user_prefix"`
 	UserTTL       string `toml:"user_ttl"`
 	AllowRawSQL   *bool  `toml:"allow_raw_sql"` // nil = use global
+	ServiceName   string `toml:"service_name"`  // peer.service override for OTel (default: listener name)
 }
 
 // AllowRawSQLResolved returns whether raw SQL is allowed for this listener,

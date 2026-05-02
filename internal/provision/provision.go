@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/exaring/otelpgx"
 	"github.com/jackc/pgx/v5"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -27,6 +28,7 @@ type Provisioner struct {
 	adminConnStr string
 	userPrefix   string
 	allowRawSQL  bool
+	peerService  string
 	store        *restrict.RedisStore
 	logger       *slog.Logger
 	dialFunc     func(ctx context.Context, network, addr string) (net.Conn, error)
@@ -34,7 +36,7 @@ type Provisioner struct {
 }
 
 // NewProvisioner creates a new Provisioner.
-func NewProvisioner(adminUser, adminPassword, adminDatabase, backend, userPrefix string, backendTLS, allowRawSQL bool, store *restrict.RedisStore, logger *slog.Logger, dialFunc func(ctx context.Context, network, addr string) (net.Conn, error), lookupFunc func(ctx context.Context, host string) ([]string, error)) *Provisioner {
+func NewProvisioner(adminUser, adminPassword, adminDatabase, backend, userPrefix string, backendTLS, allowRawSQL bool, peerService string, store *restrict.RedisStore, logger *slog.Logger, dialFunc func(ctx context.Context, network, addr string) (net.Conn, error), lookupFunc func(ctx context.Context, host string) ([]string, error)) *Provisioner {
 	sslmode := "disable"
 	if backendTLS {
 		sslmode = "require"
@@ -53,6 +55,7 @@ func NewProvisioner(adminUser, adminPassword, adminDatabase, backend, userPrefix
 		adminConnStr: connStr,
 		userPrefix:   userPrefix,
 		allowRawSQL:  allowRawSQL,
+		peerService:  peerService,
 		store:        store,
 		logger:       logger,
 		dialFunc:     dialFunc,
@@ -126,6 +129,16 @@ func (p *Provisioner) EnsureUser(ctx context.Context, loginName, nodeName, datab
 	if p.lookupFunc != nil {
 		connCfg.LookupFunc = p.lookupFunc
 	}
+
+	tracerOpts := []otelpgx.Option{
+		otelpgx.WithTrimSQLInSpanName(),
+	}
+	if p.peerService != "" {
+		tracerOpts = append(tracerOpts, otelpgx.WithTracerAttributes(
+			attribute.String("peer.service", p.peerService),
+		))
+	}
+	connCfg.Tracer = otelpgx.NewTracer(tracerOpts...)
 
 	// Bound the entire provisioning DB interaction (DNS + connect + SQL).
 	const provisionTimeout = 90 * time.Second

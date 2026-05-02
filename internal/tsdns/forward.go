@@ -8,6 +8,9 @@ import (
 	"strings"
 	"time"
 
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/net/dns/dnsmessage"
 )
 
@@ -25,6 +28,16 @@ type ListenPacketFunc func(network, addr string) (net.PacketConn, error)
 // within gVisor's netstack, avoiding a mismatch where the response arrives
 // in userspace but the socket lives in the kernel.
 func ForwardQuery(ctx context.Context, listenPacket ListenPacketFunc, resolver, fqdn, qtype string) ([]byte, error) {
+	tracer := otel.Tracer("waypoint")
+	ctx, span := tracer.Start(ctx, "tailscale.dns.forward",
+		trace.WithAttributes(
+			attribute.String("peer.service", "tailscale"),
+			attribute.String("dns.question.name", fqdn),
+			attribute.String("dns.resolver", resolver),
+		),
+	)
+	defer span.End()
+
 	// Build the DNS query.
 	name, err := dnsmessage.NewName(fqdn)
 	if err != nil {
