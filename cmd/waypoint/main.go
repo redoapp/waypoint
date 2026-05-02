@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/netip"
 	"os"
 	"os/signal"
 	"strings"
@@ -28,6 +29,8 @@ import (
 	"github.com/redoapp/waypoint/internal/tsdns"
 	"tailscale.com/ipn"
 	"tailscale.com/tsnet"
+	"tailscale.com/types/nettype"
+	"tailscale.com/wgengine/netstack"
 )
 
 var (
@@ -146,6 +149,33 @@ func runServer(ctx context.Context, configPath string, logger *slog.Logger, leve
 		}
 	}
 
+	// Patch tsnet's flow handlers so outbound connections to subnet-routed
+	// IPs work. By default, tsnet returns (nil, true) for flows with no
+	// local listener, which tells netstack to reject them. We change this
+	// to (nil, false) so netstack falls through to its default forwarding
+	// behavior (enabled by ProcessSubnets=true).
+	if nsImpl, ok := srv.Sys().Netstack.Get().(*netstack.Impl); ok {
+		origTCP := nsImpl.GetTCPHandlerForFlow
+		nsImpl.GetTCPHandlerForFlow = func(src, dst netip.AddrPort) (func(net.Conn), bool) {
+			handler, intercept := origTCP(src, dst)
+			if intercept && handler == nil {
+				return nil, false
+			}
+			return handler, intercept
+		}
+		origUDP := nsImpl.GetUDPHandlerForFlow
+		nsImpl.GetUDPHandlerForFlow = func(src, dst netip.AddrPort) (func(nettype.ConnPacketConn), bool) {
+			handler, intercept := origUDP(src, dst)
+			if intercept && handler == nil {
+				return nil, false
+			}
+			return handler, intercept
+		}
+		logger.Info("patched netstack flow handlers for subnet route access")
+	} else {
+		logger.Warn("could not patch netstack flow handlers: type assertion failed")
+	}
+
 	lc, err := srv.LocalClient()
 	if err != nil {
 		return fmt.Errorf("local client: %w", err)
@@ -162,43 +192,43 @@ func runServer(ctx context.Context, configPath string, logger *slog.Logger, leve
 	}
 	logger.Info("subnet routes accepted", "route_all", updatedPrefs.RouteAll)
 
-	// Log subnet route status after node reaches Running state.
-	go func() {
-		// Wait for the node to be running by polling status.
-		for {
-			st, err := lc.StatusWithoutPeers(ctx)
-			if err != nil {
-				logger.Warn("status check failed", "error", err)
-				return
-			}
-			if st.BackendState == "Running" {
-				break
-			}
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(500 * time.Millisecond):
-			}
-		}
-
-		// Re-apply EditPrefs now that the node is Running and has a netmap,
-		// so authReconfigLocked can actually rebuild the WireGuard config.
-		rePrefs, err := lc.EditPrefs(ctx, &ipn.MaskedPrefs{
-			RouteAllSet: true,
-			Prefs:       ipn.Prefs{RouteAll: true},
-		})
+	// Wait for the node to reach Running state before setting up listeners,
+	// so subnet routes are available for DNS resolution and backend dialing.
+	logger.Info("waiting for tailscale to reach Running state")
+	for {
+		st, err := lc.StatusWithoutPeers(ctx)
 		if err != nil {
-			logger.Warn("re-apply accept-routes failed", "error", err)
-		} else {
-			logger.Info("subnet routes re-applied after running", "route_all", rePrefs.RouteAll)
+			return fmt.Errorf("status check: %w", err)
 		}
+		if st.BackendState == "Running" {
+			logger.Info("tailscale is running")
+			break
+		}
+		logger.Debug("tailscale not ready yet", "state", st.BackendState)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
 
-		// Log peer subnet routes for diagnostics.
-		st, err := lc.Status(ctx)
-		if err != nil {
-			logger.Warn("status check for peers failed", "error", err)
-			return
-		}
+	// Re-apply EditPrefs now that the node is Running and has a netmap,
+	// so authReconfigLocked can actually rebuild the WireGuard config.
+	rePrefs, err := lc.EditPrefs(ctx, &ipn.MaskedPrefs{
+		RouteAllSet: true,
+		Prefs:       ipn.Prefs{RouteAll: true},
+	})
+	if err != nil {
+		logger.Warn("re-apply accept-routes failed", "error", err)
+	} else {
+		logger.Info("subnet routes re-applied after running", "route_all", rePrefs.RouteAll)
+	}
+
+	// Log peer subnet routes.
+	st, err := lc.Status(ctx)
+	if err != nil {
+		logger.Warn("status check for peers failed", "error", err)
+	} else {
 		for _, peer := range st.Peer {
 			if peer.PrimaryRoutes != nil && !peer.PrimaryRoutes.IsNil() && peer.PrimaryRoutes.Len() > 0 {
 				routes := make([]string, 0, peer.PrimaryRoutes.Len())
@@ -212,7 +242,7 @@ func runServer(ctx context.Context, configPath string, logger *slog.Logger, leve
 				)
 			}
 		}
-	}()
+	}
 
 	// Track active connections for graceful shutdown.
 	var wg sync.WaitGroup
@@ -309,6 +339,7 @@ func runServer(ctx context.Context, configPath string, logger *slog.Logger, leve
 				lCfg.Postgres.AdminDatabase,
 				lCfg.Backend,
 				lCfg.Postgres.UserPrefix,
+				lCfg.BackendTLS,
 				store,
 				logger.With("component", "provisioner", "listener", lCfg.Name),
 				dialer,
@@ -323,6 +354,7 @@ func runServer(ctx context.Context, configPath string, logger *slog.Logger, leve
 				Provisioner:   provisioner,
 				Metrics:       m,
 				PGConfig:      lCfg.Postgres,
+				BackendTLS:    lCfg.BackendTLS,
 				RevalInterval: revalInterval,
 				Logger:        logger.With("listener", lCfg.Name),
 				Dialer:        dialer,

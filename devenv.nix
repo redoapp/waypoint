@@ -27,6 +27,26 @@
     golangci-lint.enable = true;
   };
 
+  scripts.run-proxy.exec = ''
+    if [ -f .env ]; then
+      set -a
+      . .env
+      set +a
+    fi
+    mkdir -p .waypoint/tsnet-state
+    exec go run ./cmd/waypoint -config waypoint-dev.toml
+  '';
+
+  scripts.debug-proxy.exec = ''
+    if [ -f .env ]; then
+      set -a
+      . .env
+      set +a
+    fi
+    mkdir -p .waypoint/tsnet-state
+    exec dlv debug ./cmd/waypoint -- -config waypoint-dev.toml
+  '';
+
   scripts.test.exec = ''
     go test ./... "$@"
   '';
@@ -46,6 +66,6 @@
   enterShell = ''
     echo "Go: $(go version)"
     echo "Valkey service configured (start with 'devenv up')"
-    echo "Commands: test, coverage, coverage-unit, coverage-serve"
+    echo "Commands: run-proxy, debug-proxy, test, coverage, coverage-unit, coverage-serve"
   '';
 }

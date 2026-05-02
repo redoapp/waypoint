@@ -57,6 +57,7 @@ type ListenerConfig struct {
 	Mode                string         `toml:"mode"`
 	Backend             string         `toml:"backend"`
 	BackendViaTailscale bool           `toml:"backend_via_tailscale"`
+	BackendTLS          bool           `toml:"tls"`
 	Service             string         `toml:"service"`
 	Postgres            *PostgresAdmin `toml:"postgres"`
 }

@@ -26,6 +26,7 @@ type PostgresProxy struct {
 	Provisioner   *provision.Provisioner
 	Metrics       *metrics.Metrics
 	PGConfig      *config.PostgresAdmin
+	BackendTLS    bool
 	RevalInterval time.Duration
 	Logger        *slog.Logger
 	Dialer        func(ctx context.Context, network, addr string) (net.Conn, error)
@@ -168,6 +169,17 @@ func (p *PostgresProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 	defer backendConn.Close()
 
 	log.Debug("backend connected")
+
+	// Step 6b: Upgrade to TLS if configured.
+	if p.BackendTLS {
+		backendConn, err = pgwire.UpgradeToTLS(backendConn)
+		if err != nil {
+			log.Error("backend TLS upgrade failed", "error", err)
+			pgwire.SendErrorResponse(clientConn, "FATAL", "08006", "backend TLS failed")
+			return
+		}
+		log.Debug("backend TLS established")
+	}
 
 	// Step 7: Send startup to upstream with provisioned user.
 	if err := pgwire.WriteStartupMessage(backendConn, pgUser, requestedDB, nil); err != nil {

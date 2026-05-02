@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/url"
 	"strings"
 	"time"
 
@@ -27,9 +28,18 @@ type Provisioner struct {
 }
 
 // NewProvisioner creates a new Provisioner.
-func NewProvisioner(adminUser, adminPassword, adminDatabase, backend, userPrefix string, store *restrict.RedisStore, logger *slog.Logger, dialFunc func(ctx context.Context, network, addr string) (net.Conn, error), lookupFunc func(ctx context.Context, host string) ([]string, error)) *Provisioner {
-	connStr := fmt.Sprintf("postgres://%s:%s@%s/%s?sslmode=disable",
-		adminUser, adminPassword, backend, adminDatabase)
+func NewProvisioner(adminUser, adminPassword, adminDatabase, backend, userPrefix string, backendTLS bool, store *restrict.RedisStore, logger *slog.Logger, dialFunc func(ctx context.Context, network, addr string) (net.Conn, error), lookupFunc func(ctx context.Context, host string) ([]string, error)) *Provisioner {
+	sslmode := "disable"
+	if backendTLS {
+		sslmode = "require"
+	}
+	connStr := (&url.URL{
+		Scheme:   "postgres",
+		User:     url.UserPassword(adminUser, adminPassword),
+		Host:     backend,
+		Path:     "/" + adminDatabase,
+		RawQuery: "sslmode=" + sslmode,
+	}).String()
 	if userPrefix == "" {
 		userPrefix = "wp_"
 	}

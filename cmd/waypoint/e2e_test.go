@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -495,6 +496,36 @@ func serveDNSUDP(pc net.PacketConn) {
 	}
 }
 
+// serveDNSTCP accepts TCP connections and handles DNS-over-TCP queries
+// (2-byte length prefix per RFC 7766). It returns when ln is closed.
+func serveDNSTCP(ln net.Listener) {
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		go func(c net.Conn) {
+			defer c.Close()
+			for {
+				var length uint16
+				if err := binary.Read(c, binary.BigEndian, &length); err != nil {
+					return
+				}
+				buf := make([]byte, length)
+				if _, err := io.ReadFull(c, buf); err != nil {
+					return
+				}
+				resp := handleDNSQuery(buf)
+				if resp == nil {
+					return
+				}
+				binary.Write(c, binary.BigEndian, uint16(len(resp)))
+				c.Write(resp)
+			}
+		}(conn)
+	}
+}
+
 // buildDNSAQuery builds a raw DNS A query packet for the given FQDN.
 func buildDNSAQuery(fqdn string) []byte {
 	name, _ := dnsmessage.NewName(fqdn)
@@ -583,7 +614,7 @@ func TestE2E_SplitDNS_ForwarderTimeout(t *testing.T) {
 		netip.MustParsePrefix("10.20.0.0/24"),
 	})
 
-	// --- Run DNS server on subnet-router's Tailscale IP ---
+	// --- Run DNS server on subnet-router's Tailscale IP (UDP + TCP) ---
 
 	pc, err := srNode.ListenPacket("udp", net.JoinHostPort(srTSIP, "53"))
 	if err != nil {
@@ -591,6 +622,13 @@ func TestE2E_SplitDNS_ForwarderTimeout(t *testing.T) {
 	}
 	t.Cleanup(func() { pc.Close() })
 	go serveDNSUDP(pc)
+
+	tcpLn, err := srNode.Listen("tcp", net.JoinHostPort(srTSIP, "53"))
+	if err != nil {
+		t.Fatalf("Listen TCP on subnet-router: %v", err)
+	}
+	t.Cleanup(func() { tcpLn.Close() })
+	go serveDNSTCP(tcpLn)
 
 	// --- Start "client" tsnet node ---
 
@@ -702,11 +740,7 @@ peerFound:
 		raw, _, err := clientLC.QueryDNS(ctx, name, qtype)
 		return raw, err
 	}
-	v4, _ := clientNode.TailscaleIPs()
-	listenPacket := func(network, addr string) (net.PacketConn, error) {
-		return clientNode.ListenPacket(network, net.JoinHostPort(v4.String(), "0"))
-	}
-	routedQuery := tsdns.NewRoutedQueryFunc(fallback, listenPacket, dnsRoutes)
+	routedQuery := tsdns.NewRoutedQueryFunc(fallback, clientNode.Dial, dnsRoutes)
 
 	routedCtx, routedCancel := context.WithTimeout(ctx, 10*time.Second)
 	defer routedCancel()

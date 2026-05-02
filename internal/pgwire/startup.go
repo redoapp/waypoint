@@ -1,6 +1,7 @@
 package pgwire
 
 import (
+	"crypto/tls"
 	"fmt"
 	"io"
 	"net"
@@ -47,6 +48,31 @@ func ReadStartupMessage(conn net.Conn) (*pgproto3.StartupMessage, error) {
 
 		return &startup, nil
 	}
+}
+
+// UpgradeToTLS sends an SSLRequest to the backend and upgrades the connection
+// to TLS. Returns the TLS-wrapped connection on success.
+func UpgradeToTLS(conn net.Conn) (net.Conn, error) {
+	// SSLRequest: length=8, version=80877103 (0x04D2162F)
+	sslReq := []byte{0, 0, 0, 8, 0x04, 0xD2, 0x16, 0x2F}
+	if _, err := conn.Write(sslReq); err != nil {
+		return nil, fmt.Errorf("send SSLRequest: %w", err)
+	}
+
+	resp := make([]byte, 1)
+	if _, err := io.ReadFull(conn, resp); err != nil {
+		return nil, fmt.Errorf("read SSL response: %w", err)
+	}
+
+	if resp[0] != 'S' {
+		return nil, fmt.Errorf("backend rejected SSL (response: %c)", resp[0])
+	}
+
+	tlsConn := tls.Client(conn, &tls.Config{InsecureSkipVerify: true})
+	if err := tlsConn.Handshake(); err != nil {
+		return nil, fmt.Errorf("TLS handshake: %w", err)
+	}
+	return tlsConn, nil
 }
 
 // WriteStartupMessage sends a startup message to the upstream backend.

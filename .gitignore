@@ -23,6 +23,11 @@ covreport
 # Claude Code
 .claude/
 
+# Local dev
+.waypoint/
+waypoint-dev.toml
+.env
+
 # OS
 .DS_Store
 Thumbs.db
