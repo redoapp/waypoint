@@ -541,10 +541,10 @@ func buildDNSAQuery(fqdn string) []byte {
 	return packed
 }
 
-// TestE2E_SplitDNS_ForwarderTimeout proves that lc.QueryDNS cannot resolve
-// names forwarded to a DNS server behind a subnet router. The forwarder uses
-// net.ListenPacket (system stack) which cannot reach subnet-routed IPs in
-// tsnet's userspace mode. Direct Tailscale UDP to the same DNS server works.
+// TestE2E_SplitDNS_ForwarderTimeout validates DNS resolution for names
+// forwarded to a DNS server behind a subnet router. It verifies that both
+// lc.QueryDNS and our custom NewRoutedQueryFunc correctly resolve names
+// via the subnet-routed DNS server.
 func TestE2E_SplitDNS_ForwarderTimeout(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
@@ -714,17 +714,16 @@ peerFound:
 	}
 	t.Log("Assertion 1 passed: direct UDP DNS query to subnet-router resolved correctly")
 
-	// --- Assertion 2: lc.QueryDNS fails (the forwarding bug) ---
+	// --- Assertion 2: lc.QueryDNS resolves via built-in forwarder ---
 
 	queryCtx, queryCancel := context.WithTimeout(ctx, 10*time.Second)
 	defer queryCancel()
 
 	_, _, queryErr := clientLC.QueryDNS(queryCtx, "db.example.internal.", "A")
 	if queryErr != nil {
-		t.Logf("Assertion 2 passed: lc.QueryDNS failed as expected (forwarder cannot reach subnet-routed IP): %v", queryErr)
-	} else {
-		t.Fatal("lc.QueryDNS unexpectedly succeeded — if this happens, the upstream Tailscale forwarder bug may be fixed; update the test")
+		t.Fatalf("Assertion 2 failed: lc.QueryDNS could not resolve: %v", queryErr)
 	}
+	t.Log("Assertion 2 passed: lc.QueryDNS resolved via built-in forwarder")
 
 	// --- Assertion 3: NewRoutedQueryFunc succeeds via custom forwarder ---
 
