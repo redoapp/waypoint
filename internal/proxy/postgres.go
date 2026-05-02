@@ -282,7 +282,7 @@ func (p *PostgresProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 	setupSpan.End()
 
 	// Step 11: Bidirectional relay with limits.
-	cl := p.Tracker.WrapConn(ctx, result.LoginName, result.Limits)
+	cl := p.Tracker.WrapConn(ctx, result.LoginName, result.Limits, p.Name)
 
 	// Step 12: Start mid-session revalidation.
 	revalCtx, revalCancel := context.WithCancel(ctx)
@@ -297,10 +297,9 @@ func (p *PostgresProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 		log.Debug("relay ended", "user", result.LoginName, "error", err)
 	}
 
-	// Record byte counters after relay completes.
+	// Record aggregate byte counters for heartbeat after relay completes.
+	// OTel byte metrics are reported incrementally by ConnLimits.flush().
 	br, bw := cl.BytesRead(), cl.BytesWritten()
-	m.BytesRead.Add(ctx, br, m.Attrs("waypoint.bytes.read", listenerAttr))
-	m.BytesWritten.Add(ctx, bw, m.Attrs("waypoint.bytes.written", listenerAttr))
 	if p.BytesRead != nil {
 		p.BytesRead.Add(br)
 	}

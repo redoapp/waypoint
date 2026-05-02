@@ -26,7 +26,7 @@ func TestIntegration_Relay_BandwidthTracking(t *testing.T) {
 	limits := auth.MergedLimits{
 		BandwidthTiers: []auth.BandwidthTier{{Bytes: 100_000, Period: time.Hour}},
 	}
-	cl := tracker.WrapConn(ctx, "relay_bw_user", limits)
+	cl := tracker.WrapConn(ctx, "relay_bw_user", limits, "test-listener")
 	cl.SetFlushIntervalForTest(50 * time.Millisecond)
 
 	clientConn, clientRemote := net.Pipe()
@@ -80,7 +80,7 @@ func TestIntegration_Relay_BandwidthLimitEnforced(t *testing.T) {
 	limits := auth.MergedLimits{
 		BandwidthTiers: []auth.BandwidthTier{{Bytes: 500, Period: time.Hour}},
 	}
-	cl := tracker.WrapConn(ctx, "relay_limit_user", limits)
+	cl := tracker.WrapConn(ctx, "relay_limit_user", limits, "test-listener")
 	cl.SetFlushIntervalForTest(10 * time.Millisecond)
 
 	clientConn, clientRemote := net.Pipe()
@@ -132,7 +132,7 @@ func TestIntegration_ConnLimits_FlushToRealRedis(t *testing.T) {
 	ctx := context.Background()
 
 	limits := auth.MergedLimits{}
-	cl := tracker.WrapConn(ctx, "flush_user", limits)
+	cl := tracker.WrapConn(ctx, "flush_user", limits, "test-listener")
 	cl.SetFlushIntervalForTest(20 * time.Millisecond)
 
 	cl.Start()

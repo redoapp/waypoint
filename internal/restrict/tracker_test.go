@@ -114,7 +114,7 @@ func TestTracker_WrapConn_Deadline(t *testing.T) {
 	ctx := context.Background()
 	limits := auth.MergedLimits{MaxConnDuration: 50 * time.Millisecond}
 
-	cl := tracker.WrapConn(ctx, "alice", limits)
+	cl := tracker.WrapConn(ctx, "alice", limits, "test-listener")
 	if cl.deadline.IsZero() {
 		t.Fatal("expected non-zero deadline")
 	}
@@ -136,7 +136,7 @@ func TestTracker_WrapConn_NoDeadline(t *testing.T) {
 	ctx := context.Background()
 	limits := auth.MergedLimits{}
 
-	cl := tracker.WrapConn(ctx, "alice", limits)
+	cl := tracker.WrapConn(ctx, "alice", limits, "test-listener")
 	if !cl.deadline.IsZero() {
 		t.Fatal("expected zero deadline for no duration limit")
 	}

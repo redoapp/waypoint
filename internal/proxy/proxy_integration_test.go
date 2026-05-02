@@ -597,8 +597,8 @@ func startEchoServer(t *testing.T) string {
 }
 
 // setupTCPProxy creates a TCPProxy wired to the given backend and auth,
-// starts an accept loop, and returns the proxy listen address.
-func setupTCPProxy(t *testing.T, backend string, authorizer proxy.Authorizer) string {
+// starts an accept loop, and returns the proxy listen address and proxy struct.
+func setupTCPProxy(t *testing.T, backend string, authorizer proxy.Authorizer) (string, *proxy.TCPProxy) {
 	t.Helper()
 
 	rdb := testutil.RedisClient(t)
@@ -634,7 +634,7 @@ func setupTCPProxy(t *testing.T, backend string, authorizer proxy.Authorizer) st
 		}
 	}()
 
-	return ln.Addr().String()
+	return ln.Addr().String(), p
 }
 
 func TestIntegration_TCPProxy_HappyPath(t *testing.T) {
@@ -645,13 +645,12 @@ func TestIntegration_TCPProxy_HappyPath(t *testing.T) {
 		NodeName:  "test-node",
 		Limits:    auth.MergedLimits{MaxConns: 10},
 	}
-	addr := setupTCPProxy(t, echoAddr, &mockAuthorizer{result: authResult})
+	addr, p := setupTCPProxy(t, echoAddr, &mockAuthorizer{result: authResult})
 
 	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
 	if err != nil {
 		t.Fatalf("dial proxy: %v", err)
 	}
-	defer conn.Close()
 
 	msg := "hello from tcp proxy test\n"
 	if _, err := conn.Write([]byte(msg)); err != nil {
@@ -667,12 +666,25 @@ func TestIntegration_TCPProxy_HappyPath(t *testing.T) {
 	if string(buf[:n]) != msg {
 		t.Fatalf("expected echo %q, got %q", msg, string(buf[:n]))
 	}
+
+	// Close connection and wait for relay to finish recording bytes.
+	conn.Close()
+	deadline := time.Now().Add(2 * time.Second)
+	for p.BytesRead.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if br := p.BytesRead.Load(); br == 0 {
+		t.Error("expected BytesRead > 0 after TCP echo")
+	}
+	if bw := p.BytesWritten.Load(); bw == 0 {
+		t.Error("expected BytesWritten > 0 after TCP echo")
+	}
 }
 
 func TestIntegration_TCPProxy_AuthFailure(t *testing.T) {
 	echoAddr := startEchoServer(t)
 
-	addr := setupTCPProxy(t, echoAddr, &mockAuthorizer{err: errors.New("tcp auth denied")})
+	addr, _ := setupTCPProxy(t, echoAddr, &mockAuthorizer{err: errors.New("tcp auth denied")})
 
 	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
 	if err != nil {
@@ -698,7 +710,7 @@ func TestIntegration_TCPProxy_ConnectionLimitEnforced(t *testing.T) {
 		NodeName:  "test-node",
 		Limits:    auth.MergedLimits{MaxConns: 1},
 	}
-	addr := setupTCPProxy(t, echoAddr, &mockAuthorizer{result: authResult})
+	addr, _ := setupTCPProxy(t, echoAddr, &mockAuthorizer{result: authResult})
 
 	// First connection should succeed — verify with echo.
 	conn1, err := net.DialTimeout("tcp", addr, 5*time.Second)
@@ -973,7 +985,7 @@ func TestIntegration_TCPProxy_DefaultDialer(t *testing.T) {
 		Limits:    auth.MergedLimits{MaxConns: 10},
 	}
 	// Dialer is nil — should fall back to net.DialTimeout.
-	addr := setupTCPProxy(t, echoAddr, &mockAuthorizer{result: authResult})
+	addr, _ := setupTCPProxy(t, echoAddr, &mockAuthorizer{result: authResult})
 
 	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
 	if err != nil {

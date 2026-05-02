@@ -13,7 +13,6 @@ var (
 	AttrBackend   = attribute.Key("backend")
 	AttrErrorType = attribute.Key("error_type")
 	AttrLimitType = attribute.Key("limit_type")
-	AttrDirection = attribute.Key("direction")
 	AttrDatabase  = attribute.Key("database")
 	AttrOperation = attribute.Key("operation")
 )

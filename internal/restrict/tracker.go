@@ -66,7 +66,7 @@ func (t *Tracker) Acquire(ctx context.Context, user string, limits auth.MergedLi
 }
 
 // WrapConn wraps a net.Conn with byte counting and limit enforcement.
-func (t *Tracker) WrapConn(ctx context.Context, user string, limits auth.MergedLimits) *ConnLimits {
+func (t *Tracker) WrapConn(ctx context.Context, user string, limits auth.MergedLimits, listenerName string) *ConnLimits {
 	cl := &ConnLimits{
 		store:           t.store,
 		metrics:         t.metrics,
@@ -75,6 +75,7 @@ func (t *Tracker) WrapConn(ctx context.Context, user string, limits auth.MergedL
 		bandwidthTiers:  limits.BandwidthTiers,
 		logger:          t.logger,
 		flushInterval:   10 * time.Second,
+		listenerAttr:    metrics.AttrListener.String(listenerName),
 	}
 
 	if limits.MaxConnDuration > 0 {

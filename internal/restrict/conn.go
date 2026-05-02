@@ -10,6 +10,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+
 	"github.com/redoapp/waypoint/internal/auth"
 	"github.com/redoapp/waypoint/internal/metrics"
 )
@@ -33,6 +35,11 @@ type ConnLimits struct {
 	bytesWritten atomic.Int64
 	pendingBytes atomic.Int64 // unflushed bytes to report to Redis
 	totalBytes   atomic.Int64 // monotonic total for per-connection limit
+
+	// Per-direction pending bytes for OTel reporting.
+	pendingRead    atomic.Int64
+	pendingWritten atomic.Int64
+	listenerAttr   attribute.KeyValue // listener tag for OTel byte metrics
 
 	closeOnce sync.Once
 	done      chan struct{}
@@ -100,12 +107,14 @@ func (cl *ConnLimits) ReportBytes(n int64) error {
 // ReportRead records bytes read from the client side.
 func (cl *ConnLimits) ReportRead(n int64) error {
 	cl.bytesRead.Add(n)
+	cl.pendingRead.Add(n)
 	return cl.ReportBytes(n)
 }
 
 // ReportWrite records bytes written to the client side.
 func (cl *ConnLimits) ReportWrite(n int64) error {
 	cl.bytesWritten.Add(n)
+	cl.pendingWritten.Add(n)
 	return cl.ReportBytes(n)
 }
 
@@ -138,27 +147,34 @@ func (cl *ConnLimits) flushLoop() {
 }
 
 func (cl *ConnLimits) flush() {
-	pending := cl.pendingBytes.Swap(0)
-	if pending == 0 {
-		return
+	// Flush aggregate bytes to Redis.
+	if pending := cl.pendingBytes.Swap(0); pending > 0 {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		cl.store.AddBytes(ctx, cl.user, pending)
+
+		// Check bandwidth limits across all tiers.
+		if len(cl.bandwidthTiers) > 0 {
+			result, err := cl.store.AddBandwidthBytesMulti(ctx, cl.user, pending, cl.bandwidthTiers)
+			if err != nil {
+				cl.logger.Error("bandwidth flush failed", "user", cl.user, "error", err)
+			} else if result.Exceeded {
+				cl.setLimitErr(errBandwidthLimitExceeded)
+			}
+		}
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	// Update aggregate bytes.
-	cl.store.AddBytes(ctx, cl.user, pending)
-
-	// Check bandwidth limits across all tiers.
-	if len(cl.bandwidthTiers) > 0 {
-		result, err := cl.store.AddBandwidthBytesMulti(ctx, cl.user, pending, cl.bandwidthTiers)
-		if err != nil {
-			cl.logger.Error("bandwidth flush failed", "user", cl.user, "error", err)
-			return
-		}
-		if result.Exceeded {
-			cl.setLimitErr(errBandwidthLimitExceeded)
-		}
+	// Report per-direction byte deltas to OTel — always report (even 0) so
+	// Datadog can distinguish "no traffic" from "no data".
+	if cl.metrics != nil {
+		ctx := context.Background()
+		pr := cl.pendingRead.Swap(0)
+		pw := cl.pendingWritten.Swap(0)
+		cl.metrics.BytesRead.Add(ctx, pr,
+			cl.metrics.Attrs("waypoint.bytes.read", cl.listenerAttr))
+		cl.metrics.BytesWritten.Add(ctx, pw,
+			cl.metrics.Attrs("waypoint.bytes.written", cl.listenerAttr))
 	}
 }
 
