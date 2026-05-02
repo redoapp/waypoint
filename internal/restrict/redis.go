@@ -6,6 +6,10 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/redoapp/waypoint/internal/auth"
 	"github.com/redoapp/waypoint/internal/metrics"
 )
@@ -27,14 +31,23 @@ func NewRedisStore(client *redis.Client, keyPrefix string, m *metrics.Metrics) *
 	return &RedisStore{client: client, keyPrefix: keyPrefix, metrics: m, nowFunc: time.Now}
 }
 
-func (s *RedisStore) recordOp(ctx context.Context, op string, start time.Time, err error) {
+func (s *RedisStore) startOp(ctx context.Context, op string) (context.Context, trace.Span) {
+	return s.metrics.Tracer().Start(ctx, "waypoint.redis."+op,
+		trace.WithAttributes(attribute.String("waypoint.operation", op)),
+	)
+}
+
+func (s *RedisStore) recordOp(ctx context.Context, span trace.Span, op string, start time.Time, err error) {
 	duration := time.Since(start).Seconds()
 	attrs := s.metrics.Attrs("waypoint.redis.op_duration", metrics.AttrOperation.String(op))
 	s.metrics.RedisOpDuration.Record(ctx, duration, attrs)
 	if err != nil {
 		errAttrs := s.metrics.Attrs("waypoint.redis.errors", metrics.AttrOperation.String(op))
 		s.metrics.RedisErrors.Add(ctx, 1, errAttrs)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "redis error")
 	}
+	span.End()
 }
 
 func (s *RedisStore) key(parts ...string) string {
@@ -48,18 +61,20 @@ func (s *RedisStore) key(parts ...string) string {
 // IncrConns atomically increments the connection count for a user.
 // Returns the new count.
 func (s *RedisStore) IncrConns(ctx context.Context, user string) (int64, error) {
+	ctx, span := s.startOp(ctx, "incr_conns")
 	start := time.Now()
 	val, err := s.client.Incr(ctx, s.key("conns", user)).Result()
-	s.recordOp(ctx, "incr_conns", start, err)
+	s.recordOp(ctx, span, "incr_conns", start, err)
 	return val, err
 }
 
 // DecrConns decrements the connection count for a user.
 func (s *RedisStore) DecrConns(ctx context.Context, user string) error {
+	ctx, span := s.startOp(ctx, "decr_conns")
 	start := time.Now()
 	k := s.key("conns", user)
 	val, err := s.client.Decr(ctx, k).Result()
-	s.recordOp(ctx, "decr_conns", start, err)
+	s.recordOp(ctx, span, "decr_conns", start, err)
 	if err != nil {
 		return err
 	}
@@ -72,21 +87,23 @@ func (s *RedisStore) DecrConns(ctx context.Context, user string) error {
 
 // GetConns returns the current connection count for a user.
 func (s *RedisStore) GetConns(ctx context.Context, user string) (int64, error) {
+	ctx, span := s.startOp(ctx, "get_conns")
 	start := time.Now()
 	val, err := s.client.Get(ctx, s.key("conns", user)).Int64()
 	if err == redis.Nil {
-		s.recordOp(ctx, "get_conns", start, nil)
+		s.recordOp(ctx, span, "get_conns", start, nil)
 		return 0, nil
 	}
-	s.recordOp(ctx, "get_conns", start, err)
+	s.recordOp(ctx, span, "get_conns", start, err)
 	return val, err
 }
 
 // AddBytes adds to the total byte count for a user. Used for per-user aggregate tracking.
 func (s *RedisStore) AddBytes(ctx context.Context, user string, n int64) (int64, error) {
+	ctx, span := s.startOp(ctx, "add_bytes")
 	start := time.Now()
 	val, err := s.client.IncrBy(ctx, s.key("bytes", user), n).Result()
-	s.recordOp(ctx, "add_bytes", start, err)
+	s.recordOp(ctx, span, "add_bytes", start, err)
 	return val, err
 }
 
@@ -173,6 +190,7 @@ type BandwidthResult struct {
 // AddBandwidthBytesMulti adds bytes to all bandwidth tiers using the sliding window.
 // It iterates per-tier (not atomic across tiers). Returns which tier was exceeded, if any.
 func (s *RedisStore) AddBandwidthBytesMulti(ctx context.Context, user string, n int64, tiers []auth.BandwidthTier) (BandwidthResult, error) {
+	ctx, span := s.startOp(ctx, "add_bandwidth")
 	start := time.Now()
 	now := s.nowFunc().Unix()
 
@@ -192,23 +210,24 @@ func (s *RedisStore) AddBandwidthBytesMulti(ctx context.Context, user string, n 
 			ttl,
 		).Int64()
 		if err != nil {
-			s.recordOp(ctx, "add_bandwidth", start, err)
+			s.recordOp(ctx, span, "add_bandwidth", start, err)
 			return BandwidthResult{}, fmt.Errorf("sliding window tier %d: %w", i, err)
 		}
 
 		if total > tier.Bytes {
-			s.recordOp(ctx, "add_bandwidth", start, nil)
+			s.recordOp(ctx, span, "add_bandwidth", start, nil)
 			return BandwidthResult{Exceeded: true, ExceededTier: i}, nil
 		}
 	}
 
-	s.recordOp(ctx, "add_bandwidth", start, nil)
+	s.recordOp(ctx, span, "add_bandwidth", start, nil)
 	return BandwidthResult{ExceededTier: -1}, nil
 }
 
 // GetBandwidthBytes returns the current bandwidth usage for a single period
 // using the sliding window (read-only).
 func (s *RedisStore) GetBandwidthBytes(ctx context.Context, user string, period time.Duration) (int64, error) {
+	ctx, span := s.startOp(ctx, "get_bandwidth")
 	start := time.Now()
 	now := s.nowFunc().Unix()
 	bSize := bucketSize(period)
@@ -220,34 +239,36 @@ func (s *RedisStore) GetBandwidthBytes(ctx context.Context, user string, period 
 
 	val, err := slidingWindowReadScript.Run(ctx, s.client, []string{hashKey}, minBucket).Int64()
 	if err == redis.Nil {
-		s.recordOp(ctx, "get_bandwidth", start, nil)
+		s.recordOp(ctx, span, "get_bandwidth", start, nil)
 		return 0, nil
 	}
-	s.recordOp(ctx, "get_bandwidth", start, err)
+	s.recordOp(ctx, span, "get_bandwidth", start, err)
 	return val, err
 }
 
 // TouchLastUsed updates the last-used timestamp for a provisioned user.
 func (s *RedisStore) TouchLastUsed(ctx context.Context, pgUser string) error {
+	ctx, span := s.startOp(ctx, "touch_last_used")
 	start := time.Now()
 	err := s.client.Set(ctx, s.key("lastused", pgUser), time.Now().Unix(), 0).Err()
-	s.recordOp(ctx, "touch_last_used", start, err)
+	s.recordOp(ctx, span, "touch_last_used", start, err)
 	return err
 }
 
 // GetLastUsed returns the last-used time for a provisioned user.
 func (s *RedisStore) GetLastUsed(ctx context.Context, pgUser string) (time.Time, error) {
+	ctx, span := s.startOp(ctx, "get_last_used")
 	start := time.Now()
 	val, err := s.client.Get(ctx, s.key("lastused", pgUser)).Int64()
 	if err == redis.Nil {
-		s.recordOp(ctx, "get_last_used", start, nil)
+		s.recordOp(ctx, span, "get_last_used", start, nil)
 		return time.Time{}, nil
 	}
 	if err != nil {
-		s.recordOp(ctx, "get_last_used", start, err)
+		s.recordOp(ctx, span, "get_last_used", start, err)
 		return time.Time{}, err
 	}
-	s.recordOp(ctx, "get_last_used", start, nil)
+	s.recordOp(ctx, span, "get_last_used", start, nil)
 	return time.Unix(val, 0), nil
 }
 
@@ -262,32 +283,37 @@ return 0
 // AcquireLock attempts to acquire a distributed lock using Redis SET NX EX.
 // Returns a token that must be passed to ReleaseLock, or empty string if not acquired.
 func (s *RedisStore) AcquireLock(ctx context.Context, name string, ttl time.Duration) (string, error) {
+	ctx, span := s.startOp(ctx, "acquire_lock")
 	start := time.Now()
 	token := fmt.Sprintf("%d:%d", time.Now().UnixNano(), start.UnixNano())
 	key := s.key("lock", name)
 	result, err := s.client.SetArgs(ctx, key, token, redis.SetArgs{Mode: "NX", TTL: ttl}).Result()
-	s.recordOp(ctx, "acquire_lock", start, err)
 	if err == redis.Nil {
+		s.recordOp(ctx, span, "acquire_lock", start, nil)
 		return "", nil
 	}
 	if err != nil {
+		s.recordOp(ctx, span, "acquire_lock", start, err)
 		return "", err
 	}
 	if result != "OK" {
+		s.recordOp(ctx, span, "acquire_lock", start, nil)
 		return "", nil
 	}
+	s.recordOp(ctx, span, "acquire_lock", start, nil)
 	return token, nil
 }
 
 // ReleaseLock releases a distributed lock acquired by AcquireLock.
 // The token must match the one returned by AcquireLock.
 func (s *RedisStore) ReleaseLock(ctx context.Context, name string, token string) error {
+	ctx, span := s.startOp(ctx, "release_lock")
 	start := time.Now()
 	key := s.key("lock", name)
 	err := releaseLockScript.Run(ctx, s.client, []string{key}, token).Err()
 	if err == redis.Nil {
 		err = nil // lock already expired or released
 	}
-	s.recordOp(ctx, "release_lock", start, err)
+	s.recordOp(ctx, span, "release_lock", start, err)
 	return err
 }

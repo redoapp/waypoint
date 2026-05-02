@@ -38,6 +38,7 @@ max_conns_total = 200
 # endpoint = "http://localhost:4318"   # OTLP endpoint (enables metrics when set)
 # protocol = "http"                     # "http" (default) or "grpc"
 # interval = "30s"                      # export interval
+# tracing_sample_rate = 0.0            # 0 = disabled, 1.0 = trace all requests
 #
 # [metrics.enable]
 # # Each key is a metric name — presence enables it. Value is the tag allow-list.

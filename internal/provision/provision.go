@@ -13,6 +13,11 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/redoapp/waypoint/internal/auth"
 	"github.com/redoapp/waypoint/internal/restrict"
 )
@@ -58,6 +63,15 @@ func NewProvisioner(adminUser, adminPassword, adminDatabase, backend, userPrefix
 // EnsureUser creates or updates a dynamic PG role for the given identity,
 // node, and database. Returns the PG username and password.
 func (p *Provisioner) EnsureUser(ctx context.Context, loginName, nodeName, database string, perms *auth.DBPermissions) (string, string, error) {
+	tracer := otel.Tracer("waypoint")
+	ctx, span := tracer.Start(ctx, "waypoint.provision.ensure_user",
+		trace.WithAttributes(
+			attribute.String("waypoint.user", loginName),
+			attribute.String("waypoint.database", database),
+		),
+	)
+	defer span.End()
+
 	pgUser := p.formatUsername(loginName, nodeName, database)
 	p.logger.Debug("ensuring user", "login", loginName, "database", database)
 
@@ -67,10 +81,15 @@ func (p *Provisioner) EnsureUser(ctx context.Context, loginName, nodeName, datab
 	const maxRetries = 10
 	const retryDelay = 100 * time.Millisecond
 
+	ctx, lockSpan := tracer.Start(ctx, "waypoint.provision.acquire_lock")
 	var lockToken string
 	for i := 0; i < maxRetries; i++ {
 		token, err := p.store.AcquireLock(ctx, "role:"+pgUser, lockTTL)
 		if err != nil {
+			lockSpan.RecordError(err)
+			lockSpan.SetStatus(codes.Error, "acquire lock failed")
+			lockSpan.End()
+			span.RecordError(err)
 			return "", "", fmt.Errorf("acquire lock: %w", err)
 		}
 		if token != "" {
@@ -79,18 +98,26 @@ func (p *Provisioner) EnsureUser(ctx context.Context, loginName, nodeName, datab
 		}
 		select {
 		case <-ctx.Done():
+			lockSpan.End()
 			return "", "", ctx.Err()
 		case <-time.After(retryDelay):
 		}
 	}
 	if lockToken == "" {
-		return "", "", fmt.Errorf("could not acquire lock for role %q", pgUser)
+		err := fmt.Errorf("could not acquire lock for role %q", pgUser)
+		lockSpan.RecordError(err)
+		lockSpan.SetStatus(codes.Error, "lock timeout")
+		lockSpan.End()
+		span.RecordError(err)
+		return "", "", err
 	}
+	lockSpan.End()
 	defer p.store.ReleaseLock(ctx, "role:"+pgUser, lockToken)
 	p.logger.Debug("acquired lock", "role", pgUser)
 
 	connCfg, err := pgx.ParseConfig(p.adminConnStr)
 	if err != nil {
+		span.RecordError(err)
 		return "", "", fmt.Errorf("parse admin conn config: %w", err)
 	}
 	if p.dialFunc != nil {
@@ -106,10 +133,16 @@ func (p *Provisioner) EnsureUser(ctx context.Context, loginName, nodeName, datab
 	defer connCancel()
 
 	p.logger.Debug("connecting to admin db", "host", connCfg.Host, "database", connCfg.Database)
+	ctx, connectSpan := tracer.Start(ctx, "waypoint.provision.connect")
 	conn, err := pgx.ConnectConfig(connCtx, connCfg)
 	if err != nil {
+		connectSpan.RecordError(err)
+		connectSpan.SetStatus(codes.Error, "connect failed")
+		connectSpan.End()
+		span.RecordError(err)
 		return "", "", fmt.Errorf("admin connect: %w", err)
 	}
+	connectSpan.End()
 	defer conn.Close(ctx)
 	p.logger.Debug("connected to admin db")
 
@@ -121,11 +154,15 @@ func (p *Provisioner) EnsureUser(ctx context.Context, loginName, nodeName, datab
 	var exists bool
 	err = conn.QueryRow(ctx, roleExistsQuery(dialect), pgUser).Scan(&exists)
 	if err != nil {
+		span.RecordError(err)
 		return "", "", fmt.Errorf("check role: %w", err)
 	}
 
 	password := generatePassword()
 
+	_, roleSpan := tracer.Start(ctx, "waypoint.provision.create_role",
+		trace.WithAttributes(attribute.Bool("waypoint.role_exists", exists)),
+	)
 	if !exists {
 		// CREATE ROLE with LOGIN.
 		// Note: role names and passwords can't be parameterized, using QuoteIdentifier.
@@ -135,6 +172,10 @@ func (p *Provisioner) EnsureUser(ctx context.Context, loginName, nodeName, datab
 			quoteLiteral(password),
 		))
 		if err != nil {
+			roleSpan.RecordError(err)
+			roleSpan.SetStatus(codes.Error, "create role failed")
+			roleSpan.End()
+			span.RecordError(err)
 			return "", "", fmt.Errorf("create role: %w", err)
 		}
 		p.logger.Info("created PG role", "role", pgUser)
@@ -146,11 +187,17 @@ func (p *Provisioner) EnsureUser(ctx context.Context, loginName, nodeName, datab
 			quoteLiteral(password),
 		))
 		if err != nil {
+			roleSpan.RecordError(err)
+			roleSpan.SetStatus(codes.Error, "alter role failed")
+			roleSpan.End()
+			span.RecordError(err)
 			return "", "", fmt.Errorf("alter role password: %w", err)
 		}
 	}
+	roleSpan.End()
 
 	// Reconcile grants: GRANT CONNECT on the database, then apply permissions.
+	_, grantSpan := tracer.Start(ctx, "waypoint.provision.grant")
 	_, err = conn.Exec(ctx, fmt.Sprintf(
 		"GRANT CONNECT ON DATABASE %s TO %s",
 		pgx.Identifier{database}.Sanitize(),
@@ -168,6 +215,7 @@ func (p *Provisioner) EnsureUser(ctx context.Context, loginName, nodeName, datab
 		if len(perms.Permissions) > 0 {
 			fragments, err := ExpandPresets(perms.Permissions, perms.Schemas)
 			if err != nil {
+				grantSpan.End()
 				return "", "", fmt.Errorf("invalid permissions: %w", err)
 			}
 			for _, frag := range fragments {
@@ -181,14 +229,17 @@ func (p *Provisioner) EnsureUser(ctx context.Context, loginName, nodeName, datab
 		// Apply raw SQL statements (if allowed by config).
 		if len(perms.SQL) > 0 {
 			if !p.allowRawSQL {
+				grantSpan.End()
 				return "", "", fmt.Errorf("raw SQL statements are disabled by server configuration; use presets instead")
 			}
 			if err := validateSQL(perms.SQL); err != nil {
+				grantSpan.End()
 				return "", "", fmt.Errorf("invalid sql in permissions: %w", err)
 			}
 			for _, raw := range perms.SQL {
 				resolved, err := renderSQL(raw, SQLTemplateData{Role: sanitizedRole})
 				if err != nil {
+					grantSpan.End()
 					return "", "", fmt.Errorf("invalid sql template %q: %w", raw, err)
 				}
 				if _, err := conn.Exec(ctx, resolved); err != nil {
@@ -197,6 +248,8 @@ func (p *Provisioner) EnsureUser(ctx context.Context, loginName, nodeName, datab
 			}
 		}
 	}
+
+	grantSpan.End()
 
 	// Touch last-used timestamp.
 	p.store.TouchLastUsed(ctx, pgUser)

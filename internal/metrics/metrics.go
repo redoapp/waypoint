@@ -2,6 +2,7 @@ package metrics
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -12,6 +13,8 @@ import (
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/metric/noop"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/trace"
+	tracenoop "go.opentelemetry.io/otel/trace/noop"
 )
 
 // Metrics holds all OTel instruments for waypoint.
@@ -20,6 +23,10 @@ type Metrics struct {
 	// sdkProvider is non-nil only when using a real (non-noop) provider,
 	// so Shutdown can flush it.
 	sdkProvider *sdkmetric.MeterProvider
+
+	// tracer provides distributed tracing spans.
+	tracer        trace.Tracer
+	traceProvider tracerShutdowner // nil when tracing disabled
 
 	// tagSets is pre-computed from config: metric name → allowed tag keys.
 	// nil map value means wildcard (all tags allowed).
@@ -62,10 +69,11 @@ type Metrics struct {
 
 // Config mirrors the TOML [metrics] section.
 type Config struct {
-	Endpoint string              `toml:"endpoint"`
-	Protocol string              `toml:"protocol"` // "http" (default) or "grpc"
-	Interval string              `toml:"interval"`
-	Enable   map[string][]string `toml:"enable"`
+	Endpoint          string              `toml:"endpoint"`
+	Protocol          string              `toml:"protocol"` // "http" (default) or "grpc"
+	Interval          string              `toml:"interval"`
+	TracingSampleRate float64             `toml:"tracing_sample_rate"` // 0 = disabled, 0.0-1.0 = sample rate
+	Enable            map[string][]string `toml:"enable"`
 }
 
 // IntervalDuration parses the interval string. Defaults to 30s.
@@ -102,6 +110,7 @@ func (c Config) TagsForMetric(name string) []string {
 func New(ctx context.Context, cfg Config, logger *slog.Logger) (*Metrics, error) {
 	m := &Metrics{
 		tagSets: buildTagSets(cfg),
+		tracer:  tracenoop.NewTracerProvider().Tracer("waypoint"),
 	}
 
 	if cfg.Endpoint == "" {
@@ -127,6 +136,17 @@ func New(ctx context.Context, cfg Config, logger *slog.Logger) (*Metrics, error)
 	)
 	m.provider = m.sdkProvider
 
+	// Initialize tracing if sample rate > 0.
+	if cfg.TracingSampleRate > 0 {
+		tp, err := initTracing(ctx, cfg)
+		if err != nil {
+			return nil, fmt.Errorf("initialize tracing: %w", err)
+		}
+		m.traceProvider = tp
+		m.tracer = tp.Tracer("waypoint")
+		otel.SetTracerProvider(tp)
+	}
+
 	return m.init()
 }
 
@@ -150,6 +170,7 @@ func NewWithProvider(provider metric.MeterProvider, cfg Config) (*Metrics, error
 	m := &Metrics{
 		provider: provider,
 		tagSets:  buildTagSets(cfg),
+		tracer:   tracenoop.NewTracerProvider().Tracer("waypoint"),
 	}
 	return m.init()
 }
@@ -228,12 +249,30 @@ func (m *Metrics) init() (*Metrics, error) {
 	return m, nil
 }
 
-// Shutdown flushes and shuts down the meter provider.
+// tracerShutdowner abstracts trace provider shutdown for testing.
+type tracerShutdowner interface {
+	Shutdown(ctx context.Context) error
+}
+
+// Tracer returns the configured OTel tracer. Returns a noop tracer when tracing is disabled.
+func (m *Metrics) Tracer() trace.Tracer {
+	return m.tracer
+}
+
+// Shutdown flushes and shuts down providers.
 func (m *Metrics) Shutdown(ctx context.Context) error {
-	if m.sdkProvider != nil {
-		return m.sdkProvider.Shutdown(ctx)
+	var errs []error
+	if m.traceProvider != nil {
+		if err := m.traceProvider.Shutdown(ctx); err != nil {
+			errs = append(errs, err)
+		}
 	}
-	return nil
+	if m.sdkProvider != nil {
+		if err := m.sdkProvider.Shutdown(ctx); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // Noop returns a Metrics instance with all noop instruments.
