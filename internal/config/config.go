@@ -20,7 +20,12 @@ type Config struct {
 	Revalidation RevalidationConfig       `toml:"revalidation"`
 	Defaults     DefaultsConfig           `toml:"defaults"`
 	Metrics      metrics.Config           `toml:"metrics"`
+	Provisioning ProvisioningConfig       `toml:"provisioning"`
 	Listeners    []ListenerConfig         `toml:"listeners"`
+}
+
+type ProvisioningConfig struct {
+	AllowRawSQL *bool `toml:"allow_raw_sql"` // nil = true (default)
 }
 
 type RedisConfig struct {
@@ -81,6 +86,19 @@ type PostgresAdmin struct {
 	AdminDatabase string `toml:"admin_database"`
 	UserPrefix    string `toml:"user_prefix"`
 	UserTTL       string `toml:"user_ttl"`
+	AllowRawSQL   *bool  `toml:"allow_raw_sql"` // nil = use global
+}
+
+// AllowRawSQLResolved returns whether raw SQL is allowed for this listener,
+// resolving per-listener → global → default (true).
+func AllowRawSQLResolved(listener *PostgresAdmin, global *ProvisioningConfig) bool {
+	if listener != nil && listener.AllowRawSQL != nil {
+		return *listener.AllowRawSQL
+	}
+	if global != nil && global.AllowRawSQL != nil {
+		return *global.AllowRawSQL
+	}
+	return true
 }
 
 func (p *PostgresAdmin) UserTTLDuration() time.Duration {

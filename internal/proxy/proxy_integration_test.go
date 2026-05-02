@@ -60,7 +60,7 @@ func setupProxy(t *testing.T, authResult *auth.AuthResult, authErr error) string
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 	_, backend := testutil.PostgresBackend(t)
-	provisioner := provision.NewProvisioner("admin", "adminpass", "waypoint_test", backend, "wp_", false, store, logger, nil, nil)
+	provisioner := provision.NewProvisioner("admin", "adminpass", "waypoint_test", backend, "wp_", false, true, store, logger, nil, nil)
 
 	p := &proxy.PostgresProxy{
 		Backend:      backend,
@@ -230,7 +230,7 @@ func setupProxyWithAuth(t *testing.T, authorizer proxy.Authorizer, opts ...func(
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 	_, backend := testutil.PostgresBackend(t)
-	provisioner := provision.NewProvisioner("admin", "adminpass", "waypoint_test", backend, "wp_", false, store, logger, nil, nil)
+	provisioner := provision.NewProvisioner("admin", "adminpass", "waypoint_test", backend, "wp_", false, true, store, logger, nil, nil)
 
 	p := &proxy.PostgresProxy{
 		Backend:      backend,
@@ -272,7 +272,7 @@ var _ *redis.Client
 
 func TestIntegration_Proxy_SelectAllowed(t *testing.T) {
 	result := makeAuthResult("waypoint_test", auth.DBPermissions{
-		Permissions: []string{"USAGE ON SCHEMA public"},
+		Permissions: []string{"readonly"},
 	}, nil)
 
 	addr := setupProxy(t, result, nil)
@@ -292,7 +292,7 @@ func TestIntegration_Proxy_SelectAllowed(t *testing.T) {
 func TestIntegration_Proxy_DatabaseAccessDenied(t *testing.T) {
 	// User has permissions only for "other_db", not "waypoint_test".
 	result := makeAuthResult("other_db", auth.DBPermissions{
-		Permissions: []string{"USAGE ON SCHEMA public"},
+		Permissions: []string{"readonly"},
 	}, nil)
 
 	addr := setupProxy(t, result, nil)
@@ -320,9 +320,9 @@ func TestIntegration_Proxy_SelectAllowedInsertDenied(t *testing.T) {
 	})
 
 	result := makeAuthResult("waypoint_test", auth.DBPermissions{
-		Permissions: []string{
-			"USAGE ON SCHEMA public",
-			"SELECT ON public.acl_test",
+		SQL: []string{
+			"GRANT USAGE ON SCHEMA public TO {{.Role}}",
+			"GRANT SELECT ON public.acl_test TO {{.Role}}",
 		},
 	}, nil)
 
@@ -349,7 +349,7 @@ func TestIntegration_Proxy_SelectAllowedInsertDenied(t *testing.T) {
 
 func TestIntegration_Proxy_ConnectionLimitEnforced(t *testing.T) {
 	result := makeAuthResult("waypoint_test", auth.DBPermissions{
-		Permissions: []string{"USAGE ON SCHEMA public"},
+		Permissions: []string{"readonly"},
 	}, &auth.LimitsCap{MaxConns: 1})
 
 	addr := setupProxy(t, result, nil)
@@ -428,7 +428,7 @@ func TestIntegration_Proxy_RawSQLPermissions(t *testing.T) {
 
 func TestIntegration_Proxy_ByteLimitEnforced(t *testing.T) {
 	result := makeAuthResult("waypoint_test", auth.DBPermissions{
-		Permissions: []string{"USAGE ON SCHEMA public"},
+		Permissions: []string{"readonly"},
 	}, &auth.LimitsCap{MaxConns: 10, MaxBytesPerConn: 1024})
 
 	addr := setupProxy(t, result, nil)
@@ -454,7 +454,7 @@ func TestIntegration_Proxy_ByteLimitEnforced(t *testing.T) {
 
 func TestIntegration_Proxy_DurationLimitEnforced(t *testing.T) {
 	result := makeAuthResult("waypoint_test", auth.DBPermissions{
-		Permissions: []string{"USAGE ON SCHEMA public"},
+		Permissions: []string{"readonly"},
 	}, &auth.LimitsCap{MaxConns: 10, MaxConnDuration: "2s"})
 
 	addr := setupProxy(t, result, nil)
@@ -481,7 +481,7 @@ func TestIntegration_Proxy_DurationLimitEnforced(t *testing.T) {
 
 func TestIntegration_Proxy_MidSessionRevalidation(t *testing.T) {
 	result := makeAuthResult("waypoint_test", auth.DBPermissions{
-		Permissions: []string{"USAGE ON SCHEMA public"},
+		Permissions: []string{"readonly"},
 	}, nil)
 
 	dynAuth := &dynamicMockAuthorizer{result: result}
@@ -515,7 +515,7 @@ func TestIntegration_Proxy_MidSessionRevalidation(t *testing.T) {
 
 func TestIntegration_Proxy_WildcardDatabaseAccess(t *testing.T) {
 	result := makeAuthResult("*", auth.DBPermissions{
-		Permissions: []string{"USAGE ON SCHEMA public"},
+		Permissions: []string{"readonly"},
 	}, nil)
 
 	addr := setupProxy(t, result, nil)
@@ -535,7 +535,7 @@ func TestIntegration_Proxy_WildcardDatabaseAccess(t *testing.T) {
 func TestIntegration_Proxy_RevalidationPermissionRevoked(t *testing.T) {
 	// Start with access to waypoint_test.
 	initialResult := makeAuthResult("waypoint_test", auth.DBPermissions{
-		Permissions: []string{"USAGE ON SCHEMA public"},
+		Permissions: []string{"readonly"},
 	}, nil)
 
 	dynAuth := &dynamicMockAuthorizer{result: initialResult}
@@ -557,7 +557,7 @@ func TestIntegration_Proxy_RevalidationPermissionRevoked(t *testing.T) {
 	// Switch auth to return a result that grants access to a different database only.
 	// Auth succeeds, but DatabasePermissions("waypoint_test") returns nil.
 	revokedResult := makeAuthResult("other_db", auth.DBPermissions{
-		Permissions: []string{"USAGE ON SCHEMA public"},
+		Permissions: []string{"readonly"},
 	}, nil)
 	dynAuth.SetResult(revokedResult, nil)
 
@@ -785,7 +785,7 @@ func TestIntegration_TailscaleAuthorizer_RealPipeline(t *testing.T) {
 		PG: &auth.PGCap{
 			Databases: map[string]auth.DBPermissions{
 				"waypoint_test": {
-					Permissions: []string{"USAGE ON SCHEMA public"},
+					Permissions: []string{"readonly"},
 				},
 			},
 		},
@@ -824,7 +824,7 @@ func TestIntegration_TailscaleAuthorizer_RealPipeline(t *testing.T) {
 	tracker := restrict.NewTracker(store, m, slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})))
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	_, backend := testutil.PostgresBackend(t)
-	provisioner := provision.NewProvisioner("admin", "adminpass", "waypoint_test", backend, "wp_", false, store, logger, nil, nil)
+	provisioner := provision.NewProvisioner("admin", "adminpass", "waypoint_test", backend, "wp_", false, true, store, logger, nil, nil)
 
 	p := &proxy.PostgresProxy{
 		Backend:      backend,
@@ -1004,7 +1004,7 @@ func TestIntegration_PostgresProxy_CustomDialer(t *testing.T) {
 	}
 
 	result := makeAuthResult("waypoint_test", auth.DBPermissions{
-		Permissions: []string{"USAGE ON SCHEMA public"},
+		Permissions: []string{"readonly"},
 	}, nil)
 
 	addr := setupProxyWithAuth(t, &mockAuthorizer{result: result}, func(p *proxy.PostgresProxy) {
@@ -1176,7 +1176,7 @@ func TestIntegration_TailscaleAuthorizer_NoCapability(t *testing.T) {
 	tracker := restrict.NewTracker(store, m, slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})))
 	lgr := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	_, backend := testutil.PostgresBackend(t)
-	provisioner := provision.NewProvisioner("admin", "adminpass", "waypoint_test", backend, "wp_", false, store, lgr, nil, nil)
+	provisioner := provision.NewProvisioner("admin", "adminpass", "waypoint_test", backend, "wp_", false, true, store, lgr, nil, nil)
 
 	p := &proxy.PostgresProxy{
 		Backend:      backend,

@@ -19,6 +19,9 @@ state_dir = "/var/lib/waypoint/tsnet"
 # audience = "https://login.tailscale.com"
 # advertise_tags = ["tag:waypoint"]
 
+[provisioning]
+# allow_raw_sql = true   # set to false to disable raw SQL in ACL grants (presets only)
+
 [redis]
 address = "localhost:6379"
 # password = ""
@@ -32,7 +35,8 @@ interval = "1m"
 max_conns_total = 200
 
 # [metrics]
-# endpoint = "http://localhost:4318"   # OTLP HTTP endpoint (enables metrics when set)
+# endpoint = "http://localhost:4318"   # OTLP endpoint (enables metrics when set)
+# protocol = "http"                     # "http" (default) or "grpc"
 # interval = "30s"                      # export interval
 #
 # [metrics.enable]

@@ -21,6 +21,7 @@ import (
 type Provisioner struct {
 	adminConnStr string
 	userPrefix   string
+	allowRawSQL  bool
 	store        *restrict.RedisStore
 	logger       *slog.Logger
 	dialFunc     func(ctx context.Context, network, addr string) (net.Conn, error)
@@ -28,7 +29,7 @@ type Provisioner struct {
 }
 
 // NewProvisioner creates a new Provisioner.
-func NewProvisioner(adminUser, adminPassword, adminDatabase, backend, userPrefix string, backendTLS bool, store *restrict.RedisStore, logger *slog.Logger, dialFunc func(ctx context.Context, network, addr string) (net.Conn, error), lookupFunc func(ctx context.Context, host string) ([]string, error)) *Provisioner {
+func NewProvisioner(adminUser, adminPassword, adminDatabase, backend, userPrefix string, backendTLS, allowRawSQL bool, store *restrict.RedisStore, logger *slog.Logger, dialFunc func(ctx context.Context, network, addr string) (net.Conn, error), lookupFunc func(ctx context.Context, host string) ([]string, error)) *Provisioner {
 	sslmode := "disable"
 	if backendTLS {
 		sslmode = "require"
@@ -46,6 +47,7 @@ func NewProvisioner(adminUser, adminPassword, adminDatabase, backend, userPrefix
 	return &Provisioner{
 		adminConnStr: connStr,
 		userPrefix:   userPrefix,
+		allowRawSQL:  allowRawSQL,
 		store:        store,
 		logger:       logger,
 		dialFunc:     dialFunc,
@@ -158,27 +160,40 @@ func (p *Provisioner) EnsureUser(ctx context.Context, loginName, nodeName, datab
 		p.logger.Warn("grant connect failed", "role", pgUser, "database", database, "error", err)
 	}
 
-	// Apply permission grants and raw SQL statements.
+	// Apply permission presets and raw SQL statements.
 	if perms != nil {
 		sanitizedRole := pgx.Identifier{pgUser}.Sanitize()
 
-		for _, perm := range perms.Permissions {
-			stmt := fmt.Sprintf("GRANT %s TO %s", perm, sanitizedRole)
-			if _, err := conn.Exec(ctx, stmt); err != nil {
-				p.logger.Warn("grant failed", "role", pgUser, "grant", perm, "error", err)
+		// Expand preset names into GRANT fragments.
+		if len(perms.Permissions) > 0 {
+			fragments, err := ExpandPresets(perms.Permissions, perms.Schemas)
+			if err != nil {
+				return "", "", fmt.Errorf("invalid permissions: %w", err)
+			}
+			for _, frag := range fragments {
+				stmt := fmt.Sprintf("GRANT %s TO %s", frag, sanitizedRole)
+				if _, err := conn.Exec(ctx, stmt); err != nil {
+					p.logger.Warn("grant failed", "role", pgUser, "grant", frag, "error", err)
+				}
 			}
 		}
 
-		if err := validateSQL(perms.SQL); err != nil {
-			return "", "", fmt.Errorf("invalid sql in permissions: %w", err)
-		}
-		for _, raw := range perms.SQL {
-			resolved, err := renderSQL(raw, SQLTemplateData{Role: sanitizedRole})
-			if err != nil {
-				return "", "", fmt.Errorf("invalid sql template %q: %w", raw, err)
+		// Apply raw SQL statements (if allowed by config).
+		if len(perms.SQL) > 0 {
+			if !p.allowRawSQL {
+				return "", "", fmt.Errorf("raw SQL statements are disabled by server configuration; use presets instead")
 			}
-			if _, err := conn.Exec(ctx, resolved); err != nil {
-				p.logger.Warn("sql statement failed", "role", pgUser, "sql", raw, "error", err)
+			if err := validateSQL(perms.SQL); err != nil {
+				return "", "", fmt.Errorf("invalid sql in permissions: %w", err)
+			}
+			for _, raw := range perms.SQL {
+				resolved, err := renderSQL(raw, SQLTemplateData{Role: sanitizedRole})
+				if err != nil {
+					return "", "", fmt.Errorf("invalid sql template %q: %w", raw, err)
+				}
+				if _, err := conn.Exec(ctx, resolved); err != nil {
+					p.logger.Warn("sql statement failed", "role", pgUser, "sql", raw, "error", err)
+				}
 			}
 		}
 	}

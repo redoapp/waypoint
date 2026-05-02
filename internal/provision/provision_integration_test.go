@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5"
@@ -44,7 +45,7 @@ func setupProvisionerFor(t *testing.T, db dbBackend) *Provisioner {
 	rdb := testutil.RedisClient(t)
 	store := restrict.NewRedisStore(rdb, "inttest:", metrics.Noop())
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	return NewProvisioner(db.adminUser, db.adminPass, "waypoint_test", db.backend, "wp_", false, store, logger, nil, nil)
+	return NewProvisioner(db.adminUser, db.adminPass, "waypoint_test", db.backend, "wp_", false, true, store, logger, nil, nil)
 }
 
 func adminConnFor(t *testing.T, db dbBackend) *pgx.Conn {
@@ -275,14 +276,32 @@ func TestIntegration_EnsureUser_MissingDatabase(t *testing.T) {
 	}
 }
 
-func TestIntegration_EnsureUser_PermissionGrantFailure(t *testing.T) {
+func TestIntegration_EnsureUser_InvalidPreset(t *testing.T) {
 	for _, db := range testBackends(t) {
 		t.Run(db.name, func(t *testing.T) {
 			p := setupProvisionerFor(t, db)
 			ctx := context.Background()
 
 			badPerms := &auth.DBPermissions{Permissions: []string{"USAGE ON SCHEMA nonexistent_schema"}}
-			pgUser, password, err := p.EnsureUser(ctx, "badperm@example.com", "badperm-node", "waypoint_test", badPerms)
+			_, _, err := p.EnsureUser(ctx, "badperm@example.com", "badperm-node", "waypoint_test", badPerms)
+			if err == nil {
+				t.Fatal("expected error for invalid preset name")
+			}
+			if !strings.Contains(err.Error(), "permissions now accepts preset names only") {
+				t.Fatalf("expected hint about preset names, got: %v", err)
+			}
+		})
+	}
+}
+
+func TestIntegration_EnsureUser_ReadonlyPreset(t *testing.T) {
+	for _, db := range testBackends(t) {
+		t.Run(db.name, func(t *testing.T) {
+			p := setupProvisionerFor(t, db)
+			ctx := context.Background()
+
+			perms := &auth.DBPermissions{Permissions: []string{"readonly"}}
+			pgUser, password, err := p.EnsureUser(ctx, "reader@example.com", "reader-node", "waypoint_test", perms)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -291,7 +310,7 @@ func TestIntegration_EnsureUser_PermissionGrantFailure(t *testing.T) {
 			userConnStr := fmt.Sprintf("postgres://%s:%s@%s/waypoint_test?sslmode=disable", pgUser, password, db.backend)
 			userConn, err := pgx.Connect(ctx, userConnStr)
 			if err != nil {
-				t.Fatalf("login should work despite permission failure: %v", err)
+				t.Fatalf("login as provisioned user failed: %v", err)
 			}
 			defer userConn.Close(ctx)
 

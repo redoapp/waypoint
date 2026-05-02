@@ -86,7 +86,7 @@ func runServer(ctx context.Context, configPath string, logger *slog.Logger, leve
 	}
 
 	// Metrics.
-	m, err := metrics.New(ctx, cfg.Metrics)
+	m, err := metrics.New(ctx, cfg.Metrics, logger)
 	if err != nil {
 		return fmt.Errorf("initialize metrics: %w", err)
 	}
@@ -340,6 +340,7 @@ func runServer(ctx context.Context, configPath string, logger *slog.Logger, leve
 				lCfg.Backend,
 				lCfg.Postgres.UserPrefix,
 				lCfg.BackendTLS,
+				config.AllowRawSQLResolved(lCfg.Postgres, &cfg.Provisioning),
 				store,
 				logger.With("component", "provisioner", "listener", lCfg.Name),
 				dialer,

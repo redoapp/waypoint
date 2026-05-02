@@ -3,8 +3,11 @@ package metrics
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"time"
 
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/metric/noop"
@@ -60,6 +63,7 @@ type Metrics struct {
 // Config mirrors the TOML [metrics] section.
 type Config struct {
 	Endpoint string              `toml:"endpoint"`
+	Protocol string              `toml:"protocol"` // "http" (default) or "grpc"
 	Interval string              `toml:"interval"`
 	Enable   map[string][]string `toml:"enable"`
 }
@@ -95,7 +99,7 @@ func (c Config) TagsForMetric(name string) []string {
 
 // New creates a new Metrics instance. If cfg.Endpoint is empty, all instruments
 // are noop (zero overhead). Only metrics listed in cfg.Enable are active.
-func New(ctx context.Context, cfg Config) (*Metrics, error) {
+func New(ctx context.Context, cfg Config, logger *slog.Logger) (*Metrics, error) {
 	m := &Metrics{
 		tagSets: buildTagSets(cfg),
 	}
@@ -105,9 +109,11 @@ func New(ctx context.Context, cfg Config) (*Metrics, error) {
 		return m.init()
 	}
 
-	exporter, err := otlpmetrichttp.New(ctx,
-		otlpmetrichttp.WithEndpointURL(cfg.Endpoint),
-	)
+	otel.SetErrorHandler(otel.ErrorHandlerFunc(func(err error) {
+		logger.Error("otel export error", "error", err)
+	}))
+
+	exporter, err := newExporter(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("create OTLP exporter: %w", err)
 	}
@@ -122,6 +128,21 @@ func New(ctx context.Context, cfg Config) (*Metrics, error) {
 	m.provider = m.sdkProvider
 
 	return m.init()
+}
+
+func newExporter(ctx context.Context, cfg Config) (sdkmetric.Exporter, error) {
+	switch cfg.Protocol {
+	case "", "http":
+		return otlpmetrichttp.New(ctx,
+			otlpmetrichttp.WithEndpointURL(cfg.Endpoint),
+		)
+	case "grpc":
+		return otlpmetricgrpc.New(ctx,
+			otlpmetricgrpc.WithEndpointURL(cfg.Endpoint),
+		)
+	default:
+		return nil, fmt.Errorf("unsupported metrics protocol %q (use \"http\" or \"grpc\")", cfg.Protocol)
+	}
 }
 
 // NewWithProvider creates Metrics using an explicit MeterProvider (for testing).
@@ -217,7 +238,7 @@ func (m *Metrics) Shutdown(ctx context.Context) error {
 
 // Noop returns a Metrics instance with all noop instruments.
 func Noop() *Metrics {
-	m, _ := New(context.Background(), Config{})
+	m, _ := New(context.Background(), Config{}, slog.Default())
 	return m
 }
 

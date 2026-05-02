@@ -14,11 +14,15 @@ type PGCap struct {
 	Databases map[string]DBPermissions `json:"databases"`
 }
 
-// DBPermissions lists SQL GRANT statements and raw SQL for a database.
+// DBPermissions defines access grants for a database.
+// Permissions holds preset names ("readonly", "readwrite", "admin").
+// Schemas controls which schemas presets apply to (default: ["public"]).
+// SQL holds advanced raw SQL templates (gateable by server config).
 // SQL entries are Go text/template strings. Available variables:
 //   - {{.Role}} — the sanitized PG role identifier for the connecting user
 type DBPermissions struct {
 	Permissions []string `json:"permissions"`
+	Schemas     []string `json:"schemas,omitempty"`
 	SQL         []string `json:"sql,omitempty"`
 }
 

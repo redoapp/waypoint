@@ -159,8 +159,11 @@ func Authorize(ctx context.Context, lc *local.Client, remoteAddr string, backend
 // from the matched rules. Returns nil if no rules grant access to the database.
 func DatabasePermissions(result *AuthResult, database string) *DBPermissions {
 	var perms []string
+	var schemas []string
 	var sql []string
 	found := false
+
+	schemasSeen := make(map[string]bool)
 
 	for _, r := range result.MatchedRules {
 		if r.PG == nil {
@@ -170,12 +173,24 @@ func DatabasePermissions(result *AuthResult, database string) *DBPermissions {
 		if db, ok := r.PG.Databases[database]; ok {
 			perms = append(perms, db.Permissions...)
 			sql = append(sql, db.SQL...)
+			for _, s := range db.Schemas {
+				if !schemasSeen[s] {
+					schemasSeen[s] = true
+					schemas = append(schemas, s)
+				}
+			}
 			found = true
 		}
 		// Check for wildcard.
 		if db, ok := r.PG.Databases["*"]; ok {
 			perms = append(perms, db.Permissions...)
 			sql = append(sql, db.SQL...)
+			for _, s := range db.Schemas {
+				if !schemasSeen[s] {
+					schemasSeen[s] = true
+					schemas = append(schemas, s)
+				}
+			}
 			found = true
 		}
 	}
@@ -185,6 +200,7 @@ func DatabasePermissions(result *AuthResult, database string) *DBPermissions {
 	}
 	return &DBPermissions{
 		Permissions: perms,
+		Schemas:     schemas,
 		SQL:         sql,
 	}
 }
