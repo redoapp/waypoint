@@ -739,7 +739,11 @@ peerFound:
 		raw, _, err := clientLC.QueryDNS(ctx, name, qtype)
 		return raw, err
 	}
-	routedQuery := tsdns.NewRoutedQueryFunc(fallback, clientNode.ListenPacket, dnsRoutes)
+	clientV4, _ := clientNode.TailscaleIPs()
+	clientListenPacket := func(network, addr string) (net.PacketConn, error) {
+		return clientNode.ListenPacket(network, net.JoinHostPort(clientV4.String(), "0"))
+	}
+	routedQuery := tsdns.NewRoutedQueryFunc(fallback, clientListenPacket, dnsRoutes)
 
 	routedCtx, routedCancel := context.WithTimeout(ctx, 10*time.Second)
 	defer routedCancel()
