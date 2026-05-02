@@ -27,6 +27,10 @@ key_prefix = "waypoint:"
 [revalidation]
 interval = "1m"
 
+# Optional: restrict ACL grants to presets only (no raw SQL)
+[provisioning]
+allow_raw_sql = false
+
 [[listeners]]
 name = "pg-main"
 listen = ":5432"
@@ -39,6 +43,7 @@ admin_password = "${PG_ADMIN_PASSWORD}"
 admin_database = "postgres"
 user_prefix = "wp_"
 user_ttl = "24h"
+# allow_raw_sql = true  # per-listener override
 
 [[listeners]]
 name = "raw-mysql"
@@ -49,26 +54,33 @@ backend = "10.0.1.5:3306"
 
 ### Tailscale ACL grants
 
-Access is controlled by Tailscale ACL capability grants. Example policy snippet:
+Access is controlled by Tailscale ACL capability grants. The `permissions` field accepts named presets:
+
+| Preset | Grants |
+|--------|--------|
+| `readonly` | `USAGE` on schema, `SELECT` on all tables and sequences |
+| `readwrite` | Everything in `readonly` + `INSERT`, `UPDATE`, `DELETE` on tables, `USAGE` on sequences |
+| `admin` | `ALL PRIVILEGES` on tables and sequences, `USAGE` + `CREATE` on schema |
+
+By default, presets apply to the `public` schema. Use `schemas` to target other schemas.
+
+Example policy snippet:
 
 ```json
 {
   "grants": [{
     "src": ["group:backend"],
     "dst": ["tag:waypoint"],
-    "app": {
+    "cap": {
       "redo.com/cap/waypoint": [{
         "backends": ["pg-main"],
         "pg": {
           "databases": {
             "myapp": {
-              "permissions": ["SELECT", "INSERT", "UPDATE"],
-              "sql": [
-                "GRANT USAGE ON SCHEMA analytics TO {{.Role}}",
-                "GRANT SELECT ON ALL TABLES IN SCHEMA analytics TO {{.Role}}"
-              ]
+              "permissions": ["readwrite"],
+              "schemas": ["public", "app"]
             },
-            "*": { "permissions": ["SELECT"] }
+            "*": { "permissions": ["readonly"] }
           }
         },
         "limits": {
@@ -80,6 +92,52 @@ Access is controlled by Tailscale ACL capability grants. Example policy snippet:
   }]
 }
 ```
+
+For advanced use cases (specific tables, `REVOKE`, `ALTER DEFAULT PRIVILEGES`), use the `sql` field with Go templates:
+
+```json
+{
+  "databases": {
+    "myapp": {
+      "permissions": ["readonly"],
+      "sql": [
+        "GRANT INSERT ON public.audit_log TO {{.Role}}",
+        "GRANT USAGE ON SCHEMA analytics TO {{.Role}}",
+        "GRANT SELECT ON ALL TABLES IN SCHEMA analytics TO {{.Role}}"
+      ]
+    }
+  }
+}
+```
+
+The `sql` field can be disabled server-side with `allow_raw_sql = false` in the `[provisioning]` config section.
+
+## Observability
+
+Waypoint exports OpenTelemetry metrics and traces to any OTLP-compatible collector.
+
+```toml
+[metrics]
+endpoint = "http://otel-collector:4318"
+protocol = "http"                        # "http" (default) or "grpc"
+interval = "30s"
+tracing_sample_rate = 1.0                # 0 = disabled, 1.0 = trace all requests
+
+[metrics.enable]
+"waypoint.conn.active"   = ["listener", "mode"]
+"waypoint.conn.total"    = ["listener", "mode"]
+"waypoint.auth.attempts" = ["listener"]
+```
+
+**Metrics** are opt-in per metric name via `[metrics.enable]`. The value array controls which attribute tags are allowed (use `["*"]` for all).
+
+**Tracing** is enabled when `tracing_sample_rate > 0` and an endpoint is configured. Traces cover:
+- Connection setup (auth, slot acquisition, backend dial, PG provisioning)
+- Redis operations (lock, counters, bandwidth)
+- Mid-session revalidation checks
+- Connection close (final byte counts, duration)
+
+Long-lived connections use linked spans rather than holding a single span open — the setup span ends once the relay begins, and revalidation/close events link back for correlation.
 
 ## Usage
 
