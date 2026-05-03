@@ -24,18 +24,18 @@ func TestIntegration_Tracker_AcquireRelease(t *testing.T) {
 	ctx := context.Background()
 	limits := auth.MergedLimits{MaxConns: 2}
 
-	release1, err := tracker.Acquire(ctx, "alice", limits)
+	release1, err := tracker.Acquire(ctx, "alice", limits, "test-listener")
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	release2, err := tracker.Acquire(ctx, "alice", limits)
+	release2, err := tracker.Acquire(ctx, "alice", limits, "test-listener")
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	// Third should fail.
-	_, err = tracker.Acquire(ctx, "alice", limits)
+	_, err = tracker.Acquire(ctx, "alice", limits, "test-listener")
 	if err == nil {
 		t.Fatal("expected error on third acquire")
 	}
@@ -43,7 +43,7 @@ func TestIntegration_Tracker_AcquireRelease(t *testing.T) {
 	// Release one, then acquire should work.
 	release1()
 
-	release3, err := tracker.Acquire(ctx, "alice", limits)
+	release3, err := tracker.Acquire(ctx, "alice", limits, "test-listener")
 	if err != nil {
 		t.Fatalf("expected success after release: %v", err)
 	}
@@ -74,7 +74,7 @@ func TestIntegration_Tracker_ConcurrentAcquire(t *testing.T) {
 	for i := 0; i < goroutines; i++ {
 		go func() {
 			defer wg.Done()
-			release, err := tracker.Acquire(ctx, "concurrent_user", limits)
+			release, err := tracker.Acquire(ctx, "concurrent_user", limits, "test-listener")
 			if err != nil {
 				failures.Add(1)
 				return
@@ -125,7 +125,7 @@ func TestIntegration_Tracker_HighConcurrencyStress(t *testing.T) {
 	for i := 0; i < goroutines; i++ {
 		go func() {
 			defer wg.Done()
-			release, err := tracker.Acquire(ctx, "stress_user", limits)
+			release, err := tracker.Acquire(ctx, "stress_user", limits, "test-listener")
 			if err != nil {
 				return
 			}
@@ -152,7 +152,7 @@ func TestIntegration_Tracker_HighConcurrencyStress(t *testing.T) {
 		fn()
 	}
 
-	conns, err := store.GetConns(ctx, "stress_user")
+	conns, err := store.GetConns(ctx, "stress_user", "test-listener")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -176,7 +176,7 @@ func TestIntegration_Tracker_AcquireReleaseCycle_CountConsistency(t *testing.T) 
 	for i := 0; i < cycles; i++ {
 		var releases []func()
 		for j := 0; j < maxConns; j++ {
-			release, err := tracker.Acquire(ctx, "cycle_user", limits)
+			release, err := tracker.Acquire(ctx, "cycle_user", limits, "test-listener")
 			if err != nil {
 				t.Fatalf("cycle %d, acquire %d: %v", i, j, err)
 			}
@@ -184,7 +184,7 @@ func TestIntegration_Tracker_AcquireReleaseCycle_CountConsistency(t *testing.T) 
 		}
 
 		// Should be at limit.
-		_, err := tracker.Acquire(ctx, "cycle_user", limits)
+		_, err := tracker.Acquire(ctx, "cycle_user", limits, "test-listener")
 		if err == nil {
 			t.Fatalf("cycle %d: should be at limit", i)
 		}
@@ -195,7 +195,7 @@ func TestIntegration_Tracker_AcquireReleaseCycle_CountConsistency(t *testing.T) 
 	}
 
 	// After all cycles, count should be zero.
-	conns, err := store.GetConns(ctx, "cycle_user")
+	conns, err := store.GetConns(ctx, "cycle_user", "test-listener")
 	if err != nil {
 		t.Fatal(err)
 	}

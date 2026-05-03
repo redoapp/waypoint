@@ -61,7 +61,7 @@ func TestIntegration_Relay_BandwidthTracking(t *testing.T) {
 
 	time.Sleep(100 * time.Millisecond)
 
-	bw, err := store.GetBandwidthBytes(ctx, "relay_bw_user", time.Hour)
+	bw, err := store.GetBandwidthBytes(ctx, "relay_bw_user", "test-listener", time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -115,7 +115,7 @@ func TestIntegration_Relay_BandwidthLimitEnforced(t *testing.T) {
 	<-done
 	backendRemote.Close()
 
-	bw, err := store.GetBandwidthBytes(ctx, "relay_limit_user", time.Hour)
+	bw, err := store.GetBandwidthBytes(ctx, "relay_limit_user", "test-listener", time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -149,7 +149,7 @@ func TestIntegration_ConnLimits_FlushToRealRedis(t *testing.T) {
 	cl.Stop()
 
 	// Verify aggregate bytes in Redis.
-	total, err := store.AddBytes(ctx, "flush_user", 0)
+	total, err := store.AddBytes(ctx, "flush_user", "test-listener", 0)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -19,7 +19,7 @@ func TestIntegration_RedisStore_IncrDecrConns(t *testing.T) {
 	ctx := context.Background()
 
 	// Increment twice.
-	count, err := store.IncrConns(ctx, "alice")
+	count, err := store.IncrConns(ctx, "alice", "test-listener")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -27,7 +27,7 @@ func TestIntegration_RedisStore_IncrDecrConns(t *testing.T) {
 		t.Fatalf("expected 1, got %d", count)
 	}
 
-	count, err = store.IncrConns(ctx, "alice")
+	count, err = store.IncrConns(ctx, "alice", "test-listener")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -36,10 +36,10 @@ func TestIntegration_RedisStore_IncrDecrConns(t *testing.T) {
 	}
 
 	// Decrement once, verify count.
-	if err := store.DecrConns(ctx, "alice"); err != nil {
+	if err := store.DecrConns(ctx, "alice", "test-listener"); err != nil {
 		t.Fatal(err)
 	}
-	got, err := store.GetConns(ctx, "alice")
+	got, err := store.GetConns(ctx, "alice", "test-listener")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -48,10 +48,10 @@ func TestIntegration_RedisStore_IncrDecrConns(t *testing.T) {
 	}
 
 	// Decrement to zero, key should be deleted.
-	if err := store.DecrConns(ctx, "alice"); err != nil {
+	if err := store.DecrConns(ctx, "alice", "test-listener"); err != nil {
 		t.Fatal(err)
 	}
-	got, err = store.GetConns(ctx, "alice")
+	got, err = store.GetConns(ctx, "alice", "test-listener")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -65,7 +65,7 @@ func TestIntegration_RedisStore_AddBytes(t *testing.T) {
 	store := restrict.NewRedisStore(rdb, "inttest:", metrics.Noop())
 	ctx := context.Background()
 
-	total, err := store.AddBytes(ctx, "alice", 100)
+	total, err := store.AddBytes(ctx, "alice", "test-listener", 100)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -73,7 +73,7 @@ func TestIntegration_RedisStore_AddBytes(t *testing.T) {
 		t.Fatalf("expected 100, got %d", total)
 	}
 
-	total, err = store.AddBytes(ctx, "alice", 250)
+	total, err = store.AddBytes(ctx, "alice", "test-listener", 250)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -88,7 +88,7 @@ func TestIntegration_RedisStore_BandwidthSlidingWindow(t *testing.T) {
 	ctx := context.Background()
 	tiers := []auth.BandwidthTier{{Bytes: 100000, Period: time.Hour}}
 
-	result, err := store.AddBandwidthBytesMulti(ctx, "alice", 500, tiers)
+	result, err := store.AddBandwidthBytesMulti(ctx, "alice", "test-listener", 500, tiers)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,7 +96,7 @@ func TestIntegration_RedisStore_BandwidthSlidingWindow(t *testing.T) {
 		t.Fatal("did not expect limit exceeded")
 	}
 
-	result, err = store.AddBandwidthBytesMulti(ctx, "alice", 300, tiers)
+	result, err = store.AddBandwidthBytesMulti(ctx, "alice", "test-listener", 300, tiers)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -104,7 +104,7 @@ func TestIntegration_RedisStore_BandwidthSlidingWindow(t *testing.T) {
 		t.Fatal("did not expect limit exceeded")
 	}
 
-	got, err := store.GetBandwidthBytes(ctx, "alice", time.Hour)
+	got, err := store.GetBandwidthBytes(ctx, "alice", "test-listener", time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -123,7 +123,7 @@ func TestIntegration_RedisStore_BandwidthMultiTier(t *testing.T) {
 	}
 
 	// Under both limits.
-	result, err := store.AddBandwidthBytesMulti(ctx, "multitier_user", 500, tiers)
+	result, err := store.AddBandwidthBytesMulti(ctx, "multitier_user", "test-listener", 500, tiers)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -132,7 +132,7 @@ func TestIntegration_RedisStore_BandwidthMultiTier(t *testing.T) {
 	}
 
 	// Exceed hourly.
-	result, err = store.AddBandwidthBytesMulti(ctx, "multitier_user", 600, tiers)
+	result, err = store.AddBandwidthBytesMulti(ctx, "multitier_user", "test-listener", 600, tiers)
 	if err != nil {
 		t.Fatal(err)
 	}
