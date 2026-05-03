@@ -76,7 +76,7 @@ func (p *Provisioner) EnsureUser(ctx context.Context, loginName, nodeName, datab
 	defer span.End()
 
 	pgUser := p.formatUsername(loginName, nodeName, database)
-	p.logger.Debug("ensuring user", "login", loginName, "database", database)
+	p.logger.DebugContext(ctx, "ensuring user", "login", loginName, "database", database)
 
 	// Acquire a distributed lock via Redis to serialize concurrent EnsureUser
 	// calls for the same role. This works with both PostgreSQL and CockroachDB.
@@ -116,7 +116,7 @@ func (p *Provisioner) EnsureUser(ctx context.Context, loginName, nodeName, datab
 	}
 	lockSpan.End()
 	defer p.store.ReleaseLock(ctx, "role:"+pgUser, lockToken)
-	p.logger.Debug("acquired lock", "role", pgUser)
+	p.logger.DebugContext(ctx, "acquired lock", "role", pgUser)
 
 	connCfg, err := pgx.ParseConfig(p.adminConnStr)
 	if err != nil {
@@ -145,7 +145,7 @@ func (p *Provisioner) EnsureUser(ctx context.Context, loginName, nodeName, datab
 	connCtx, connCancel := context.WithTimeout(ctx, provisionTimeout)
 	defer connCancel()
 
-	p.logger.Debug("connecting to admin db", "host", connCfg.Host, "database", connCfg.Database)
+	p.logger.DebugContext(ctx, "connecting to admin db", "host", connCfg.Host, "database", connCfg.Database)
 	ctx, connectSpan := tracer.Start(ctx, "waypoint.provision.connect")
 	conn, err := pgx.ConnectConfig(connCtx, connCfg)
 	if err != nil {
@@ -157,11 +157,11 @@ func (p *Provisioner) EnsureUser(ctx context.Context, loginName, nodeName, datab
 	}
 	connectSpan.End()
 	defer conn.Close(ctx)
-	p.logger.Debug("connected to admin db")
+	p.logger.DebugContext(ctx, "connected to admin db")
 
 	// Detect database dialect (PostgreSQL vs CockroachDB).
 	dialect := detectDialect(ctx, conn, p.adminConnStr)
-	p.logger.Debug("detected dialect", "dialect", dialect)
+	p.logger.DebugContext(ctx, "detected dialect", "dialect", dialect)
 
 	// Check if user exists.
 	var exists bool
@@ -191,7 +191,7 @@ func (p *Provisioner) EnsureUser(ctx context.Context, loginName, nodeName, datab
 			span.RecordError(err)
 			return "", "", fmt.Errorf("create role: %w", err)
 		}
-		p.logger.Info("created PG role", "role", pgUser)
+		p.logger.InfoContext(ctx, "created PG role", "role", pgUser)
 	} else {
 		// Update password on every connection.
 		_, err = conn.Exec(ctx, fmt.Sprintf(
@@ -217,7 +217,7 @@ func (p *Provisioner) EnsureUser(ctx context.Context, loginName, nodeName, datab
 		pgx.Identifier{pgUser}.Sanitize(),
 	))
 	if err != nil {
-		p.logger.Warn("grant connect failed", "role", pgUser, "database", database, "error", err)
+		p.logger.WarnContext(ctx, "grant connect failed", "role", pgUser, "database", database, "error", err)
 	}
 
 	// Apply permission presets and raw SQL statements.
@@ -234,7 +234,7 @@ func (p *Provisioner) EnsureUser(ctx context.Context, loginName, nodeName, datab
 			for _, frag := range fragments {
 				stmt := fmt.Sprintf("GRANT %s TO %s", frag, sanitizedRole)
 				if _, err := conn.Exec(ctx, stmt); err != nil {
-					p.logger.Warn("grant failed", "role", pgUser, "grant", frag, "error", err)
+					p.logger.WarnContext(ctx, "grant failed", "role", pgUser, "grant", frag, "error", err)
 				}
 			}
 		}
@@ -256,7 +256,7 @@ func (p *Provisioner) EnsureUser(ctx context.Context, loginName, nodeName, datab
 					return "", "", fmt.Errorf("invalid sql template %q: %w", raw, err)
 				}
 				if _, err := conn.Exec(ctx, resolved); err != nil {
-					p.logger.Warn("sql statement failed", "role", pgUser, "sql", raw, "error", err)
+					p.logger.WarnContext(ctx, "sql statement failed", "role", pgUser, "sql", raw, "error", err)
 				}
 			}
 		}

@@ -55,7 +55,8 @@ func main() {
 			levelVar.Set(l)
 		}
 	}
-	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: &levelVar}))
+	logger := slog.New(logging.NewOTelHandler(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: &levelVar})))
+	slog.SetDefault(logger)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()

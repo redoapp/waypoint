@@ -80,7 +80,7 @@ func ForwardQuery(ctx context.Context, listenPacket ListenPacketFunc, resolver, 
 		resolver = net.JoinHostPort(resolver, "53")
 	}
 
-	slog.Debug("forwarding DNS query", "fqdn", fqdn, "qtype", qtype, "resolver", resolver)
+	slog.DebugContext(ctx, "forwarding DNS query", "fqdn", fqdn, "qtype", qtype, "resolver", resolver)
 
 	pc, err := listenPacket("udp", ":0")
 	if err != nil {
@@ -110,7 +110,7 @@ func ForwardQuery(ctx context.Context, listenPacket ListenPacketFunc, resolver, 
 		return nil, fmt.Errorf("read DNS response from %s for %s: %w", resolver, fqdn, err)
 	}
 
-	slog.Debug("DNS query resolved", "fqdn", fqdn, "resolver", resolver, "response_bytes", n)
+	slog.DebugContext(ctx, "DNS query resolved", "fqdn", fqdn, "resolver", resolver, "response_bytes", n)
 	return buf[:n], nil
 }
 
@@ -147,10 +147,10 @@ func NewRoutedQueryFunc(fallback QueryFunc, listenPacket ListenPacketFunc, route
 	return func(ctx context.Context, name, qtype string) ([]byte, error) {
 		resolvers, ok := matchRoute(name, routes)
 		if !ok || len(resolvers) == 0 {
-			slog.Debug("DNS query using fallback (no route match)", "name", name, "qtype", qtype)
+			slog.DebugContext(ctx, "DNS query using fallback (no route match)", "name", name, "qtype", qtype)
 			return fallback(ctx, name, qtype)
 		}
-		slog.Debug("DNS query matched route", "name", name, "qtype", qtype, "resolvers", resolvers)
+		slog.DebugContext(ctx, "DNS query matched route", "name", name, "qtype", qtype, "resolvers", resolvers)
 		// Try each resolver; return first success.
 		var lastErr error
 		for _, r := range resolvers {
@@ -158,7 +158,7 @@ func NewRoutedQueryFunc(fallback QueryFunc, listenPacket ListenPacketFunc, route
 			if err == nil {
 				return resp, nil
 			}
-			slog.Warn("DNS resolver failed", "name", name, "resolver", r, "error", err)
+			slog.WarnContext(ctx, "DNS resolver failed", "name", name, "resolver", r, "error", err)
 			lastErr = err
 		}
 		return nil, fmt.Errorf("all resolvers failed for %s: %w", name, lastErr)

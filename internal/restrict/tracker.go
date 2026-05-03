@@ -57,7 +57,7 @@ func (t *Tracker) Acquire(ctx context.Context, user string, limits auth.MergedLi
 	if err != nil {
 		return nil, fmt.Errorf("increment conn count: %w", err)
 	}
-	t.logger.Debug("connection acquired", "user", user, "listener", listenerName, "count", count)
+	t.logger.DebugContext(ctx, "connection acquired", "user", user, "listener", listenerName, "count", count)
 
 	// Double-check after increment (race window is acceptable per spec).
 	if limits.Endpoint != nil && limits.Endpoint.MaxConns > 0 && count > int64(limits.Endpoint.MaxConns) {

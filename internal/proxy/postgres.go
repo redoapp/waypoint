@@ -44,7 +44,7 @@ func (p *PostgresProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 
 	connID := logging.NewConnID()
 	log := p.Logger.With("conn_id", connID, "remote", clientConn.RemoteAddr())
-	log.Debug("connection accepted")
+	log.DebugContext(ctx, "connection accepted")
 
 	m := p.Metrics
 	tracer := m.Tracer()
@@ -78,14 +78,14 @@ func (p *PostgresProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 		setupSpan.End()
 		m.AuthFailures.Add(ctx, 1, m.Attrs("waypoint.auth.failures", listenerAttr))
 		m.ConnRejected.Add(ctx, 1, m.Attrs("waypoint.conn.rejected", listenerAttr, modeAttr))
-		log.Warn("auth failed", "error", err, "listener", p.Name)
+		log.WarnContext(ctx, "auth failed", "error", err, "listener", p.Name)
 		pgwire.SendErrorResponse(clientConn, "FATAL", "28000", "authentication failed: "+err.Error())
 		return
 	}
 	authSpan.SetAttributes(attribute.String("waypoint.user", result.LoginName))
 	authSpan.End()
 
-	log.Info("authorized",
+	log.InfoContext(ctx, "authorized",
 		"user", result.LoginName,
 		"node", result.NodeName,
 		"backend", p.Name,
@@ -102,13 +102,13 @@ func (p *PostgresProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 		setupSpan.SetStatus(codes.Error, "limit exceeded")
 		setupSpan.End()
 		m.ConnRejected.Add(ctx, 1, m.Attrs("waypoint.conn.rejected", listenerAttr, modeAttr))
-		log.Warn("limit exceeded", "user", result.LoginName, "error", err)
+		log.WarnContext(ctx, "limit exceeded", "user", result.LoginName, "error", err)
 		pgwire.SendErrorResponse(clientConn, "FATAL", "53300", "too many connections: "+err.Error())
 		return
 	}
 	slotSpan.End()
 	defer release()
-	log.Debug("connection slot acquired")
+	log.DebugContext(ctx, "connection slot acquired")
 
 	// Track connection.
 	connStart := time.Now()
@@ -126,7 +126,7 @@ func (p *PostgresProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 		setupSpan.RecordError(err)
 		setupSpan.SetStatus(codes.Error, "read startup failed")
 		setupSpan.End()
-		log.Error("read startup failed", "error", err)
+		log.ErrorContext(ctx, "read startup failed", "error", err)
 		return
 	}
 
@@ -135,7 +135,7 @@ func (p *PostgresProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 		requestedDB = startup.Parameters["user"]
 	}
 
-	log.Debug("startup message received", "database", requestedDB)
+	log.DebugContext(ctx, "startup message received", "database", requestedDB)
 	setupSpan.SetAttributes(attribute.String("waypoint.database", requestedDB))
 
 	// Step 4: Check per-database permissions from cap rules.
@@ -157,7 +157,7 @@ func (p *PostgresProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 		}
 		setupSpan.SetStatus(codes.Error, "no permissions for database")
 		setupSpan.End()
-		log.Warn("no permissions for database",
+		log.WarnContext(ctx, "no permissions for database",
 			"user", result.LoginName,
 			"database", requestedDB,
 			"granted_databases", grantedDBs,
@@ -167,7 +167,7 @@ func (p *PostgresProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 		return
 	}
 
-	log.Debug("database permissions resolved",
+	log.DebugContext(ctx, "database permissions resolved",
 		"database", requestedDB,
 		"permissions", dbPerms.Permissions,
 		"sql_count", len(dbPerms.SQL),
@@ -186,7 +186,7 @@ func (p *PostgresProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 		setupSpan.RecordError(err)
 		setupSpan.SetStatus(codes.Error, "provision failed")
 		setupSpan.End()
-		log.Error("provision failed",
+		log.ErrorContext(ctx, "provision failed",
 			"user", result.LoginName,
 			"database", requestedDB,
 			"error", err,
@@ -195,7 +195,7 @@ func (p *PostgresProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 		return
 	}
 
-	log.Debug("user provisioned", "pg_user", pgUser, "database", requestedDB)
+	log.DebugContext(ctx, "user provisioned", "pg_user", pgUser, "database", requestedDB)
 
 	// Step 6: Connect to upstream PG with provisioned credentials.
 	ctx, dialSpan := tracer.Start(ctx, "waypoint.dial_backend")
@@ -214,14 +214,14 @@ func (p *PostgresProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 		setupSpan.RecordError(err)
 		setupSpan.SetStatus(codes.Error, "dial failed")
 		setupSpan.End()
-		log.Error("backend dial failed", "backend", p.Backend, "error", err)
+		log.ErrorContext(ctx, "backend dial failed", "backend", p.Backend, "error", err)
 		pgwire.SendErrorResponse(clientConn, "FATAL", "08006", "backend unavailable")
 		return
 	}
 	dialSpan.End()
 	defer backendConn.Close()
 
-	log.Debug("backend connected")
+	log.DebugContext(ctx, "backend connected")
 
 	// Step 6b: Upgrade to TLS if configured.
 	if p.BackendTLS {
@@ -230,11 +230,11 @@ func (p *PostgresProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 			setupSpan.RecordError(err)
 			setupSpan.SetStatus(codes.Error, "backend TLS failed")
 			setupSpan.End()
-			log.Error("backend TLS upgrade failed", "error", err)
+			log.ErrorContext(ctx, "backend TLS upgrade failed", "error", err)
 			pgwire.SendErrorResponse(clientConn, "FATAL", "08006", "backend TLS failed")
 			return
 		}
-		log.Debug("backend TLS established")
+		log.DebugContext(ctx, "backend TLS established")
 	}
 
 	// Step 7: Send startup to upstream with provisioned user.
@@ -242,7 +242,7 @@ func (p *PostgresProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 		setupSpan.RecordError(err)
 		setupSpan.SetStatus(codes.Error, "send startup failed")
 		setupSpan.End()
-		log.Error("send startup failed", "error", err)
+		log.ErrorContext(ctx, "send startup failed", "error", err)
 		pgwire.SendErrorResponse(clientConn, "FATAL", "08006", "backend error")
 		return
 	}
@@ -253,19 +253,19 @@ func (p *PostgresProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 		setupSpan.RecordError(err)
 		setupSpan.SetStatus(codes.Error, "upstream auth failed")
 		setupSpan.End()
-		log.Error("upstream auth failed", "user", pgUser, "error", err)
+		log.ErrorContext(ctx, "upstream auth failed", "user", pgUser, "error", err)
 		pgwire.SendErrorResponse(clientConn, "FATAL", "28P01", "backend authentication failed")
 		return
 	}
 
-	log.Debug("upstream auth complete")
+	log.DebugContext(ctx, "upstream auth complete")
 
 	// Step 9: Send AuthenticationOk to client (Tailscale identity = their credential).
 	if err := pgwire.SendAuthOK(clientConn); err != nil {
 		setupSpan.RecordError(err)
 		setupSpan.SetStatus(codes.Error, "send auth ok failed")
 		setupSpan.End()
-		log.Error("send auth ok failed", "error", err)
+		log.ErrorContext(ctx, "send auth ok failed", "error", err)
 		return
 	}
 
@@ -274,7 +274,7 @@ func (p *PostgresProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 		setupSpan.RecordError(err)
 		setupSpan.SetStatus(codes.Error, "forward post-auth failed")
 		setupSpan.End()
-		log.Error("forward post-auth failed", "error", err)
+		log.ErrorContext(ctx, "forward post-auth failed", "error", err)
 		return
 	}
 
@@ -292,10 +292,10 @@ func (p *PostgresProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 		go p.revalidateLoop(revalCtx, setupSpanCtx, connID, clientConn, backendConn, result.LoginName, requestedDB, log)
 	}
 
-	log.Debug("relay started")
+	log.DebugContext(ctx, "relay started")
 
 	if err := restrict.Relay(clientConn, backendConn, cl); err != nil {
-		log.Debug("relay ended", "user", result.LoginName, "error", err)
+		log.DebugContext(ctx, "relay ended", "user", result.LoginName, "error", err)
 	}
 
 	// Record aggregate byte counters for heartbeat after relay completes.
@@ -322,7 +322,7 @@ func (p *PostgresProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 	)
 	closeSpan.End()
 
-	log.Info("connection closed", "duration", time.Since(connStart), "bytes_read", br, "bytes_written", bw)
+	log.InfoContext(ctx, "connection closed", "duration", time.Since(connStart), "bytes_read", br, "bytes_written", bw)
 }
 
 // revalidateLoop periodically re-checks WhoIs + caps. Closes connections
@@ -340,7 +340,7 @@ func (p *PostgresProxy) revalidateLoop(ctx context.Context, setupSpanCtx trace.S
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			log.Debug("revalidation check")
+			log.DebugContext(ctx, "revalidation check")
 			m.RevalAttempts.Add(ctx, 1, m.Attrs("waypoint.reval.attempts", listenerAttr))
 
 			_, revalSpan := tracer.Start(ctx, "waypoint.revalidation",
@@ -358,7 +358,7 @@ func (p *PostgresProxy) revalidateLoop(ctx context.Context, setupSpanCtx trace.S
 				revalSpan.SetStatus(codes.Error, "revalidation failed")
 				revalSpan.End()
 				m.RevalFailures.Add(ctx, 1, m.Attrs("waypoint.reval.failures", listenerAttr))
-				log.Warn("revalidation failed, closing connection",
+				log.WarnContext(ctx, "revalidation failed, closing connection",
 					"user", loginName,
 					"error", err,
 				)
@@ -372,7 +372,7 @@ func (p *PostgresProxy) revalidateLoop(ctx context.Context, setupSpanCtx trace.S
 				revalSpan.SetStatus(codes.Error, "permissions revoked")
 				revalSpan.End()
 				m.RevalFailures.Add(ctx, 1, m.Attrs("waypoint.reval.failures", listenerAttr))
-				log.Warn("permissions revoked, closing connection",
+				log.WarnContext(ctx, "permissions revoked, closing connection",
 					"user", loginName,
 					"database", database,
 				)
@@ -382,7 +382,7 @@ func (p *PostgresProxy) revalidateLoop(ctx context.Context, setupSpanCtx trace.S
 			}
 
 			revalSpan.End()
-			log.Debug("revalidation passed")
+			log.DebugContext(ctx, "revalidation passed")
 		}
 	}
 }

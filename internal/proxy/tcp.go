@@ -35,7 +35,7 @@ func (p *TCPProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 
 	connID := logging.NewConnID()
 	log := p.Logger.With("conn_id", connID, "remote", clientConn.RemoteAddr())
-	log.Debug("connection accepted")
+	log.DebugContext(ctx, "connection accepted")
 
 	m := p.Metrics
 	tracer := m.Tracer()
@@ -69,13 +69,13 @@ func (p *TCPProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 		setupSpan.End()
 		m.AuthFailures.Add(ctx, 1, m.Attrs("waypoint.auth.failures", listenerAttr))
 		m.ConnRejected.Add(ctx, 1, m.Attrs("waypoint.conn.rejected", listenerAttr, modeAttr))
-		log.Warn("auth failed", "error", err, "listener", p.Name)
+		log.WarnContext(ctx, "auth failed", "error", err, "listener", p.Name)
 		return
 	}
 	authSpan.SetAttributes(attribute.String("waypoint.user", result.LoginName))
 	authSpan.End()
 
-	log.Info("authorized",
+	log.InfoContext(ctx, "authorized",
 		"user", result.LoginName,
 		"node", result.NodeName,
 		"backend", p.Name,
@@ -92,12 +92,12 @@ func (p *TCPProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 		setupSpan.SetStatus(codes.Error, "limit exceeded")
 		setupSpan.End()
 		m.ConnRejected.Add(ctx, 1, m.Attrs("waypoint.conn.rejected", listenerAttr, modeAttr))
-		log.Warn("limit exceeded", "user", result.LoginName, "error", err)
+		log.WarnContext(ctx, "limit exceeded", "user", result.LoginName, "error", err)
 		return
 	}
 	slotSpan.End()
 	defer release()
-	log.Debug("connection slot acquired")
+	log.DebugContext(ctx, "connection slot acquired")
 
 	// Track connection.
 	connStart := time.Now()
@@ -126,7 +126,7 @@ func (p *TCPProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 		setupSpan.RecordError(err)
 		setupSpan.SetStatus(codes.Error, "dial failed")
 		setupSpan.End()
-		log.Error("backend dial failed", "backend", p.Backend, "error", err)
+		log.ErrorContext(ctx, "backend dial failed", "backend", p.Backend, "error", err)
 		return
 	}
 	dialSpan.End()
@@ -139,7 +139,7 @@ func (p *TCPProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 	cl := p.Tracker.WrapConn(ctx, result.LoginName, result.Limits, p.Name)
 
 	if err := restrict.Relay(clientConn, backendConn, cl); err != nil {
-		log.Debug("relay ended", "user", result.LoginName, "error", err)
+		log.DebugContext(ctx, "relay ended", "user", result.LoginName, "error", err)
 	}
 
 	// Record aggregate byte counters for heartbeat after relay completes.
@@ -166,5 +166,5 @@ func (p *TCPProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 	)
 	closeSpan.End()
 
-	log.Info("connection closed", "duration", time.Since(connStart), "bytes_read", br, "bytes_written", bw)
+	log.InfoContext(ctx, "connection closed", "duration", time.Since(connStart), "bytes_read", br, "bytes_written", bw)
 }

@@ -32,7 +32,7 @@ type ManagerAuthResult struct {
 func AuthorizeManager(ctx context.Context, lc *local.Client, remoteAddr string, logger *slog.Logger) (*ManagerAuthResult, error) {
 	tracer := otel.Tracer("waypoint")
 
-	logger.Debug("WhoIs lookup", "remote", remoteAddr)
+	logger.DebugContext(ctx, "WhoIs lookup", "remote", remoteAddr)
 	ctx, whoIsSpan := tracer.Start(ctx, "tailscale.whois",
 		trace.WithAttributes(attribute.String("peer.service", "tailscale")),
 	)
@@ -53,7 +53,7 @@ func AuthorizeManager(ctx context.Context, lc *local.Client, remoteAddr string, 
 		nodeName = strings.Split(who.Node.Name, ".")[0]
 	}
 
-	logger.Info("WhoIs identity",
+	logger.InfoContext(ctx, "WhoIs identity",
 		"login", who.UserProfile.LoginName,
 		"node", nodeName,
 	)
@@ -63,7 +63,7 @@ func AuthorizeManager(ctx context.Context, lc *local.Client, remoteAddr string, 
 		return nil, fmt.Errorf("unmarshal manager capabilities: %w", err)
 	}
 	if len(rules) == 0 {
-		logger.Info("manager access denied: no capability rules",
+		logger.InfoContext(ctx, "manager access denied: no capability rules",
 			"login", who.UserProfile.LoginName,
 			"node", nodeName,
 		)

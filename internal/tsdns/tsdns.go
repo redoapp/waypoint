@@ -42,13 +42,13 @@ func LookupHost(ctx context.Context, query QueryFunc, host string) ([]string, er
 		fqdn += "."
 	}
 
-	slog.Debug("looking up host", "host", host)
+	slog.DebugContext(ctx, "looking up host", "host", host)
 
 	raw, err := query(ctx, fqdn, "A")
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "DNS lookup failed")
-		slog.Warn("DNS lookup failed", "host", host, "error", err)
+		slog.WarnContext(ctx, "DNS lookup failed", "host", host, "error", err)
 		return nil, err
 	}
 
@@ -56,10 +56,10 @@ func LookupHost(ctx context.Context, query QueryFunc, host string) ([]string, er
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "DNS parse failed")
-		slog.Warn("DNS parse failed", "host", host, "error", err)
+		slog.WarnContext(ctx, "DNS parse failed", "host", host, "error", err)
 		return nil, err
 	}
-	slog.Debug("DNS lookup resolved", "host", host, "ips", ips)
+	slog.DebugContext(ctx, "DNS lookup resolved", "host", host, "ips", ips)
 	return ips, nil
 }
 

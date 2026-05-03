@@ -57,7 +57,7 @@ type EndpointLimits struct {
 func Authorize(ctx context.Context, lc *local.Client, remoteAddr string, backend string, logger *slog.Logger) (*AuthResult, error) {
 	tracer := otel.Tracer("waypoint")
 
-	logger.Debug("WhoIs lookup", "remote", remoteAddr)
+	logger.DebugContext(ctx, "WhoIs lookup", "remote", remoteAddr)
 	ctx, whoIsSpan := tracer.Start(ctx, "tailscale.whois",
 		trace.WithAttributes(attribute.String("peer.service", "tailscale")),
 	)
@@ -78,7 +78,7 @@ func Authorize(ctx context.Context, lc *local.Client, remoteAddr string, backend
 		nodeName = strings.Split(who.Node.Name, ".")[0]
 	}
 
-	logger.Info("WhoIs identity",
+	logger.InfoContext(ctx, "WhoIs identity",
 		"login", who.UserProfile.LoginName,
 		"display_name", who.UserProfile.DisplayName,
 		"user_id", who.UserProfile.ID,
@@ -100,7 +100,7 @@ func Authorize(ctx context.Context, lc *local.Client, remoteAddr string, backend
 			peerCaps = append(peerCaps, string(cap))
 		}
 
-		logger.Info("access denied: no capability rules",
+		logger.InfoContext(ctx, "access denied: no capability rules",
 			"login", who.UserProfile.LoginName,
 			"display_name", who.UserProfile.DisplayName,
 			"node", nodeName,
@@ -133,7 +133,7 @@ func Authorize(ctx context.Context, lc *local.Client, remoteAddr string, backend
 				}
 			}
 		}
-		logger.Info("access denied: no rules for backend",
+		logger.InfoContext(ctx, "access denied: no rules for backend",
 			"login", who.UserProfile.LoginName,
 			"node", nodeName,
 			"backend", backend,
@@ -147,7 +147,7 @@ func Authorize(ctx context.Context, lc *local.Client, remoteAddr string, backend
 
 	perms, limits := mergeRules(matched, backend)
 
-	logger.Debug("capability rules matched",
+	logger.DebugContext(ctx, "capability rules matched",
 		"rules_matched", len(matched),
 		"permissions", perms,
 	)
@@ -166,7 +166,7 @@ func Authorize(ctx context.Context, lc *local.Client, remoteAddr string, backend
 		limitAttrs = append(limitAttrs, "bandwidth_tiers", len(limits.BandwidthTiers))
 	}
 	if len(limitAttrs) > 0 {
-		logger.Debug("effective limits", limitAttrs...)
+		logger.DebugContext(ctx, "effective limits", limitAttrs...)
 	}
 
 	return &AuthResult{
