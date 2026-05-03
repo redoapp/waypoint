@@ -32,7 +32,7 @@ func TestIntegration_Relay_BandwidthTracking(t *testing.T) {
 	clientConn, clientRemote := net.Pipe()
 	backendConn, backendRemote := net.Pipe()
 
-	done := make(chan error, 1)
+	done := make(chan restrict.RelayResult, 1)
 	go func() {
 		done <- restrict.Relay(clientConn, backendConn, cl)
 	}()
@@ -86,7 +86,7 @@ func TestIntegration_Relay_BandwidthLimitEnforced(t *testing.T) {
 	clientConn, clientRemote := net.Pipe()
 	backendConn, backendRemote := net.Pipe()
 
-	done := make(chan error, 1)
+	done := make(chan restrict.RelayResult, 1)
 	go func() {
 		done <- restrict.Relay(clientConn, backendConn, cl)
 	}()

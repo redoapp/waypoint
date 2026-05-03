@@ -16,9 +16,38 @@ import (
 	"github.com/redoapp/waypoint/internal/metrics"
 )
 
-var errByteLimitExceeded = errors.New("per-connection byte limit exceeded")
-var errBandwidthLimitExceeded = errors.New("bandwidth limit exceeded")
-var errDeadlineExceeded = errors.New("connection duration limit exceeded")
+// ErrByteLimitExceeded is returned when the per-connection byte limit is exceeded.
+var ErrByteLimitExceeded = errors.New("per-connection byte limit exceeded")
+
+// ErrBandwidthLimitExceeded is returned when a bandwidth tier limit is exceeded.
+var ErrBandwidthLimitExceeded = errors.New("bandwidth limit exceeded")
+
+// ErrDeadlineExceeded is returned when the connection duration limit is exceeded.
+var ErrDeadlineExceeded = errors.New("connection duration limit exceeded")
+
+// Direction indicates which side of the relay initiated the close.
+type Direction string
+
+const (
+	DirClient  Direction = "client"
+	DirBackend Direction = "backend"
+)
+
+// CloseReason categorizes why a relay ended.
+type CloseReason string
+
+const (
+	CloseNormal  CloseReason = "normal"  // clean EOF from one side
+	CloseLimit   CloseReason = "limit"   // byte, bandwidth, or duration limit exceeded
+	CloseNetwork CloseReason = "network" // I/O error (not EOF)
+)
+
+// RelayResult describes how a bidirectional relay ended.
+type RelayResult struct {
+	Reason      CloseReason
+	InitiatedBy Direction
+	Err         error // underlying error; nil for clean EOF
+}
 
 // ConnLimits tracks per-connection limits and batches byte updates to Redis.
 type ConnLimits struct {
@@ -90,7 +119,7 @@ func (cl *ConnLimits) ReportBytes(n int64) error {
 				cl.metrics.LimitViolations.Add(context.Background(), 1,
 					cl.metrics.Attrs("waypoint.limit.violations", metrics.AttrLimitType.String("bytes_per_conn")))
 			}
-			return errByteLimitExceeded
+			return ErrByteLimitExceeded
 		}
 	}
 
@@ -99,7 +128,7 @@ func (cl *ConnLimits) ReportBytes(n int64) error {
 			cl.metrics.LimitViolations.Add(context.Background(), 1,
 				cl.metrics.Attrs("waypoint.limit.violations", metrics.AttrLimitType.String("conn_duration")))
 		}
-		return errDeadlineExceeded
+		return ErrDeadlineExceeded
 	}
 
 	return cl.checkLimitErr()
@@ -161,7 +190,7 @@ func (cl *ConnLimits) flush() {
 			if err != nil {
 				cl.logger.Error("bandwidth flush failed", "user", cl.user, "error", err)
 			} else if result.Exceeded {
-				cl.setLimitErr(errBandwidthLimitExceeded)
+				cl.setLimitErr(ErrBandwidthLimitExceeded)
 			}
 		}
 	}
@@ -179,23 +208,31 @@ func (cl *ConnLimits) flush() {
 	}
 }
 
+// relayEvent pairs a copy result with the direction it came from.
+type relayEvent struct {
+	dir Direction
+	err error
+}
+
 // Relay copies data bidirectionally between client and backend,
 // enforcing limits via the ConnLimits tracker.
-func Relay(client, backend net.Conn, cl *ConnLimits) error {
+func Relay(client, backend net.Conn, cl *ConnLimits) RelayResult {
 	cl.Start()
 	defer cl.Stop()
 
-	errc := make(chan error, 2)
+	errc := make(chan relayEvent, 2)
 
+	// client → backend (reading from client side).
 	go func() {
-		errc <- copyWithLimits(backend, client, cl.ReportRead)
+		errc <- relayEvent{dir: DirClient, err: copyWithLimits(backend, client, cl.ReportRead)}
 	}()
+	// backend → client (reading from backend side).
 	go func() {
-		errc <- copyWithLimits(client, backend, cl.ReportWrite)
+		errc <- relayEvent{dir: DirBackend, err: copyWithLimits(client, backend, cl.ReportWrite)}
 	}()
 
 	// Wait for first error (one direction closed).
-	err := <-errc
+	first := <-errc
 
 	// Close both sides to unblock the other goroutine.
 	client.Close()
@@ -204,7 +241,25 @@ func Relay(client, backend net.Conn, cl *ConnLimits) error {
 	// Wait for second goroutine.
 	<-errc
 
-	return err
+	return classifyResult(first)
+}
+
+func classifyResult(first relayEvent) RelayResult {
+	r := RelayResult{
+		InitiatedBy: first.dir,
+		Err:         first.err,
+	}
+	switch {
+	case first.err == nil:
+		r.Reason = CloseNormal
+	case errors.Is(first.err, ErrByteLimitExceeded),
+		errors.Is(first.err, ErrBandwidthLimitExceeded),
+		errors.Is(first.err, ErrDeadlineExceeded):
+		r.Reason = CloseLimit
+	default:
+		r.Reason = CloseNetwork
+	}
+	return r
 }
 
 func copyWithLimits(dst, src net.Conn, report func(int64) error) error {

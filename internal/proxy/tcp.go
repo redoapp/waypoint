@@ -138,8 +138,22 @@ func (p *TCPProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 
 	cl := p.Tracker.WrapConn(ctx, result.LoginName, result.Limits, p.Name)
 
-	if err := restrict.Relay(clientConn, backendConn, cl); err != nil {
-		log.DebugContext(ctx, "relay ended", "user", result.LoginName, "error", err)
+	relayResult := restrict.Relay(clientConn, backendConn, cl)
+
+	switch relayResult.Reason {
+	case restrict.CloseLimit:
+		log.WarnContext(ctx, "relay ended: limit exceeded",
+			"user", result.LoginName,
+			"close_reason", relayResult.Reason,
+			"initiated_by", relayResult.InitiatedBy,
+			"error", relayResult.Err,
+		)
+	case restrict.CloseNetwork:
+		log.WarnContext(ctx, "relay ended: network error",
+			"user", result.LoginName,
+			"initiated_by", relayResult.InitiatedBy,
+			"error", relayResult.Err,
+		)
 	}
 
 	// Record aggregate byte counters for heartbeat after relay completes.
@@ -162,9 +176,17 @@ func (p *TCPProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 			attribute.Int64("waypoint.bytes_read", br),
 			attribute.Int64("waypoint.bytes_written", bw),
 			attribute.Float64("waypoint.duration_s", time.Since(connStart).Seconds()),
+			attribute.String("waypoint.close_reason", string(relayResult.Reason)),
+			attribute.String("waypoint.close_initiated_by", string(relayResult.InitiatedBy)),
 		),
 	)
 	closeSpan.End()
 
-	log.InfoContext(ctx, "connection closed", "duration", time.Since(connStart), "bytes_read", br, "bytes_written", bw)
+	log.InfoContext(ctx, "connection closed",
+		"duration", time.Since(connStart),
+		"bytes_read", br,
+		"bytes_written", bw,
+		"close_reason", relayResult.Reason,
+		"initiated_by", relayResult.InitiatedBy,
+	)
 }

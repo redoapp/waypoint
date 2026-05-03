@@ -65,7 +65,7 @@ func TestConnLimits_ByteLimit(t *testing.T) {
 	}
 
 	// Over limit.
-	if err := cl.ReportBytes(60); err != errByteLimitExceeded {
+	if err := cl.ReportBytes(60); err != ErrByteLimitExceeded {
 		t.Fatalf("expected byte limit exceeded, got: %v", err)
 	}
 }
@@ -90,7 +90,7 @@ func TestConnLimits_ByteLimit_NoPending(t *testing.T) {
 	}
 
 	// Total is 80 read + written; adding 30 via pending pushes over 100.
-	if err := cl.ReportBytes(30); err != errByteLimitExceeded {
+	if err := cl.ReportBytes(30); err != ErrByteLimitExceeded {
 		t.Fatalf("expected byte limit exceeded, got: %v", err)
 	}
 }
@@ -122,7 +122,7 @@ func TestConnLimits_DeadlineExceeded(t *testing.T) {
 		done:          make(chan struct{}),
 	}
 
-	if err := cl.ReportBytes(0); err != errDeadlineExceeded {
+	if err := cl.ReportBytes(0); err != ErrDeadlineExceeded {
 		t.Fatalf("expected deadline exceeded, got: %v", err)
 	}
 }
@@ -188,7 +188,7 @@ func TestConnLimits_BandwidthLimitViaFlush(t *testing.T) {
 	cl.pendingBytes.Store(150) // Over bandwidth limit.
 	cl.flush()
 
-	if err := cl.checkLimitErr(); err != errBandwidthLimitExceeded {
+	if err := cl.checkLimitErr(); err != ErrBandwidthLimitExceeded {
 		t.Fatalf("expected bandwidth limit exceeded, got: %v", err)
 	}
 }
@@ -210,7 +210,7 @@ func TestConnLimits_BandwidthMultiTierViaFlush(t *testing.T) {
 	cl.pendingBytes.Store(300) // Under hourly, over weekly.
 	cl.flush()
 
-	if err := cl.checkLimitErr(); err != errBandwidthLimitExceeded {
+	if err := cl.checkLimitErr(); err != ErrBandwidthLimitExceeded {
 		t.Fatalf("expected bandwidth limit exceeded (weekly tier), got: %v", err)
 	}
 }
@@ -260,7 +260,7 @@ func TestRelay_BasicCopy(t *testing.T) {
 	clientConn, clientRemote := net.Pipe()
 	backendConn, backendRemote := net.Pipe()
 
-	done := make(chan error, 1)
+	done := make(chan RelayResult, 1)
 	go func() {
 		done <- Relay(clientConn, backendConn, cl)
 	}()
@@ -279,9 +279,12 @@ func TestRelay_BasicCopy(t *testing.T) {
 	}
 	backendRemote.Close()
 
-	err := <-done
-	if err != nil {
-		t.Fatalf("relay returned error: %v", err)
+	result := <-done
+	if result.Err != nil {
+		t.Fatalf("relay returned error: %v", result.Err)
+	}
+	if result.Reason != CloseNormal {
+		t.Fatalf("expected CloseNormal, got %v", result.Reason)
 	}
 }
 
@@ -311,7 +314,7 @@ func TestConnLimits_ByteLimit_ViaReportReadWrite(t *testing.T) {
 	}
 
 	// Over limit: total = 90 + 20 = 110 > 100.
-	if err := cl.ReportWrite(20); err != errByteLimitExceeded {
+	if err := cl.ReportWrite(20); err != ErrByteLimitExceeded {
 		t.Fatalf("expected byte limit exceeded, got: %v", err)
 	}
 }
@@ -374,7 +377,7 @@ func TestRelay_DeadlineEnforced(t *testing.T) {
 	clientConn, clientRemote := net.Pipe()
 	backendConn, backendRemote := net.Pipe()
 
-	done := make(chan error, 1)
+	done := make(chan RelayResult, 1)
 	go func() {
 		done <- Relay(clientConn, backendConn, cl)
 	}()
@@ -402,11 +405,14 @@ func TestRelay_DeadlineEnforced(t *testing.T) {
 		}
 	}()
 
-	err := <-done
+	result := <-done
 	backendRemote.Close()
 
-	if err != errDeadlineExceeded {
-		t.Fatalf("expected deadline exceeded, got: %v", err)
+	if result.Reason != CloseLimit {
+		t.Fatalf("expected CloseLimit, got: %v", result.Reason)
+	}
+	if result.Err != ErrDeadlineExceeded {
+		t.Fatalf("expected ErrDeadlineExceeded, got: %v", result.Err)
 	}
 }
 
@@ -425,7 +431,7 @@ func TestRelay_CombinedLimits(t *testing.T) {
 	clientConn, clientRemote := net.Pipe()
 	backendConn, backendRemote := net.Pipe()
 
-	done := make(chan error, 1)
+	done := make(chan RelayResult, 1)
 	go func() {
 		done <- Relay(clientConn, backendConn, cl)
 	}()
@@ -440,9 +446,12 @@ func TestRelay_CombinedLimits(t *testing.T) {
 	backendRemote.Read(buf)
 	backendRemote.Close()
 
-	err := <-done
-	if err != errByteLimitExceeded {
-		t.Fatalf("expected byte limit exceeded (not deadline or bandwidth), got: %v", err)
+	result := <-done
+	if result.Reason != CloseLimit {
+		t.Fatalf("expected CloseLimit, got: %v", result.Reason)
+	}
+	if result.Err != ErrByteLimitExceeded {
+		t.Fatalf("expected ErrByteLimitExceeded (not deadline or bandwidth), got: %v", result.Err)
 	}
 }
 
@@ -489,7 +498,7 @@ func TestRelay_ByteLimitEnforced(t *testing.T) {
 	clientConn, clientRemote := net.Pipe()
 	backendConn, backendRemote := net.Pipe()
 
-	done := make(chan error, 1)
+	done := make(chan RelayResult, 1)
 	go func() {
 		done <- Relay(clientConn, backendConn, cl)
 	}()
@@ -505,8 +514,11 @@ func TestRelay_ByteLimitEnforced(t *testing.T) {
 	backendRemote.Read(buf)
 	backendRemote.Close()
 
-	err := <-done
-	if err != errByteLimitExceeded {
-		t.Fatalf("expected byte limit exceeded, got: %v", err)
+	result := <-done
+	if result.Reason != CloseLimit {
+		t.Fatalf("expected CloseLimit, got: %v", result.Reason)
+	}
+	if result.Err != ErrByteLimitExceeded {
+		t.Fatalf("expected ErrByteLimitExceeded, got: %v", result.Err)
 	}
 }

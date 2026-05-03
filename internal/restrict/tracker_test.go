@@ -126,7 +126,7 @@ func TestTracker_WrapConn_Deadline(t *testing.T) {
 
 	time.Sleep(60 * time.Millisecond)
 
-	if err := cl.ReportBytes(0); err != errDeadlineExceeded {
+	if err := cl.ReportBytes(0); err != ErrDeadlineExceeded {
 		t.Fatalf("expected deadline exceeded, got: %v", err)
 	}
 }
