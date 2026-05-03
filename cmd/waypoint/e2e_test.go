@@ -63,8 +63,10 @@ func TestE2E_ServiceListener_ProxyProto(t *testing.T) {
 
 	// Set waypoint capabilities for all peers.
 	capRule := auth.CapRule{
-		Backends: []string{"echo-svc"},
-		Limits:   &auth.LimitsCap{MaxConns: 5},
+		Limits: &auth.LimitsCap{MaxConns: 5},
+		Backends: map[string]auth.BackendCap{
+			"echo-svc": {},
+		},
 	}
 	capJSON, err := json.Marshal(capRule)
 	if err != nil {

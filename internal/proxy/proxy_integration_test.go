@@ -169,10 +169,13 @@ func makeAuthResult(database string, perms auth.DBPermissions, limits *auth.Limi
 		NodeName:  "test-node",
 		MatchedRules: []auth.CapRule{
 			{
-				Backends: []string{"test-listener"},
-				PG: &auth.PGCap{
-					Databases: map[string]auth.DBPermissions{
-						database: perms,
+				Backends: map[string]auth.BackendCap{
+					"test-listener": {
+						PG: &auth.PGCap{
+							Databases: map[string]auth.DBPermissions{
+								database: perms,
+							},
+						},
 					},
 				},
 			},
@@ -793,15 +796,18 @@ func TestIntegration_TailscaleAuthorizer_RealPipeline(t *testing.T) {
 
 	// Set waypoint capabilities for all peers.
 	capRule := auth.CapRule{
-		Backends: []string{"test-listener"},
-		PG: &auth.PGCap{
-			Databases: map[string]auth.DBPermissions{
-				"waypoint_test": {
-					Permissions: []string{"readonly"},
+		Limits: &auth.LimitsCap{MaxConns: 5},
+		Backends: map[string]auth.BackendCap{
+			"test-listener": {
+				PG: &auth.PGCap{
+					Databases: map[string]auth.DBPermissions{
+						"waypoint_test": {
+							Permissions: []string{"readonly"},
+						},
+					},
 				},
 			},
 		},
-		Limits: &auth.LimitsCap{MaxConns: 5},
 	}
 	capJSON, err := json.Marshal(capRule)
 	if err != nil {

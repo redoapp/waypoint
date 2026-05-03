@@ -139,15 +139,16 @@ func (p *PostgresProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 	setupSpan.SetAttributes(attribute.String("waypoint.database", requestedDB))
 
 	// Step 4: Check per-database permissions from cap rules.
-	dbPerms := auth.DatabasePermissions(result, requestedDB)
+	dbPerms := auth.DatabasePermissions(result, p.Name, requestedDB)
 	if dbPerms == nil {
 		var grantedDBs []string
 		seen := make(map[string]bool)
 		for _, r := range result.MatchedRules {
-			if r.PG == nil {
+			bc, ok := r.Backends[p.Name]
+			if !ok || bc.PG == nil {
 				continue
 			}
-			for db := range r.PG.Databases {
+			for db := range bc.PG.Databases {
 				if !seen[db] {
 					grantedDBs = append(grantedDBs, db)
 					seen[db] = true
@@ -366,7 +367,7 @@ func (p *PostgresProxy) revalidateLoop(ctx context.Context, setupSpanCtx trace.S
 				return
 			}
 
-			dbPerms := auth.DatabasePermissions(result, database)
+			dbPerms := auth.DatabasePermissions(result, p.Name, database)
 			if dbPerms == nil {
 				revalSpan.SetStatus(codes.Error, "permissions revoked")
 				revalSpan.End()

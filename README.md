@@ -73,19 +73,22 @@ Example policy snippet:
     "dst": ["tag:waypoint"],
     "cap": {
       "redo.com/cap/waypoint": [{
-        "backends": ["pg-main"],
-        "pg": {
-          "databases": {
-            "myapp": {
-              "permissions": ["readwrite"],
-              "schemas": ["public", "app"]
-            },
-            "*": { "permissions": ["readonly"] }
-          }
-        },
         "limits": {
           "max_conns": 10,
           "max_conn_duration": "1h"
+        },
+        "backends": {
+          "pg-main": {
+            "pg": {
+              "databases": {
+                "myapp": {
+                  "permissions": ["readwrite"],
+                  "schemas": ["public", "app"]
+                },
+                "*": { "permissions": ["readonly"] }
+              }
+            }
+          }
         }
       }]
     }

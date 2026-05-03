@@ -118,18 +118,15 @@ func Authorize(ctx context.Context, lc *local.Client, remoteAddr string, backend
 	// Filter rules matching the requested backend and merge.
 	var matched []CapRule
 	for _, r := range rules {
-		for _, b := range r.Backends {
-			if b == backend {
-				matched = append(matched, r)
-				break
-			}
+		if _, ok := r.Backends[backend]; ok {
+			matched = append(matched, r)
 		}
 	}
 	if len(matched) == 0 {
 		var availableBackends []string
 		seen := make(map[string]bool)
 		for _, r := range rules {
-			for _, b := range r.Backends {
+			for b := range r.Backends {
 				if !seen[b] {
 					availableBackends = append(availableBackends, b)
 					seen[b] = true
@@ -182,8 +179,9 @@ func Authorize(ctx context.Context, lc *local.Client, remoteAddr string, backend
 }
 
 // DatabasePermissions returns the merged permissions for a specific database
-// from the matched rules. Returns nil if no rules grant access to the database.
-func DatabasePermissions(result *AuthResult, database string) *DBPermissions {
+// from the matched rules for the given backend. Returns nil if no rules grant
+// access to the database.
+func DatabasePermissions(result *AuthResult, backend string, database string) *DBPermissions {
 	var perms []string
 	var schemas []string
 	var sql []string
@@ -192,11 +190,12 @@ func DatabasePermissions(result *AuthResult, database string) *DBPermissions {
 	schemasSeen := make(map[string]bool)
 
 	for _, r := range result.MatchedRules {
-		if r.PG == nil {
+		bc, ok := r.Backends[backend]
+		if !ok || bc.PG == nil {
 			continue
 		}
 		// Check for exact database match.
-		if db, ok := r.PG.Databases[database]; ok {
+		if db, ok := bc.PG.Databases[database]; ok {
 			perms = append(perms, db.Permissions...)
 			sql = append(sql, db.SQL...)
 			for _, s := range db.Schemas {
@@ -208,7 +207,7 @@ func DatabasePermissions(result *AuthResult, database string) *DBPermissions {
 			found = true
 		}
 		// Check for wildcard.
-		if db, ok := r.PG.Databases["*"]; ok {
+		if db, ok := bc.PG.Databases["*"]; ok {
 			perms = append(perms, db.Permissions...)
 			sql = append(sql, db.SQL...)
 			for _, s := range db.Schemas {
@@ -232,25 +231,29 @@ func DatabasePermissions(result *AuthResult, database string) *DBPermissions {
 }
 
 // mergeRules collects all permissions and picks the most restrictive limits.
-// backend is used to look up per-endpoint limits from EndpointLimits maps.
+// backend is used to look up the BackendCap entry in each rule.
 func mergeRules(rules []CapRule, backend string) ([]string, MergedLimits) {
 	var perms []string
 	var limits MergedLimits
 
 	for _, r := range rules {
-		if r.PG != nil {
-			for _, db := range r.PG.Databases {
+		bc, ok := r.Backends[backend]
+		if !ok {
+			continue
+		}
+		if bc.PG != nil {
+			for _, db := range bc.PG.Databases {
 				perms = append(perms, db.Permissions...)
 			}
 		}
 		if r.Limits != nil {
 			mergeLimits(&limits, r.Limits)
 		}
-		if ep, ok := r.EndpointLimits[backend]; ok && ep != nil {
+		if bc.Limits != nil {
 			if limits.Endpoint == nil {
 				limits.Endpoint = &EndpointLimits{}
 			}
-			mergeEndpointLimits(limits.Endpoint, ep)
+			mergeEndpointLimits(limits.Endpoint, bc.Limits)
 		}
 	}
 

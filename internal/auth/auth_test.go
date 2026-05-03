@@ -7,16 +7,19 @@ import (
 
 func TestMergeRules_SingleRuleWithPG(t *testing.T) {
 	rules := []CapRule{{
-		Backends: []string{"pg-main"},
-		PG: &PGCap{
-			Databases: map[string]DBPermissions{
-				"app_db": {Permissions: []string{"SELECT ON ALL TABLES IN SCHEMA public"}},
+		Limits: &LimitsCap{MaxConns: 5},
+		Backends: map[string]BackendCap{
+			"pg-main": {
+				PG: &PGCap{
+					Databases: map[string]DBPermissions{
+						"app_db": {Permissions: []string{"SELECT ON ALL TABLES IN SCHEMA public"}},
+					},
+				},
 			},
 		},
-		Limits: &LimitsCap{MaxConns: 5},
 	}}
 
-	perms, limits := mergeRules(rules, rules[0].Backends[0])
+	perms, limits := mergeRules(rules, "pg-main")
 
 	if len(perms) != 1 || perms[0] != "SELECT ON ALL TABLES IN SCHEMA public" {
 		t.Errorf("unexpected perms: %v", perms)
@@ -29,26 +32,32 @@ func TestMergeRules_SingleRuleWithPG(t *testing.T) {
 func TestMergeRules_MultipleRulesMergePermissions(t *testing.T) {
 	rules := []CapRule{
 		{
-			Backends: []string{"pg-main"},
-			PG: &PGCap{
-				Databases: map[string]DBPermissions{
-					"app_db": {Permissions: []string{"SELECT ON ALL TABLES IN SCHEMA public"}},
+			Limits: &LimitsCap{MaxConns: 10, MaxBytesPerConn: 1000},
+			Backends: map[string]BackendCap{
+				"pg-main": {
+					PG: &PGCap{
+						Databases: map[string]DBPermissions{
+							"app_db": {Permissions: []string{"SELECT ON ALL TABLES IN SCHEMA public"}},
+						},
+					},
 				},
 			},
-			Limits: &LimitsCap{MaxConns: 10, MaxBytesPerConn: 1000},
 		},
 		{
-			Backends: []string{"pg-main"},
-			PG: &PGCap{
-				Databases: map[string]DBPermissions{
-					"app_db": {Permissions: []string{"INSERT ON ALL TABLES IN SCHEMA public"}},
+			Limits: &LimitsCap{MaxConns: 5, MaxBytesPerConn: 2000},
+			Backends: map[string]BackendCap{
+				"pg-main": {
+					PG: &PGCap{
+						Databases: map[string]DBPermissions{
+							"app_db": {Permissions: []string{"INSERT ON ALL TABLES IN SCHEMA public"}},
+						},
+					},
 				},
 			},
-			Limits: &LimitsCap{MaxConns: 5, MaxBytesPerConn: 2000},
 		},
 	}
 
-	perms, limits := mergeRules(rules, rules[0].Backends[0])
+	perms, limits := mergeRules(rules, "pg-main")
 
 	if len(perms) != 2 {
 		t.Fatalf("expected 2 perms, got %d: %v", len(perms), perms)
@@ -64,10 +73,12 @@ func TestMergeRules_MultipleRulesMergePermissions(t *testing.T) {
 
 func TestMergeRules_NoLimits(t *testing.T) {
 	rules := []CapRule{{
-		Backends: []string{"raw-tcp"},
+		Backends: map[string]BackendCap{
+			"raw-tcp": {},
+		},
 	}}
 
-	perms, limits := mergeRules(rules, rules[0].Backends[0])
+	perms, limits := mergeRules(rules, "raw-tcp")
 
 	if len(perms) != 0 {
 		t.Errorf("expected no perms, got %v", perms)
@@ -79,11 +90,13 @@ func TestMergeRules_NoLimits(t *testing.T) {
 
 func TestMergeRules_NoPG(t *testing.T) {
 	rules := []CapRule{{
-		Backends: []string{"raw-tcp"},
-		Limits:   &LimitsCap{MaxConns: 10},
+		Limits: &LimitsCap{MaxConns: 10},
+		Backends: map[string]BackendCap{
+			"raw-tcp": {},
+		},
 	}}
 
-	perms, limits := mergeRules(rules, rules[0].Backends[0])
+	perms, limits := mergeRules(rules, "raw-tcp")
 
 	if len(perms) != 0 {
 		t.Errorf("expected no perms for non-PG rule, got %v", perms)
@@ -293,22 +306,25 @@ func TestMergeLimits_BandwidthEmptyPeriodSkipped(t *testing.T) {
 func TestDatabasePermissions_ExactMatch(t *testing.T) {
 	result := &AuthResult{
 		MatchedRules: []CapRule{{
-			Backends: []string{"pg-main"},
-			PG: &PGCap{
-				Databases: map[string]DBPermissions{
-					"app_db":    {Permissions: []string{"SELECT ON public.users"}},
-					"analytics": {Permissions: []string{"SELECT ON public.events"}},
+			Backends: map[string]BackendCap{
+				"pg-main": {
+					PG: &PGCap{
+						Databases: map[string]DBPermissions{
+							"app_db":    {Permissions: []string{"SELECT ON public.users"}},
+							"analytics": {Permissions: []string{"SELECT ON public.events"}},
+						},
+					},
 				},
 			},
 		}},
 	}
 
-	dbPerms := DatabasePermissions(result, "app_db")
+	dbPerms := DatabasePermissions(result, "pg-main", "app_db")
 	if dbPerms == nil || len(dbPerms.Permissions) != 1 || dbPerms.Permissions[0] != "SELECT ON public.users" {
 		t.Errorf("unexpected perms for app_db: %v", dbPerms)
 	}
 
-	dbPerms = DatabasePermissions(result, "analytics")
+	dbPerms = DatabasePermissions(result, "pg-main", "analytics")
 	if dbPerms == nil || len(dbPerms.Permissions) != 1 || dbPerms.Permissions[0] != "SELECT ON public.events" {
 		t.Errorf("unexpected perms for analytics: %v", dbPerms)
 	}
@@ -317,16 +333,19 @@ func TestDatabasePermissions_ExactMatch(t *testing.T) {
 func TestDatabasePermissions_WildcardMatch(t *testing.T) {
 	result := &AuthResult{
 		MatchedRules: []CapRule{{
-			Backends: []string{"pg-main"},
-			PG: &PGCap{
-				Databases: map[string]DBPermissions{
-					"*": {Permissions: []string{"SELECT ON ALL TABLES IN SCHEMA public"}},
+			Backends: map[string]BackendCap{
+				"pg-main": {
+					PG: &PGCap{
+						Databases: map[string]DBPermissions{
+							"*": {Permissions: []string{"SELECT ON ALL TABLES IN SCHEMA public"}},
+						},
+					},
 				},
 			},
 		}},
 	}
 
-	dbPerms := DatabasePermissions(result, "any_database")
+	dbPerms := DatabasePermissions(result, "pg-main", "any_database")
 	if dbPerms == nil || len(dbPerms.Permissions) != 1 {
 		t.Errorf("wildcard should match any database, got: %v", dbPerms)
 	}
@@ -335,17 +354,20 @@ func TestDatabasePermissions_WildcardMatch(t *testing.T) {
 func TestDatabasePermissions_ExactAndWildcardMerge(t *testing.T) {
 	result := &AuthResult{
 		MatchedRules: []CapRule{{
-			Backends: []string{"pg-main"},
-			PG: &PGCap{
-				Databases: map[string]DBPermissions{
-					"app_db": {Permissions: []string{"INSERT ON public.users"}},
-					"*":      {Permissions: []string{"SELECT ON ALL TABLES IN SCHEMA public"}},
+			Backends: map[string]BackendCap{
+				"pg-main": {
+					PG: &PGCap{
+						Databases: map[string]DBPermissions{
+							"app_db": {Permissions: []string{"INSERT ON public.users"}},
+							"*":      {Permissions: []string{"SELECT ON ALL TABLES IN SCHEMA public"}},
+						},
+					},
 				},
 			},
 		}},
 	}
 
-	dbPerms := DatabasePermissions(result, "app_db")
+	dbPerms := DatabasePermissions(result, "pg-main", "app_db")
 	if dbPerms == nil || len(dbPerms.Permissions) != 2 {
 		t.Errorf("expected exact + wildcard merged, got: %v", dbPerms)
 	}
@@ -354,16 +376,19 @@ func TestDatabasePermissions_ExactAndWildcardMerge(t *testing.T) {
 func TestDatabasePermissions_NoMatch(t *testing.T) {
 	result := &AuthResult{
 		MatchedRules: []CapRule{{
-			Backends: []string{"pg-main"},
-			PG: &PGCap{
-				Databases: map[string]DBPermissions{
-					"app_db": {Permissions: []string{"SELECT ON public.users"}},
+			Backends: map[string]BackendCap{
+				"pg-main": {
+					PG: &PGCap{
+						Databases: map[string]DBPermissions{
+							"app_db": {Permissions: []string{"SELECT ON public.users"}},
+						},
+					},
 				},
 			},
 		}},
 	}
 
-	dbPerms := DatabasePermissions(result, "secret_db")
+	dbPerms := DatabasePermissions(result, "pg-main", "secret_db")
 	if dbPerms != nil {
 		t.Errorf("expected nil for unmatched database, got: %v", dbPerms)
 	}
@@ -372,11 +397,13 @@ func TestDatabasePermissions_NoMatch(t *testing.T) {
 func TestDatabasePermissions_NoPGCap(t *testing.T) {
 	result := &AuthResult{
 		MatchedRules: []CapRule{{
-			Backends: []string{"raw-tcp"},
+			Backends: map[string]BackendCap{
+				"raw-tcp": {},
+			},
 		}},
 	}
 
-	dbPerms := DatabasePermissions(result, "any_db")
+	dbPerms := DatabasePermissions(result, "raw-tcp", "any_db")
 	if dbPerms != nil {
 		t.Errorf("expected nil for non-PG rule, got: %v", dbPerms)
 	}
@@ -386,25 +413,31 @@ func TestDatabasePermissions_MultipleRulesMerge(t *testing.T) {
 	result := &AuthResult{
 		MatchedRules: []CapRule{
 			{
-				Backends: []string{"pg-main"},
-				PG: &PGCap{
-					Databases: map[string]DBPermissions{
-						"app_db": {Permissions: []string{"SELECT ON public.users"}},
+				Backends: map[string]BackendCap{
+					"pg-main": {
+						PG: &PGCap{
+							Databases: map[string]DBPermissions{
+								"app_db": {Permissions: []string{"SELECT ON public.users"}},
+							},
+						},
 					},
 				},
 			},
 			{
-				Backends: []string{"pg-main"},
-				PG: &PGCap{
-					Databases: map[string]DBPermissions{
-						"app_db": {Permissions: []string{"INSERT ON public.users"}},
+				Backends: map[string]BackendCap{
+					"pg-main": {
+						PG: &PGCap{
+							Databases: map[string]DBPermissions{
+								"app_db": {Permissions: []string{"INSERT ON public.users"}},
+							},
+						},
 					},
 				},
 			},
 		},
 	}
 
-	dbPerms := DatabasePermissions(result, "app_db")
+	dbPerms := DatabasePermissions(result, "pg-main", "app_db")
 	if dbPerms == nil || len(dbPerms.Permissions) != 2 {
 		t.Errorf("expected 2 perms from merged rules, got: %v", dbPerms)
 	}
@@ -414,25 +447,31 @@ func TestDatabasePermissions_SQLFieldMerge(t *testing.T) {
 	result := &AuthResult{
 		MatchedRules: []CapRule{
 			{
-				Backends: []string{"pg-main"},
-				PG: &PGCap{
-					Databases: map[string]DBPermissions{
-						"app_db": {
-							Permissions: []string{"SELECT ON public.users"},
-							SQL:         []string{"GRANT USAGE ON SCHEMA analytics TO {{.Role}}"},
+				Backends: map[string]BackendCap{
+					"pg-main": {
+						PG: &PGCap{
+							Databases: map[string]DBPermissions{
+								"app_db": {
+									Permissions: []string{"SELECT ON public.users"},
+									SQL:         []string{"GRANT USAGE ON SCHEMA analytics TO {{.Role}}"},
+								},
+							},
 						},
 					},
 				},
 			},
 			{
-				Backends: []string{"pg-main"},
-				PG: &PGCap{
-					Databases: map[string]DBPermissions{
-						"app_db": {
-							SQL: []string{"ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO {{.Role}}"},
-						},
-						"*": {
-							SQL: []string{"GRANT USAGE ON SCHEMA public TO {{.Role}}"},
+				Backends: map[string]BackendCap{
+					"pg-main": {
+						PG: &PGCap{
+							Databases: map[string]DBPermissions{
+								"app_db": {
+									SQL: []string{"ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO {{.Role}}"},
+								},
+								"*": {
+									SQL: []string{"GRANT USAGE ON SCHEMA public TO {{.Role}}"},
+								},
+							},
 						},
 					},
 				},
@@ -440,7 +479,7 @@ func TestDatabasePermissions_SQLFieldMerge(t *testing.T) {
 		},
 	}
 
-	dbPerms := DatabasePermissions(result, "app_db")
+	dbPerms := DatabasePermissions(result, "pg-main", "app_db")
 	if dbPerms == nil {
 		t.Fatal("expected non-nil perms")
 	}
@@ -455,18 +494,21 @@ func TestDatabasePermissions_SQLFieldMerge(t *testing.T) {
 func TestDatabasePermissions_SQLOnlyAccess(t *testing.T) {
 	result := &AuthResult{
 		MatchedRules: []CapRule{{
-			Backends: []string{"pg-main"},
-			PG: &PGCap{
-				Databases: map[string]DBPermissions{
-					"app_db": {
-						SQL: []string{"GRANT SELECT ON public.users TO {{.Role}}"},
+			Backends: map[string]BackendCap{
+				"pg-main": {
+					PG: &PGCap{
+						Databases: map[string]DBPermissions{
+							"app_db": {
+								SQL: []string{"GRANT SELECT ON public.users TO {{.Role}}"},
+							},
+						},
 					},
 				},
 			},
 		}},
 	}
 
-	dbPerms := DatabasePermissions(result, "app_db")
+	dbPerms := DatabasePermissions(result, "pg-main", "app_db")
 	if dbPerms == nil {
 		t.Fatal("expected non-nil perms for SQL-only access")
 	}
@@ -480,16 +522,19 @@ func TestDatabasePermissions_SQLOnlyAccess(t *testing.T) {
 
 func TestMergeRules_MultipleDBs(t *testing.T) {
 	rules := []CapRule{{
-		Backends: []string{"pg-main"},
-		PG: &PGCap{
-			Databases: map[string]DBPermissions{
-				"db1": {Permissions: []string{"perm1"}},
-				"db2": {Permissions: []string{"perm2", "perm3"}},
+		Backends: map[string]BackendCap{
+			"pg-main": {
+				PG: &PGCap{
+					Databases: map[string]DBPermissions{
+						"db1": {Permissions: []string{"perm1"}},
+						"db2": {Permissions: []string{"perm2", "perm3"}},
+					},
+				},
 			},
 		},
 	}}
 
-	perms, _ := mergeRules(rules, rules[0].Backends[0])
+	perms, _ := mergeRules(rules, "pg-main")
 
 	if len(perms) != 3 {
 		t.Errorf("expected 3 total perms across all DBs, got %d: %v", len(perms), perms)
