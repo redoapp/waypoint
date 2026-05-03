@@ -52,11 +52,11 @@ func TestRedisStore_AncestorKeys(t *testing.T) {
 	if len(keys) != 2 {
 		t.Fatalf("expected 2 keys, got %d: %v", len(keys), keys)
 	}
-	if keys[0] != "wp:conns:alice/mongodb" {
-		t.Errorf("leaf key: expected wp:conns:alice/mongodb, got %q", keys[0])
+	if keys[0] != "wp:conns:{alice}/mongodb" {
+		t.Errorf("leaf key: expected wp:conns:{alice}/mongodb, got %q", keys[0])
 	}
-	if keys[1] != "wp:conns:alice" {
-		t.Errorf("root key: expected wp:conns:alice, got %q", keys[1])
+	if keys[1] != "wp:conns:{alice}" {
+		t.Errorf("root key: expected wp:conns:{alice}, got %q", keys[1])
 	}
 }
 
@@ -70,13 +70,13 @@ func TestRedisStore_AncestorKeys_ThreeLevels(t *testing.T) {
 	if len(keys) != 3 {
 		t.Fatalf("expected 3 keys, got %d: %v", len(keys), keys)
 	}
-	if keys[0] != "wp:conns:alice/mongodb/27017" {
+	if keys[0] != "wp:conns:{alice}/mongodb/27017" {
 		t.Errorf("leaf: got %q", keys[0])
 	}
-	if keys[1] != "wp:conns:alice/mongodb" {
+	if keys[1] != "wp:conns:{alice}/mongodb" {
 		t.Errorf("mid: got %q", keys[1])
 	}
-	if keys[2] != "wp:conns:alice" {
+	if keys[2] != "wp:conns:{alice}" {
 		t.Errorf("root: got %q", keys[2])
 	}
 }
@@ -166,10 +166,10 @@ func TestRedisStore_DecrConnsToZero_Cleanup(t *testing.T) {
 	store.DecrConns(ctx, "bob", "pg-main")
 
 	// Both leaf and root keys should be deleted at zero.
-	if mr.Exists("test:conns:bob/pg-main") {
+	if mr.Exists("test:conns:{bob}/pg-main") {
 		t.Error("expected leaf key to be deleted at zero")
 	}
-	if mr.Exists("test:conns:bob") {
+	if mr.Exists("test:conns:{bob}") {
 		t.Error("expected root key to be deleted at zero")
 	}
 }
@@ -238,7 +238,7 @@ func TestRedisStore_AddBytes_Hierarchical(t *testing.T) {
 
 	// Check root total via direct GET.
 	rdb := store.client
-	rootVal, err := rdb.Get(ctx, "test:bytes:alice").Int64()
+	rootVal, err := rdb.Get(ctx, "test:bytes:{alice}").Int64()
 	if err != nil {
 		t.Fatal(err)
 	}

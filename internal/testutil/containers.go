@@ -3,6 +3,7 @@ package testutil
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -19,6 +20,10 @@ var (
 	redisOnce   sync.Once
 	redisClient *redis.Client
 	redisErr    error
+
+	redisClusterOnce   sync.Once
+	redisClusterClient *redis.Client
+	redisClusterErr    error
 
 	pgOnce    sync.Once
 	pgConnStr string
@@ -87,6 +92,85 @@ func RedisClientRaw(t *testing.T) *redis.Client {
 		t.Fatal("RedisClientRaw called before RedisClient")
 	}
 	return redisClient
+}
+
+// RedisClusterClient starts a single-node Redis in cluster mode (once per test binary)
+// and returns a connected client. The server enforces cluster hash slot semantics,
+// so multi-key Lua scripts operating across different slots will fail with CROSSSLOT
+// errors — exactly like a production Redis Cluster would.
+func RedisClusterClient(t *testing.T) *redis.Client {
+	t.Helper()
+
+	redisClusterOnce.Do(func() {
+		ctx := context.Background()
+
+		container, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
+			ContainerRequest: testcontainers.ContainerRequest{
+				Image:        "redis:7-alpine",
+				ExposedPorts: []string{"6379/tcp"},
+				Cmd:          []string{"redis-server", "--cluster-enabled", "yes", "--cluster-config-file", "nodes.conf", "--cluster-node-timeout", "5000"},
+				WaitingFor:   wait.ForLog("Ready to accept connections").WithStartupTimeout(30 * time.Second),
+			},
+			Started: true,
+		})
+		if err != nil {
+			redisClusterErr = fmt.Errorf("start redis cluster container: %w", err)
+			return
+		}
+
+		host, err := container.Host(ctx)
+		if err != nil {
+			redisClusterErr = fmt.Errorf("redis cluster host: %w", err)
+			return
+		}
+
+		port, err := container.MappedPort(ctx, "6379/tcp")
+		if err != nil {
+			redisClusterErr = fmt.Errorf("redis cluster port: %w", err)
+			return
+		}
+
+		addr := fmt.Sprintf("%s:%s", host, port.Port())
+
+		// Assign all 16384 slots to this single node using ADDSLOTSRANGE (Redis 7+).
+		code, _, execErr := container.Exec(ctx, []string{
+			"redis-cli", "CLUSTER", "ADDSLOTSRANGE", "0", "16383",
+		})
+		if execErr != nil {
+			redisClusterErr = fmt.Errorf("redis cluster addslotsrange: %w", execErr)
+			return
+		}
+		if code != 0 {
+			redisClusterErr = fmt.Errorf("redis cluster addslotsrange: exit code %d", code)
+			return
+		}
+
+		// Wait for cluster to become ready.
+		redisClusterClient = redis.NewClient(&redis.Options{Addr: addr})
+		for i := 0; i < 30; i++ {
+			info, err := redisClusterClient.ClusterInfo(ctx).Result()
+			if err == nil && strings.Contains(info, "cluster_state:ok") {
+				break
+			}
+			time.Sleep(500 * time.Millisecond)
+		}
+
+		if err := redisClusterClient.Ping(ctx).Err(); err != nil {
+			redisClusterErr = fmt.Errorf("redis cluster ping: %w", err)
+			return
+		}
+	})
+
+	if redisClusterErr != nil {
+		t.Fatalf("redis cluster container: %v", redisClusterErr)
+	}
+
+	// Flush before each test for isolation.
+	if err := redisClusterClient.FlushAll(context.Background()).Err(); err != nil {
+		t.Fatalf("redis cluster flushall: %v", err)
+	}
+
+	return redisClusterClient
 }
 
 // PostgresBackend starts a shared PostgreSQL 16-alpine container (once per test binary)

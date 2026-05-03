@@ -17,7 +17,7 @@ func (s *Store) ListUsers(ctx context.Context) ([]UserStats, error) {
 
 	// Scan for connection keys: {prefix}conns:{user}
 	if err := s.scanKeys(ctx, s.keyPrefix+"conns:*", func(key string) error {
-		user := key[len(s.keyPrefix+"conns:"):]
+		user := stripHashTag(key[len(s.keyPrefix+"conns:"):])
 		val, err := s.client.Get(ctx, key).Int64()
 		if err != nil && err != redis.Nil {
 			return err
@@ -30,7 +30,7 @@ func (s *Store) ListUsers(ctx context.Context) ([]UserStats, error) {
 
 	// Scan for byte keys: {prefix}bytes:{user}
 	if err := s.scanKeys(ctx, s.keyPrefix+"bytes:*", func(key string) error {
-		user := key[len(s.keyPrefix+"bytes:"):]
+		user := stripHashTag(key[len(s.keyPrefix+"bytes:"):])
 		val, err := s.client.Get(ctx, key).Int64()
 		if err != nil && err != redis.Nil {
 			return err
@@ -41,16 +41,16 @@ func (s *Store) ListUsers(ctx context.Context) ([]UserStats, error) {
 		return nil, fmt.Errorf("scan bytes: %w", err)
 	}
 
-	// Scan for bandwidth keys: {prefix}bw:{user}:{periodSecs}
+	// Scan for bandwidth keys: {prefix}bw:{periodSecs}:{user}
 	if err := s.scanKeys(ctx, s.keyPrefix+"bw:*", func(key string) error {
-		// Parse: {prefix}bw:{user}:{periodSecs}
+		// Parse: {prefix}bw:{periodSecs}:{user}
 		rest := key[len(s.keyPrefix+"bw:"):]
-		lastColon := strings.LastIndex(rest, ":")
-		if lastColon < 0 {
+		firstColon := strings.Index(rest, ":")
+		if firstColon < 0 {
 			return nil
 		}
-		user := rest[:lastColon]
-		periodStr := rest[lastColon+1:]
+		periodStr := rest[:firstColon]
+		user := stripHashTag(rest[firstColon+1:])
 		periodSecs, err := strconv.ParseInt(periodStr, 10, 64)
 		if err != nil {
 			return nil
@@ -91,23 +91,27 @@ func (s *Store) GetUserStats(ctx context.Context, user string) (*UserStats, erro
 	stats := &UserStats{LoginName: user}
 
 	// Connections.
-	val, err := s.client.Get(ctx, s.keyPrefix+"conns:"+user).Int64()
+	val, err := s.client.Get(ctx, s.keyPrefix+"conns:{"+user+"}").Int64()
 	if err != nil && err != redis.Nil {
 		return nil, err
 	}
 	stats.ActiveConns = val
 
 	// Bytes.
-	val, err = s.client.Get(ctx, s.keyPrefix+"bytes:"+user).Int64()
+	val, err = s.client.Get(ctx, s.keyPrefix+"bytes:{"+user+"}").Int64()
 	if err != nil && err != redis.Nil {
 		return nil, err
 	}
 	stats.TotalBytes = val
 
-	// Bandwidth: scan for all periods.
-	if err := s.scanKeys(ctx, s.keyPrefix+"bw:"+user+":*", func(key string) error {
-		rest := key[len(s.keyPrefix+"bw:"+user+":"):]
-		periodSecs, err := strconv.ParseInt(rest, 10, 64)
+	// Bandwidth: scan for all periods (keys are bw:{period}:{user}).
+	if err := s.scanKeys(ctx, s.keyPrefix+"bw:*:{"+user+"}", func(key string) error {
+		rest := key[len(s.keyPrefix+"bw:"):]
+		firstColon := strings.Index(rest, ":")
+		if firstColon < 0 {
+			return nil
+		}
+		periodSecs, err := strconv.ParseInt(rest[:firstColon], 10, 64)
 		if err != nil {
 			return nil
 		}
@@ -133,28 +137,28 @@ func (s *Store) GetUserStats(ctx context.Context, user string) (*UserStats, erro
 
 // ResetConns resets the connection count for a user.
 func (s *Store) ResetConns(ctx context.Context, user string) error {
-	return s.client.Del(ctx, s.keyPrefix+"conns:"+user).Err()
+	return s.client.Del(ctx, s.keyPrefix+"conns:{"+user+"}").Err()
 }
 
 // ResetBytes resets the total byte count for a user.
 func (s *Store) ResetBytes(ctx context.Context, user string) error {
-	return s.client.Del(ctx, s.keyPrefix+"bytes:"+user).Err()
+	return s.client.Del(ctx, s.keyPrefix+"bytes:{"+user+"}").Err()
 }
 
 // ResetBandwidth resets bandwidth for a specific period.
 func (s *Store) ResetBandwidth(ctx context.Context, user string, periodSecs int64) error {
-	key := fmt.Sprintf("%sbw:%s:%d", s.keyPrefix, user, periodSecs)
+	key := fmt.Sprintf("%sbw:%d:{%s}", s.keyPrefix, periodSecs, user)
 	return s.client.Del(ctx, key).Err()
 }
 
 // ResetAll resets all limits for a user.
 func (s *Store) ResetAll(ctx context.Context, user string) error {
 	// Delete conns and bytes keys directly.
-	s.client.Del(ctx, s.keyPrefix+"conns:"+user)
-	s.client.Del(ctx, s.keyPrefix+"bytes:"+user)
+	s.client.Del(ctx, s.keyPrefix+"conns:{"+user+"}")
+	s.client.Del(ctx, s.keyPrefix+"bytes:{"+user+"}")
 
 	// Scan and delete all bandwidth keys.
-	return s.scanKeys(ctx, s.keyPrefix+"bw:"+user+":*", func(key string) error {
+	return s.scanKeys(ctx, s.keyPrefix+"bw:*:{"+user+"}", func(key string) error {
 		return s.client.Del(ctx, key).Err()
 	})
 }
@@ -206,6 +210,17 @@ func (s *Store) readBandwidth(ctx context.Context, key string, period time.Durat
 		return 0, nil
 	}
 	return val, err
+}
+
+// stripHashTag removes Redis hash tag braces from a key segment.
+// e.g. "{alice}" → "alice", "{alice}/scope" → "alice/scope".
+func stripHashTag(s string) string {
+	if len(s) > 0 && s[0] == '{' {
+		if end := strings.Index(s, "}"); end >= 0 {
+			return s[1:end] + s[end+1:]
+		}
+	}
+	return s
 }
 
 func formatDuration(d time.Duration) string {

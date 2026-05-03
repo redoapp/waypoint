@@ -172,3 +172,93 @@ func TestIntegration_RedisStore_TouchAndGetLastUsed(t *testing.T) {
 		t.Fatalf("expected zero time for nonexistent, got %v", ts)
 	}
 }
+
+// Redis Cluster tests — these catch CROSSSLOT regressions.
+// Without hash tags on keys, the hierarchical Lua scripts would fail
+// with "CROSSSLOT Keys in request don't hash to the same slot".
+
+func TestIntegration_RedisCluster_IncrDecrConns(t *testing.T) {
+	rdb := testutil.RedisClusterClient(t)
+	store := restrict.NewRedisStore(rdb, "clustertest:", metrics.Noop())
+	ctx := context.Background()
+
+	count, err := store.IncrConns(ctx, "alice", "test-listener")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("expected 1, got %d", count)
+	}
+
+	count, err = store.IncrConns(ctx, "alice", "test-listener")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 2 {
+		t.Fatalf("expected 2, got %d", count)
+	}
+
+	if err := store.DecrConns(ctx, "alice", "test-listener"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.GetConns(ctx, "alice", "test-listener")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != 1 {
+		t.Fatalf("expected 1 after decr, got %d", got)
+	}
+}
+
+func TestIntegration_RedisCluster_AddBytes(t *testing.T) {
+	rdb := testutil.RedisClusterClient(t)
+	store := restrict.NewRedisStore(rdb, "clustertest:", metrics.Noop())
+	ctx := context.Background()
+
+	total, err := store.AddBytes(ctx, "alice", "test-listener", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 100 {
+		t.Fatalf("expected 100, got %d", total)
+	}
+
+	total, err = store.AddBytes(ctx, "alice", "test-listener", 250)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 350 {
+		t.Fatalf("expected 350, got %d", total)
+	}
+}
+
+func TestIntegration_RedisCluster_BandwidthSlidingWindow(t *testing.T) {
+	rdb := testutil.RedisClusterClient(t)
+	store := restrict.NewRedisStore(rdb, "clustertest:", metrics.Noop())
+	ctx := context.Background()
+	tiers := []auth.BandwidthTier{{Bytes: 100000, Period: time.Hour}}
+
+	result, err := store.AddBandwidthBytesMulti(ctx, "alice", "test-listener", 500, tiers)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Exceeded {
+		t.Fatal("did not expect limit exceeded")
+	}
+
+	result, err = store.AddBandwidthBytesMulti(ctx, "alice", "test-listener", 300, tiers)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Exceeded {
+		t.Fatal("did not expect limit exceeded")
+	}
+
+	got, err := store.GetBandwidthBytes(ctx, "alice", "test-listener", time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != 800 {
+		t.Fatalf("expected 800 from get, got %d", got)
+	}
+}

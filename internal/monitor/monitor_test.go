@@ -59,12 +59,12 @@ func TestResetBandwidth(t *testing.T) {
 	mr, store := setupTest(t)
 	ctx := context.Background()
 
-	mr.HSet("wp:bw:alice@example.com:3600", "100", "5000")
+	mr.HSet("wp:bw:3600:{alice@example.com}", "100", "5000")
 
 	if err := store.ResetBandwidth(ctx, "alice@example.com", 3600); err != nil {
 		t.Fatal(err)
 	}
-	if mr.Exists("wp:bw:alice@example.com:3600") {
+	if mr.Exists("wp:bw:3600:{alice@example.com}") {
 		t.Error("bandwidth key should be deleted")
 	}
 }
@@ -73,21 +73,21 @@ func TestResetAll_WithBandwidth(t *testing.T) {
 	mr, store := setupTest(t)
 	ctx := context.Background()
 
-	mr.Set("wp:conns:alice@example.com", "5")
-	mr.Set("wp:bytes:alice@example.com", "999999")
-	mr.HSet("wp:bw:alice@example.com:3600", "100", "5000")
+	mr.Set("wp:conns:{alice@example.com}", "5")
+	mr.Set("wp:bytes:{alice@example.com}", "999999")
+	mr.HSet("wp:bw:3600:{alice@example.com}", "100", "5000")
 
 	if err := store.ResetAll(ctx, "alice@example.com"); err != nil {
 		t.Fatal(err)
 	}
 
-	if mr.Exists("wp:conns:alice@example.com") {
+	if mr.Exists("wp:conns:{alice@example.com}") {
 		t.Error("conns key should be deleted")
 	}
-	if mr.Exists("wp:bytes:alice@example.com") {
+	if mr.Exists("wp:bytes:{alice@example.com}") {
 		t.Error("bytes key should be deleted")
 	}
-	if mr.Exists("wp:bw:alice@example.com:3600") {
+	if mr.Exists("wp:bw:3600:{alice@example.com}") {
 		t.Error("bandwidth key should be deleted")
 	}
 }
@@ -96,14 +96,14 @@ func TestGetUserStats_WithBandwidth(t *testing.T) {
 	mr, store := setupTest(t)
 	ctx := context.Background()
 
-	mr.Set("wp:conns:alice@example.com", "2")
-	mr.Set("wp:bytes:alice@example.com", "10000")
+	mr.Set("wp:conns:{alice@example.com}", "2")
+	mr.Set("wp:bytes:{alice@example.com}", "10000")
 
 	// Set up bandwidth hash with a bucket that falls within the sliding window.
 	now := time.Now().Unix()
 	bSize := int64(10) // for 3600s period: 3600/360 = 10
 	currentBucket := now / bSize
-	mr.HSet("wp:bw:alice@example.com:3600",
+	mr.HSet("wp:bw:3600:{alice@example.com}",
 		strconv.FormatInt(currentBucket, 10), "5000",
 		strconv.FormatInt(currentBucket-1, 10), "3000",
 	)
@@ -139,14 +139,14 @@ func TestGetUserStats_MultiplePeriods(t *testing.T) {
 	// 1h period: bSize = 3600/360 = 10
 	bSize1h := int64(10)
 	bucket1h := now / bSize1h
-	mr.HSet("wp:bw:alice@example.com:3600",
+	mr.HSet("wp:bw:3600:{alice@example.com}",
 		strconv.FormatInt(bucket1h, 10), "1000",
 	)
 
 	// 1d period: bSize = 86400/360 = 240
 	bSize1d := int64(240)
 	bucket1d := now / bSize1d
-	mr.HSet("wp:bw:alice@example.com:86400",
+	mr.HSet("wp:bw:86400:{alice@example.com}",
 		strconv.FormatInt(bucket1d, 10), "9000",
 	)
 
@@ -176,17 +176,17 @@ func TestListUsers_WithBandwidth(t *testing.T) {
 	mr, store := setupTest(t)
 	ctx := context.Background()
 
-	mr.Set("wp:conns:alice@example.com", "1")
-	mr.Set("wp:conns:bob@example.com", "2")
+	mr.Set("wp:conns:{alice@example.com}", "1")
+	mr.Set("wp:conns:{bob@example.com}", "2")
 
 	now := time.Now().Unix()
 	bSize := int64(10)
 	bucket := now / bSize
 
-	mr.HSet("wp:bw:alice@example.com:3600",
+	mr.HSet("wp:bw:3600:{alice@example.com}",
 		strconv.FormatInt(bucket, 10), "4000",
 	)
-	mr.HSet("wp:bw:bob@example.com:3600",
+	mr.HSet("wp:bw:3600:{bob@example.com}",
 		strconv.FormatInt(bucket, 10), "6000",
 	)
 
@@ -269,9 +269,9 @@ func TestListUsers(t *testing.T) {
 	mr, store := setupTest(t)
 	ctx := context.Background()
 
-	mr.Set("wp:conns:alice@example.com", "2")
-	mr.Set("wp:bytes:alice@example.com", "500000")
-	mr.Set("wp:conns:bob@example.com", "1")
+	mr.Set("wp:conns:{alice@example.com}", "2")
+	mr.Set("wp:bytes:{alice@example.com}", "500000")
+	mr.Set("wp:conns:{bob@example.com}", "1")
 
 	users, err := store.ListUsers(ctx)
 	if err != nil {
@@ -300,13 +300,13 @@ func TestResetConns(t *testing.T) {
 	mr, store := setupTest(t)
 	ctx := context.Background()
 
-	mr.Set("wp:conns:alice@example.com", "5")
+	mr.Set("wp:conns:{alice@example.com}", "5")
 
 	if err := store.ResetConns(ctx, "alice@example.com"); err != nil {
 		t.Fatal(err)
 	}
 
-	if mr.Exists("wp:conns:alice@example.com") {
+	if mr.Exists("wp:conns:{alice@example.com}") {
 		t.Error("conns key should be deleted")
 	}
 }
@@ -315,13 +315,13 @@ func TestResetBytes(t *testing.T) {
 	mr, store := setupTest(t)
 	ctx := context.Background()
 
-	mr.Set("wp:bytes:alice@example.com", "999999")
+	mr.Set("wp:bytes:{alice@example.com}", "999999")
 
 	if err := store.ResetBytes(ctx, "alice@example.com"); err != nil {
 		t.Fatal(err)
 	}
 
-	if mr.Exists("wp:bytes:alice@example.com") {
+	if mr.Exists("wp:bytes:{alice@example.com}") {
 		t.Error("bytes key should be deleted")
 	}
 }
@@ -330,17 +330,17 @@ func TestResetAll(t *testing.T) {
 	mr, store := setupTest(t)
 	ctx := context.Background()
 
-	mr.Set("wp:conns:alice@example.com", "5")
-	mr.Set("wp:bytes:alice@example.com", "999999")
+	mr.Set("wp:conns:{alice@example.com}", "5")
+	mr.Set("wp:bytes:{alice@example.com}", "999999")
 
 	if err := store.ResetAll(ctx, "alice@example.com"); err != nil {
 		t.Fatal(err)
 	}
 
-	if mr.Exists("wp:conns:alice@example.com") {
+	if mr.Exists("wp:conns:{alice@example.com}") {
 		t.Error("conns key should be deleted")
 	}
-	if mr.Exists("wp:bytes:alice@example.com") {
+	if mr.Exists("wp:bytes:{alice@example.com}") {
 		t.Error("bytes key should be deleted")
 	}
 }
@@ -349,8 +349,8 @@ func TestGetUserStats(t *testing.T) {
 	mr, store := setupTest(t)
 	ctx := context.Background()
 
-	mr.Set("wp:conns:alice@example.com", "3")
-	mr.Set("wp:bytes:alice@example.com", "12345")
+	mr.Set("wp:conns:{alice@example.com}", "3")
+	mr.Set("wp:bytes:{alice@example.com}", "12345")
 
 	stats, err := store.GetUserStats(ctx, "alice@example.com")
 	if err != nil {

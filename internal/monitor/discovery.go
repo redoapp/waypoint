@@ -10,12 +10,12 @@ import (
 
 // Store provides access to Redis for the monitor.
 type Store struct {
-	client    *redis.Client
+	client    redis.UniversalClient
 	keyPrefix string
 }
 
 // NewStore creates a new monitor store.
-func NewStore(client *redis.Client, keyPrefix string) *Store {
+func NewStore(client redis.UniversalClient, keyPrefix string) *Store {
 	if keyPrefix == "" {
 		keyPrefix = "waypoint:"
 	}

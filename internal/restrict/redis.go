@@ -17,7 +17,7 @@ import (
 
 // RedisStore manages per-user counters in Redis.
 type RedisStore struct {
-	client    *redis.Client
+	client    redis.UniversalClient
 	keyPrefix string
 	metrics   *metrics.Metrics
 	// nowFunc allows tests to override time.Now for sliding window calculations.
@@ -25,7 +25,7 @@ type RedisStore struct {
 }
 
 // NewRedisStore creates a new Redis-backed counter store.
-func NewRedisStore(client *redis.Client, keyPrefix string, m *metrics.Metrics) *RedisStore {
+func NewRedisStore(client redis.UniversalClient, keyPrefix string, m *metrics.Metrics) *RedisStore {
 	if keyPrefix == "" {
 		keyPrefix = "waypoint:"
 	}
@@ -61,15 +61,20 @@ func (s *RedisStore) key(parts ...string) string {
 
 // ancestorKeys builds Redis keys from leaf to root for hierarchical operations.
 // The metric prefix (e.g., "conns") is joined with ":" while path segments
-// (user, scope) are joined with "/".
+// (user, scope) are joined with "/". The first segment (user) is wrapped in
+// Redis hash tags {user} so all keys for the same user map to the same
+// cluster hash slot, avoiding CROSSSLOT errors in Lua scripts.
 //
 // Example: ancestorKeys("conns", "alice", "mongodb")
 //
-//	→ ["waypoint:conns:alice/mongodb", "waypoint:conns:alice"]
+//	→ ["waypoint:conns:{alice}/mongodb", "waypoint:conns:{alice}"]
 func (s *RedisStore) ancestorKeys(metric string, segments ...string) []string {
 	keys := make([]string, len(segments))
 	for i := range segments {
-		path := strings.Join(segments[:len(segments)-i], "/")
+		parts := make([]string, len(segments)-i)
+		copy(parts, segments[:len(segments)-i])
+		parts[0] = "{" + parts[0] + "}"
+		path := strings.Join(parts, "/")
 		keys[i] = s.keyPrefix + metric + ":" + path
 	}
 	return keys
@@ -182,9 +187,9 @@ func (s *RedisStore) GetConns(ctx context.Context, user, scope string) (int64, e
 	start := time.Now()
 	var k string
 	if scope == "" {
-		k = s.keyPrefix + "conns:" + user
+		k = s.keyPrefix + "conns:{" + user + "}"
 	} else {
-		k = s.keyPrefix + "conns:" + user + "/" + scope
+		k = s.keyPrefix + "conns:{" + user + "}/" + scope
 	}
 	val, err := s.client.Get(ctx, k).Int64()
 	if err == redis.Nil {
@@ -338,9 +343,9 @@ func (s *RedisStore) GetBandwidthBytes(ctx context.Context, user, scope string, 
 
 	var hashKey string
 	if scope == "" {
-		hashKey = s.keyPrefix + fmt.Sprintf("bw:%d:", periodSecs) + user
+		hashKey = s.keyPrefix + fmt.Sprintf("bw:%d:", periodSecs) + "{" + user + "}"
 	} else {
-		hashKey = s.keyPrefix + fmt.Sprintf("bw:%d:", periodSecs) + user + "/" + scope
+		hashKey = s.keyPrefix + fmt.Sprintf("bw:%d:", periodSecs) + "{" + user + "}/" + scope
 	}
 
 	val, err := slidingWindowReadScript.Run(ctx, s.client, []string{hashKey}, minBucket).Int64()
