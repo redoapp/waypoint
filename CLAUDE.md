@@ -46,6 +46,12 @@ coverage-serve    # serve HTML report on :8080
 
 Integration and E2E tests are gated behind the `integration` build tag. Ryuk (testcontainers reaper) is disabled via env var for rootless Podman compatibility.
 
+**Important:** When changing function signatures or interfaces in any package, always build and verify with `-tags integration` to catch integration test breakage. These files are invisible to `go test ./...` without the tag. Run at minimum:
+
+```sh
+go build -tags integration ./...
+```
+
 ## Lint
 
 ```sh
