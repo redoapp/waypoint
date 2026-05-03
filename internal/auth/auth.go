@@ -33,6 +33,19 @@ type BandwidthTier struct {
 
 // MergedLimits holds the resolved limits after merging all matching rules.
 type MergedLimits struct {
+	// Per-user (global) limits — checked against root key (waypoint:conns:<user>).
+	MaxConns        int
+	MaxBytesPerConn int64
+	MaxConnDuration time.Duration
+	BandwidthTiers  []BandwidthTier
+
+	// Per-endpoint limits — checked against leaf key (waypoint:conns:<user>/<listener>).
+	// Nil means no endpoint-specific limits (only global apply).
+	Endpoint *EndpointLimits
+}
+
+// EndpointLimits holds per-endpoint restriction overrides.
+type EndpointLimits struct {
 	MaxConns        int
 	MaxBytesPerConn int64
 	MaxConnDuration time.Duration
@@ -135,7 +148,7 @@ func Authorize(ctx context.Context, lc *local.Client, remoteAddr string, backend
 		)
 	}
 
-	perms, limits := mergeRules(matched)
+	perms, limits := mergeRules(matched, backend)
 
 	logger.Debug("capability rules matched",
 		"rules_matched", len(matched),
@@ -219,7 +232,8 @@ func DatabasePermissions(result *AuthResult, database string) *DBPermissions {
 }
 
 // mergeRules collects all permissions and picks the most restrictive limits.
-func mergeRules(rules []CapRule) ([]string, MergedLimits) {
+// backend is used to look up per-endpoint limits from EndpointLimits maps.
+func mergeRules(rules []CapRule, backend string) ([]string, MergedLimits) {
 	var perms []string
 	var limits MergedLimits
 
@@ -232,9 +246,53 @@ func mergeRules(rules []CapRule) ([]string, MergedLimits) {
 		if r.Limits != nil {
 			mergeLimits(&limits, r.Limits)
 		}
+		if ep, ok := r.EndpointLimits[backend]; ok && ep != nil {
+			if limits.Endpoint == nil {
+				limits.Endpoint = &EndpointLimits{}
+			}
+			mergeEndpointLimits(limits.Endpoint, ep)
+		}
 	}
 
 	return perms, limits
+}
+
+// mergeEndpointLimits applies the most restrictive values from cap into endpoint limits.
+func mergeEndpointLimits(merged *EndpointLimits, cap *LimitsCap) {
+	if cap.MaxConns > 0 && (merged.MaxConns == 0 || cap.MaxConns < merged.MaxConns) {
+		merged.MaxConns = cap.MaxConns
+	}
+	if cap.MaxBytesPerConn > 0 && (merged.MaxBytesPerConn == 0 || cap.MaxBytesPerConn < merged.MaxBytesPerConn) {
+		merged.MaxBytesPerConn = cap.MaxBytesPerConn
+	}
+	if cap.MaxConnDuration != "" {
+		d, err := time.ParseDuration(cap.MaxConnDuration)
+		if err == nil && d > 0 && (merged.MaxConnDuration == 0 || d < merged.MaxConnDuration) {
+			merged.MaxConnDuration = d
+		}
+	}
+	for _, bw := range cap.Bandwidth {
+		period, err := time.ParseDuration(bw.Period)
+		if err != nil || bw.Bytes <= 0 || period <= 0 {
+			continue
+		}
+		found := false
+		for i := range merged.BandwidthTiers {
+			if merged.BandwidthTiers[i].Period == period {
+				if bw.Bytes < merged.BandwidthTiers[i].Bytes {
+					merged.BandwidthTiers[i].Bytes = bw.Bytes
+				}
+				found = true
+				break
+			}
+		}
+		if !found {
+			merged.BandwidthTiers = append(merged.BandwidthTiers, BandwidthTier{
+				Bytes:  bw.Bytes,
+				Period: period,
+			})
+		}
+	}
 }
 
 // mergeLimits applies the most restrictive values from cap into merged.

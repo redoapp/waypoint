@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -66,6 +67,38 @@ type ListenerConfig struct {
 	BackendTLS          bool           `toml:"tls"`
 	Service             string         `toml:"service"`
 	Postgres            *PostgresAdmin `toml:"postgres"`
+	PortMap             map[int]int    `toml:"port_map,omitempty"`
+}
+
+// BackendPair holds a resolved listen address and backend address.
+type BackendPair struct {
+	Listen  string
+	Backend string
+}
+
+// ExpandedBackends returns (listenAddr, backendAddr) pairs.
+// For single-port listeners, returns one pair using Listen and Backend directly.
+// For multi-port listeners (PortMap set), returns one pair per mapping,
+// sorted by listen port for deterministic ordering.
+func (l *ListenerConfig) ExpandedBackends() []BackendPair {
+	if len(l.PortMap) == 0 {
+		return []BackendPair{{Listen: l.Listen, Backend: l.Backend}}
+	}
+
+	// Extract bind host from Listen field (e.g., "0.0.0.0" → "0.0.0.0", "" → "").
+	bindHost := l.Listen
+
+	pairs := make([]BackendPair, 0, len(l.PortMap))
+	for listenPort, backendPort := range l.PortMap {
+		pairs = append(pairs, BackendPair{
+			Listen:  net.JoinHostPort(bindHost, strconv.Itoa(listenPort)),
+			Backend: net.JoinHostPort(l.Backend, strconv.Itoa(backendPort)),
+		})
+	}
+	sort.Slice(pairs, func(i, j int) bool {
+		return pairs[i].Listen < pairs[j].Listen
+	})
+	return pairs
 }
 
 // ListenPort extracts the numeric port from the Listen address (e.g. ":5432" → 5432).
@@ -146,6 +179,7 @@ func validate(cfg *Config) error {
 		return fmt.Errorf("at least one [[listeners]] is required")
 	}
 	names := make(map[string]bool)
+	listenAddrs := make(map[string]string) // listen addr → listener name (for collision detection)
 	for i, l := range cfg.Listeners {
 		if l.Name == "" {
 			return fmt.Errorf("listeners[%d].name is required", i)
@@ -154,9 +188,7 @@ func validate(cfg *Config) error {
 			return fmt.Errorf("duplicate listener name %q", l.Name)
 		}
 		names[l.Name] = true
-		if l.Listen == "" {
-			return fmt.Errorf("listeners[%d].listen is required", i)
-		}
+
 		mode := strings.ToLower(l.Mode)
 		if mode != "tcp" && mode != "postgres" {
 			return fmt.Errorf("listeners[%d].mode must be 'tcp' or 'postgres', got %q", i, l.Mode)
@@ -164,6 +196,45 @@ func validate(cfg *Config) error {
 		if l.Backend == "" {
 			return fmt.Errorf("listeners[%d].backend is required", i)
 		}
+
+		hasPortMap := len(l.PortMap) > 0
+
+		if hasPortMap {
+			if mode != "tcp" {
+				return fmt.Errorf("listeners[%d]: port_map is only supported for mode \"tcp\", got %q", i, l.Mode)
+			}
+			// Backend must be a host without port when port_map is set.
+			if _, _, err := net.SplitHostPort(l.Backend); err == nil {
+				return fmt.Errorf("listeners[%d]: backend must be a hostname without port when port_map is set (got %q)", i, l.Backend)
+			}
+			// Listen field (if set) must be a bind host without port.
+			if l.Listen != "" {
+				if _, _, err := net.SplitHostPort(l.Listen); err == nil {
+					return fmt.Errorf("listeners[%d]: listen must be a bind host without port when port_map is set, or omit it", i)
+				}
+			}
+			for lp, bp := range l.PortMap {
+				if lp < 1 || lp > 65535 {
+					return fmt.Errorf("listeners[%d]: invalid listen port %d in port_map", i, lp)
+				}
+				if bp < 1 || bp > 65535 {
+					return fmt.Errorf("listeners[%d]: invalid backend port %d in port_map", i, bp)
+				}
+			}
+		} else {
+			if l.Listen == "" {
+				return fmt.Errorf("listeners[%d].listen is required", i)
+			}
+		}
+
+		// Check for listen address collisions across all listeners.
+		for _, be := range l.ExpandedBackends() {
+			if existing, ok := listenAddrs[be.Listen]; ok {
+				return fmt.Errorf("listeners[%d] (%q): listen address %q conflicts with listener %q", i, l.Name, be.Listen, existing)
+			}
+			listenAddrs[be.Listen] = l.Name
+		}
+
 		if l.Service != "" && !strings.HasPrefix(l.Service, "svc:") {
 			return fmt.Errorf("listeners[%d].service must start with \"svc:\", got %q", i, l.Service)
 		}

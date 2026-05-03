@@ -3,6 +3,7 @@ package restrict
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -58,38 +59,134 @@ func (s *RedisStore) key(parts ...string) string {
 	return k[:len(k)-1] // trim trailing colon
 }
 
-// IncrConns atomically increments the connection count for a user.
-// Returns the new count.
-func (s *RedisStore) IncrConns(ctx context.Context, user string) (int64, error) {
+// ancestorKeys builds Redis keys from leaf to root for hierarchical operations.
+// The metric prefix (e.g., "conns") is joined with ":" while path segments
+// (user, scope) are joined with "/".
+//
+// Example: ancestorKeys("conns", "alice", "mongodb")
+//
+//	→ ["waypoint:conns:alice/mongodb", "waypoint:conns:alice"]
+func (s *RedisStore) ancestorKeys(metric string, segments ...string) []string {
+	keys := make([]string, len(segments))
+	for i := range segments {
+		path := strings.Join(segments[:len(segments)-i], "/")
+		keys[i] = s.keyPrefix + metric + ":" + path
+	}
+	return keys
+}
+
+// hierarchicalIncrScript atomically increments all ancestor keys.
+// KEYS[1..N] = ancestor keys (leaf first, root last)
+// ARGV[1]    = value to add
+// Returns: leaf value after increment
+var hierarchicalIncrScript = redis.NewScript(`
+local val = tonumber(ARGV[1])
+for i = 1, #KEYS do
+    redis.call('INCRBY', KEYS[i], val)
+end
+return tonumber(redis.call('GET', KEYS[1]))
+`)
+
+// hierarchicalDecrScript atomically decrements all ancestor keys.
+// Cleans up zero/negative keys.
+// KEYS[1..N] = ancestor keys (leaf first, root last)
+// ARGV[1]    = value to subtract
+var hierarchicalDecrScript = redis.NewScript(`
+local val = tonumber(ARGV[1])
+for i = 1, #KEYS do
+    local n = redis.call('DECRBY', KEYS[i], val)
+    if n <= 0 then redis.call('DEL', KEYS[i]) end
+end
+`)
+
+// hierarchicalSlidingWindowScript runs the sliding window on all ancestor keys.
+// KEYS[1..N] = ancestor hash keys (leaf first, root last)
+// ARGV[1]    = bytes to add
+// ARGV[2]    = current sub-bucket ID
+// ARGV[3]    = minimum valid sub-bucket ID
+// ARGV[4]    = key TTL in seconds
+// Returns: leaf total (for enforcement)
+var hierarchicalSlidingWindowScript = redis.NewScript(`
+local bytes_to_add = tonumber(ARGV[1])
+local sub_bucket = ARGV[2]
+local min_bucket = tonumber(ARGV[3])
+local ttl = tonumber(ARGV[4])
+local leaf_total = 0
+
+for i = 1, #KEYS do
+    redis.call('HINCRBY', KEYS[i], sub_bucket, bytes_to_add)
+    redis.call('EXPIRE', KEYS[i], ttl)
+
+    local all = redis.call('HGETALL', KEYS[i])
+    local total = 0
+    local expired = {}
+    for j = 1, #all, 2 do
+        local bucket_id = tonumber(all[j])
+        if bucket_id >= min_bucket then
+            total = total + tonumber(all[j + 1])
+        else
+            expired[#expired + 1] = all[j]
+        end
+    end
+    if #expired > 0 then
+        redis.call('HDEL', KEYS[i], unpack(expired))
+    end
+    if i == 1 then leaf_total = total end
+end
+
+return leaf_total
+`)
+
+// hierarchicalAddScript atomically adds to byte totals at all ancestor levels.
+// KEYS[1..N] = ancestor keys (leaf first, root last)
+// ARGV[1]    = bytes to add
+// Returns: leaf value
+var hierarchicalAddScript = redis.NewScript(`
+local val = tonumber(ARGV[1])
+for i = 1, #KEYS do
+    redis.call('INCRBY', KEYS[i], val)
+end
+return tonumber(redis.call('GET', KEYS[1]))
+`)
+
+// IncrConns atomically increments the connection count for a user/scope,
+// cascading the increment up to the user-level total.
+// Returns the new leaf (scoped) count.
+func (s *RedisStore) IncrConns(ctx context.Context, user, scope string) (int64, error) {
 	ctx, span := s.startOp(ctx, "incr_conns")
 	start := time.Now()
-	val, err := s.client.Incr(ctx, s.key("conns", user)).Result()
+	keys := s.ancestorKeys("conns", user, scope)
+	val, err := hierarchicalIncrScript.Run(ctx, s.client, keys, 1).Int64()
 	s.recordOp(ctx, span, "incr_conns", start, err)
 	return val, err
 }
 
-// DecrConns decrements the connection count for a user.
-func (s *RedisStore) DecrConns(ctx context.Context, user string) error {
+// DecrConns decrements the connection count for a user/scope,
+// cascading the decrement up to the user-level total.
+func (s *RedisStore) DecrConns(ctx context.Context, user, scope string) error {
 	ctx, span := s.startOp(ctx, "decr_conns")
 	start := time.Now()
-	k := s.key("conns", user)
-	val, err := s.client.Decr(ctx, k).Result()
+	keys := s.ancestorKeys("conns", user, scope)
+	err := hierarchicalDecrScript.Run(ctx, s.client, keys, 1).Err()
+	if err == redis.Nil {
+		err = nil // script returns nil when keys don't exist
+	}
 	s.recordOp(ctx, span, "decr_conns", start, err)
-	if err != nil {
-		return err
-	}
-	// Clean up if zero or negative.
-	if val <= 0 {
-		s.client.Del(ctx, k)
-	}
-	return nil
+	return err
 }
 
-// GetConns returns the current connection count for a user.
-func (s *RedisStore) GetConns(ctx context.Context, user string) (int64, error) {
+// GetConns returns the current connection count at a specific scope level.
+// Pass scope="" to read the user-level total, or a listener name for per-endpoint.
+func (s *RedisStore) GetConns(ctx context.Context, user, scope string) (int64, error) {
 	ctx, span := s.startOp(ctx, "get_conns")
 	start := time.Now()
-	val, err := s.client.Get(ctx, s.key("conns", user)).Int64()
+	var k string
+	if scope == "" {
+		k = s.keyPrefix + "conns:" + user
+	} else {
+		k = s.keyPrefix + "conns:" + user + "/" + scope
+	}
+	val, err := s.client.Get(ctx, k).Int64()
 	if err == redis.Nil {
 		s.recordOp(ctx, span, "get_conns", start, nil)
 		return 0, nil
@@ -98,11 +195,12 @@ func (s *RedisStore) GetConns(ctx context.Context, user string) (int64, error) {
 	return val, err
 }
 
-// AddBytes adds to the total byte count for a user. Used for per-user aggregate tracking.
-func (s *RedisStore) AddBytes(ctx context.Context, user string, n int64) (int64, error) {
+// AddBytes adds to the total byte count, cascading up from scope to user total.
+func (s *RedisStore) AddBytes(ctx context.Context, user, scope string, n int64) (int64, error) {
 	ctx, span := s.startOp(ctx, "add_bytes")
 	start := time.Now()
-	val, err := s.client.IncrBy(ctx, s.key("bytes", user), n).Result()
+	keys := s.ancestorKeys("bytes", user, scope)
+	val, err := hierarchicalAddScript.Run(ctx, s.client, keys, n).Int64()
 	s.recordOp(ctx, span, "add_bytes", start, err)
 	return val, err
 }
@@ -187,9 +285,10 @@ type BandwidthResult struct {
 	ExceededTier int
 }
 
-// AddBandwidthBytesMulti adds bytes to all bandwidth tiers using the sliding window.
-// It iterates per-tier (not atomic across tiers). Returns which tier was exceeded, if any.
-func (s *RedisStore) AddBandwidthBytesMulti(ctx context.Context, user string, n int64, tiers []auth.BandwidthTier) (BandwidthResult, error) {
+// AddBandwidthBytesMulti adds bytes to all bandwidth tiers using the hierarchical sliding window.
+// Writes cascade from scope (leaf) to user (root) at each tier.
+// Returns which tier was exceeded at the leaf level, if any.
+func (s *RedisStore) AddBandwidthBytesMulti(ctx context.Context, user, scope string, n int64, tiers []auth.BandwidthTier) (BandwidthResult, error) {
 	ctx, span := s.startOp(ctx, "add_bandwidth")
 	start := time.Now()
 	now := s.nowFunc().Unix()
@@ -201,9 +300,10 @@ func (s *RedisStore) AddBandwidthBytesMulti(ctx context.Context, user string, n 
 		minBucket := currentBucket - (periodSecs / bSize)
 		ttl := periodSecs + bSize // TTL = period + one bucket for safety
 
-		hashKey := s.key("bw", user, fmt.Sprintf("%d", periodSecs))
+		// Period goes before hierarchy: waypoint:bw:<period>:<user>/<scope>
+		keys := s.ancestorKeys(fmt.Sprintf("bw:%d", periodSecs), user, scope)
 
-		total, err := slidingWindowScript.Run(ctx, s.client, []string{hashKey},
+		total, err := hierarchicalSlidingWindowScript.Run(ctx, s.client, keys,
 			n,
 			fmt.Sprintf("%d", currentBucket),
 			minBucket,
@@ -225,8 +325,9 @@ func (s *RedisStore) AddBandwidthBytesMulti(ctx context.Context, user string, n 
 }
 
 // GetBandwidthBytes returns the current bandwidth usage for a single period
-// using the sliding window (read-only).
-func (s *RedisStore) GetBandwidthBytes(ctx context.Context, user string, period time.Duration) (int64, error) {
+// at a specific scope level using the sliding window (read-only).
+// Pass scope="" for user-level total, or a listener name for per-endpoint.
+func (s *RedisStore) GetBandwidthBytes(ctx context.Context, user, scope string, period time.Duration) (int64, error) {
 	ctx, span := s.startOp(ctx, "get_bandwidth")
 	start := time.Now()
 	now := s.nowFunc().Unix()
@@ -235,7 +336,12 @@ func (s *RedisStore) GetBandwidthBytes(ctx context.Context, user string, period 
 	currentBucket := now / bSize
 	minBucket := currentBucket - (periodSecs / bSize)
 
-	hashKey := s.key("bw", user, fmt.Sprintf("%d", periodSecs))
+	var hashKey string
+	if scope == "" {
+		hashKey = s.keyPrefix + fmt.Sprintf("bw:%d:", periodSecs) + user
+	} else {
+		hashKey = s.keyPrefix + fmt.Sprintf("bw:%d:", periodSecs) + user + "/" + scope
+	}
 
 	val, err := slidingWindowReadScript.Run(ctx, s.client, []string{hashKey}, minBucket).Int64()
 	if err == redis.Nil {

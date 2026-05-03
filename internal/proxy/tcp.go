@@ -83,7 +83,7 @@ func (p *TCPProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 
 	// Acquire connection slot.
 	ctx, slotSpan := tracer.Start(ctx, "waypoint.acquire_slot")
-	release, err := p.Tracker.Acquire(ctx, result.LoginName, result.Limits)
+	release, err := p.Tracker.Acquire(ctx, result.LoginName, result.Limits, p.Name)
 	if err != nil {
 		slotSpan.RecordError(err)
 		slotSpan.SetStatus(codes.Error, "limit exceeded")

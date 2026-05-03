@@ -85,6 +85,14 @@ listen = ":3306"
 mode = "tcp"
 backend = "10.0.1.5:3306"
 
+# Example: multi-port TCP proxy for MongoDB replica set.
+# All ports share the listener name for metrics and limit scoping.
+# [[listeners]]
+# name = "mongodb"
+# mode = "tcp"
+# backend = "mongo.example.com"
+# port_map = { 27017 = 27017, 27018 = 27018, 27019 = 27019 }
+
 # Example: backend reachable only via Tailscale (MagicDNS name or 100.x.y.z IP).
 # [[listeners]]
 # name = "ts-backend"

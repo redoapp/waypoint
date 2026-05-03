@@ -16,7 +16,7 @@ func TestMergeRules_SingleRuleWithPG(t *testing.T) {
 		Limits: &LimitsCap{MaxConns: 5},
 	}}
 
-	perms, limits := mergeRules(rules)
+	perms, limits := mergeRules(rules, rules[0].Backends[0])
 
 	if len(perms) != 1 || perms[0] != "SELECT ON ALL TABLES IN SCHEMA public" {
 		t.Errorf("unexpected perms: %v", perms)
@@ -48,7 +48,7 @@ func TestMergeRules_MultipleRulesMergePermissions(t *testing.T) {
 		},
 	}
 
-	perms, limits := mergeRules(rules)
+	perms, limits := mergeRules(rules, rules[0].Backends[0])
 
 	if len(perms) != 2 {
 		t.Fatalf("expected 2 perms, got %d: %v", len(perms), perms)
@@ -67,7 +67,7 @@ func TestMergeRules_NoLimits(t *testing.T) {
 		Backends: []string{"raw-tcp"},
 	}}
 
-	perms, limits := mergeRules(rules)
+	perms, limits := mergeRules(rules, rules[0].Backends[0])
 
 	if len(perms) != 0 {
 		t.Errorf("expected no perms, got %v", perms)
@@ -83,7 +83,7 @@ func TestMergeRules_NoPG(t *testing.T) {
 		Limits:   &LimitsCap{MaxConns: 10},
 	}}
 
-	perms, limits := mergeRules(rules)
+	perms, limits := mergeRules(rules, rules[0].Backends[0])
 
 	if len(perms) != 0 {
 		t.Errorf("expected no perms for non-PG rule, got %v", perms)
@@ -489,7 +489,7 @@ func TestMergeRules_MultipleDBs(t *testing.T) {
 		},
 	}}
 
-	perms, _ := mergeRules(rules)
+	perms, _ := mergeRules(rules, rules[0].Backends[0])
 
 	if len(perms) != 3 {
 		t.Errorf("expected 3 total perms across all DBs, got %d: %v", len(perms), perms)

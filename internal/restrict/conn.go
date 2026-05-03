@@ -25,6 +25,7 @@ type ConnLimits struct {
 	store           *RedisStore
 	metrics         *metrics.Metrics
 	user            string
+	scope           string // listener name for hierarchical key scoping
 	maxBytesPerConn int64
 	bandwidthTiers  []auth.BandwidthTier
 	deadline        time.Time
@@ -152,11 +153,11 @@ func (cl *ConnLimits) flush() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 
-		cl.store.AddBytes(ctx, cl.user, pending)
+		cl.store.AddBytes(ctx, cl.user, cl.scope, pending)
 
 		// Check bandwidth limits across all tiers.
 		if len(cl.bandwidthTiers) > 0 {
-			result, err := cl.store.AddBandwidthBytesMulti(ctx, cl.user, pending, cl.bandwidthTiers)
+			result, err := cl.store.AddBandwidthBytesMulti(ctx, cl.user, cl.scope, pending, cl.bandwidthTiers)
 			if err != nil {
 				cl.logger.Error("bandwidth flush failed", "user", cl.user, "error", err)
 			} else if result.Exceeded {

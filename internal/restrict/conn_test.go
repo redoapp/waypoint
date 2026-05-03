@@ -141,7 +141,7 @@ func TestConnLimits_FlushWritesToRedis(t *testing.T) {
 	cl.flush()
 
 	ctx := context.Background()
-	total, err := store.AddBytes(ctx, "alice", 0) // Just read current.
+	total, err := store.AddBytes(ctx, "alice", "", 0) // Just read current.
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -168,7 +168,7 @@ func TestConnLimits_FlushZeroPendingIsNoop(t *testing.T) {
 	cl.flush() // Should not error or write anything.
 
 	ctx := context.Background()
-	total, _ := store.AddBytes(ctx, "alice", 0)
+	total, _ := store.AddBytes(ctx, "alice", "", 0)
 	if total != 0 {
 		t.Errorf("expected 0 after no-op flush, got %d", total)
 	}
@@ -344,7 +344,7 @@ func TestConnLimits_ReportReadWrite_FlushesToRedis(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	total, err := store.AddBytes(ctx, "alice", 0)
+	total, err := store.AddBytes(ctx, "alice", "", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -352,7 +352,7 @@ func TestConnLimits_ReportReadWrite_FlushesToRedis(t *testing.T) {
 		t.Fatalf("expected 500 in Redis, got %d", total)
 	}
 
-	bw, err := store.GetBandwidthBytes(ctx, "alice", time.Hour)
+	bw, err := store.GetBandwidthBytes(ctx, "alice", "", time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}

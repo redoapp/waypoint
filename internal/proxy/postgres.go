@@ -93,7 +93,7 @@ func (p *PostgresProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 
 	// Step 2: Acquire connection slot.
 	ctx, slotSpan := tracer.Start(ctx, "waypoint.acquire_slot")
-	release, err := p.Tracker.Acquire(ctx, result.LoginName, result.Limits)
+	release, err := p.Tracker.Acquire(ctx, result.LoginName, result.Limits, p.Name)
 	if err != nil {
 		slotSpan.RecordError(err)
 		slotSpan.SetStatus(codes.Error, "limit exceeded")

@@ -4,9 +4,10 @@ const WaypointCap = "redo.com/cap/waypoint"
 
 // CapRule represents a single capability rule from the Tailscale ACL grant.
 type CapRule struct {
-	Backends []string   `json:"backends"`
-	PG       *PGCap     `json:"pg,omitempty"`
-	Limits   *LimitsCap `json:"limits,omitempty"`
+	Backends       []string              `json:"backends"`
+	PG             *PGCap                `json:"pg,omitempty"`
+	Limits         *LimitsCap            `json:"limits,omitempty"`
+	EndpointLimits map[string]*LimitsCap `json:"endpoint_limits,omitempty"`
 }
 
 // PGCap holds postgres-specific capabilities.

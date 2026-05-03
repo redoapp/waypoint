@@ -10,6 +10,7 @@ import (
 	"net/netip"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -272,30 +273,7 @@ func runServer(ctx context.Context, configPath string, logger *slog.Logger, leve
 		lCfg := lCfg
 		mode := strings.ToLower(lCfg.Mode)
 
-		var ln net.Listener
-		if lCfg.Service != "" {
-			port, err := lCfg.ListenPort()
-			if err != nil {
-				return fmt.Errorf("invalid listen port for service %s: %w", lCfg.Name, err)
-			}
-			svcLn, err := srv.ListenService(lCfg.Service, tsnet.ServiceModeTCP{
-				Port:                 port,
-				PROXYProtocolVersion: 2,
-			})
-			if err != nil {
-				return fmt.Errorf("listen service %s (%s): %w", lCfg.Name, lCfg.Service, err)
-			}
-			logger.Info("registered tailscale service", "name", lCfg.Name, "service", lCfg.Service, "fqdn", svcLn.FQDN)
-			ln = &proxyproto.Listener{Listener: svcLn}
-		} else {
-			var err error
-			ln, err = srv.Listen("tcp", lCfg.Listen)
-			if err != nil {
-				return fmt.Errorf("listen %s (%s): %w", lCfg.Name, lCfg.Listen, err)
-			}
-		}
-		listeners = append(listeners, ln)
-
+		// Compute dialer/lookupFunc once per listener config (shared across all ports).
 		var dialer func(ctx context.Context, network, addr string) (net.Conn, error)
 		var lookupFunc func(ctx context.Context, host string) ([]string, error)
 		if lCfg.BackendViaTailscale {
@@ -330,66 +308,101 @@ func runServer(ctx context.Context, configPath string, logger *slog.Logger, leve
 			dialer = tsdns.NewDialer(srv.Dial, queryDNS)
 		}
 
-		switch mode {
-		case "tcp":
-			p := &proxy.TCPProxy{
-				Backend:      lCfg.Backend,
-				Name:         lCfg.Name,
-				Auth:         &proxy.TailscaleAuthorizer{LC: lc, Logger: logger.With("listener", lCfg.Name)},
-				Tracker:      tracker,
-				Metrics:      m,
-				Logger:       logger.With("listener", lCfg.Name),
-				Dialer:       dialer,
-				BytesRead:    &bytesRead,
-				BytesWritten: &bytesWritten,
-			}
-			go acceptLoop(ctx, &wg, ln, p.HandleConn, logger.With("listener", lCfg.Name))
+		// Expand port mappings. For single-port configs, returns one entry.
+		backends := lCfg.ExpandedBackends()
 
-		case "postgres":
-			if lCfg.Postgres == nil {
-				return fmt.Errorf("postgres listener %s requires [listeners.postgres] config", lCfg.Name)
+		for _, be := range backends {
+			be := be
+
+			var ln net.Listener
+			if lCfg.Service != "" {
+				_, portStr, err := net.SplitHostPort(be.Listen)
+				if err != nil {
+					return fmt.Errorf("invalid listen address for service %s: %w", lCfg.Name, err)
+				}
+				port64, err := strconv.ParseUint(portStr, 10, 16)
+				if err != nil {
+					return fmt.Errorf("invalid listen port for service %s: %w", lCfg.Name, err)
+				}
+				svcLn, err := srv.ListenService(lCfg.Service, tsnet.ServiceModeTCP{
+					Port:                 uint16(port64),
+					PROXYProtocolVersion: 2,
+				})
+				if err != nil {
+					return fmt.Errorf("listen service %s (%s): %w", lCfg.Name, lCfg.Service, err)
+				}
+				logger.Info("registered tailscale service", "name", lCfg.Name, "service", lCfg.Service, "fqdn", svcLn.FQDN, "port", port64)
+				ln = &proxyproto.Listener{Listener: svcLn}
+			} else {
+				var err error
+				ln, err = srv.Listen("tcp", be.Listen)
+				if err != nil {
+					return fmt.Errorf("listen %s (%s): %w", lCfg.Name, be.Listen, err)
+				}
+			}
+			listeners = append(listeners, ln)
+
+			switch mode {
+			case "tcp":
+				p := &proxy.TCPProxy{
+					Backend:      be.Backend,
+					Name:         lCfg.Name,
+					Auth:         &proxy.TailscaleAuthorizer{LC: lc, Logger: logger.With("listener", lCfg.Name)},
+					Tracker:      tracker,
+					Metrics:      m,
+					Logger:       logger.With("listener", lCfg.Name),
+					Dialer:       dialer,
+					BytesRead:    &bytesRead,
+					BytesWritten: &bytesWritten,
+				}
+				go acceptLoop(ctx, &wg, ln, p.HandleConn, logger.With("listener", lCfg.Name))
+
+			case "postgres":
+				if lCfg.Postgres == nil {
+					return fmt.Errorf("postgres listener %s requires [listeners.postgres] config", lCfg.Name)
+				}
+
+				pgPeerService := lCfg.Name
+				if lCfg.Postgres.ServiceName != "" {
+					pgPeerService = lCfg.Postgres.ServiceName
+				}
+
+				provisioner := provision.NewProvisioner(
+					lCfg.Postgres.AdminUser,
+					lCfg.Postgres.AdminPassword,
+					lCfg.Postgres.AdminDatabase,
+					be.Backend,
+					lCfg.Postgres.UserPrefix,
+					lCfg.BackendTLS,
+					config.AllowRawSQLResolved(lCfg.Postgres, &cfg.Provisioning),
+					pgPeerService,
+					store,
+					logger.With("component", "provisioner", "listener", lCfg.Name),
+					dialer,
+					lookupFunc,
+				)
+
+				p := &proxy.PostgresProxy{
+					Backend:       be.Backend,
+					Name:          lCfg.Name,
+					Auth:          &proxy.TailscaleAuthorizer{LC: lc, Logger: logger.With("listener", lCfg.Name)},
+					Tracker:       tracker,
+					Provisioner:   provisioner,
+					Metrics:       m,
+					PGConfig:      lCfg.Postgres,
+					BackendTLS:    lCfg.BackendTLS,
+					RevalInterval: revalInterval,
+					Logger:        logger.With("listener", lCfg.Name),
+					Dialer:        dialer,
+					BytesRead:     &bytesRead,
+					BytesWritten:  &bytesWritten,
+				}
+				go acceptLoop(ctx, &wg, ln, p.HandleConn, logger.With("listener", lCfg.Name))
 			}
 
-			pgPeerService := lCfg.Name
-			if lCfg.Postgres.ServiceName != "" {
-				pgPeerService = lCfg.Postgres.ServiceName
-			}
-
-			provisioner := provision.NewProvisioner(
-				lCfg.Postgres.AdminUser,
-				lCfg.Postgres.AdminPassword,
-				lCfg.Postgres.AdminDatabase,
-				lCfg.Backend,
-				lCfg.Postgres.UserPrefix,
-				lCfg.BackendTLS,
-				config.AllowRawSQLResolved(lCfg.Postgres, &cfg.Provisioning),
-				pgPeerService,
-				store,
-				logger.With("component", "provisioner", "listener", lCfg.Name),
-				dialer,
-				lookupFunc,
-			)
-
-			p := &proxy.PostgresProxy{
-				Backend:       lCfg.Backend,
-				Name:          lCfg.Name,
-				Auth:          &proxy.TailscaleAuthorizer{LC: lc, Logger: logger.With("listener", lCfg.Name)},
-				Tracker:       tracker,
-				Provisioner:   provisioner,
-				Metrics:       m,
-				PGConfig:      lCfg.Postgres,
-				BackendTLS:    lCfg.BackendTLS,
-				RevalInterval: revalInterval,
-				Logger:        logger.With("listener", lCfg.Name),
-				Dialer:        dialer,
-				BytesRead:     &bytesRead,
-				BytesWritten:  &bytesWritten,
-			}
-			go acceptLoop(ctx, &wg, ln, p.HandleConn, logger.With("listener", lCfg.Name))
+			m.SystemListeners.Add(ctx, 1, m.Attrs("waypoint.system.listeners"))
+			logger.Info("listening", "name", lCfg.Name, "addr", be.Listen, "mode", mode, "backend", be.Backend)
 		}
-
-		m.SystemListeners.Add(ctx, 1, m.Attrs("waypoint.system.listeners"))
-		logger.Info("listening", "name", lCfg.Name, "addr", lCfg.Listen, "mode", mode, "backend", lCfg.Backend)
 	}
 
 	<-ctx.Done()

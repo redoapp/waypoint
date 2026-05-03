@@ -42,11 +42,50 @@ func TestRedisStore_Key(t *testing.T) {
 	}
 }
 
+func TestRedisStore_AncestorKeys(t *testing.T) {
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	defer rdb.Close()
+
+	store := NewRedisStore(rdb, "wp:", metrics.Noop())
+	keys := store.ancestorKeys("conns", "alice", "mongodb")
+	if len(keys) != 2 {
+		t.Fatalf("expected 2 keys, got %d: %v", len(keys), keys)
+	}
+	if keys[0] != "wp:conns:alice/mongodb" {
+		t.Errorf("leaf key: expected wp:conns:alice/mongodb, got %q", keys[0])
+	}
+	if keys[1] != "wp:conns:alice" {
+		t.Errorf("root key: expected wp:conns:alice, got %q", keys[1])
+	}
+}
+
+func TestRedisStore_AncestorKeys_ThreeLevels(t *testing.T) {
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	defer rdb.Close()
+
+	store := NewRedisStore(rdb, "wp:", metrics.Noop())
+	keys := store.ancestorKeys("conns", "alice", "mongodb", "27017")
+	if len(keys) != 3 {
+		t.Fatalf("expected 3 keys, got %d: %v", len(keys), keys)
+	}
+	if keys[0] != "wp:conns:alice/mongodb/27017" {
+		t.Errorf("leaf: got %q", keys[0])
+	}
+	if keys[1] != "wp:conns:alice/mongodb" {
+		t.Errorf("mid: got %q", keys[1])
+	}
+	if keys[2] != "wp:conns:alice" {
+		t.Errorf("root: got %q", keys[2])
+	}
+}
+
 func TestRedisStore_IncrDecrConns(t *testing.T) {
 	store, _ := setupRedis(t)
 	ctx := context.Background()
 
-	count, err := store.IncrConns(ctx, "alice")
+	count, err := store.IncrConns(ctx, "alice", "pg-main")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -54,7 +93,7 @@ func TestRedisStore_IncrDecrConns(t *testing.T) {
 		t.Errorf("expected 1, got %d", count)
 	}
 
-	count, err = store.IncrConns(ctx, "alice")
+	count, err = store.IncrConns(ctx, "alice", "pg-main")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,11 +101,11 @@ func TestRedisStore_IncrDecrConns(t *testing.T) {
 		t.Errorf("expected 2, got %d", count)
 	}
 
-	if err := store.DecrConns(ctx, "alice"); err != nil {
+	if err := store.DecrConns(ctx, "alice", "pg-main"); err != nil {
 		t.Fatal(err)
 	}
 
-	got, err := store.GetConns(ctx, "alice")
+	got, err := store.GetConns(ctx, "alice", "pg-main")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -75,16 +114,63 @@ func TestRedisStore_IncrDecrConns(t *testing.T) {
 	}
 }
 
+func TestRedisStore_IncrConns_Hierarchical(t *testing.T) {
+	store, _ := setupRedis(t)
+	ctx := context.Background()
+
+	// Increment on two different endpoints.
+	store.IncrConns(ctx, "alice", "mongodb")
+	store.IncrConns(ctx, "alice", "mongodb")
+	store.IncrConns(ctx, "alice", "mysql")
+
+	// Leaf counts.
+	mongo, _ := store.GetConns(ctx, "alice", "mongodb")
+	mysql, _ := store.GetConns(ctx, "alice", "mysql")
+	if mongo != 2 {
+		t.Errorf("mongodb: expected 2, got %d", mongo)
+	}
+	if mysql != 1 {
+		t.Errorf("mysql: expected 1, got %d", mysql)
+	}
+
+	// Root (user total) = sum of all endpoints.
+	total, _ := store.GetConns(ctx, "alice", "")
+	if total != 3 {
+		t.Errorf("user total: expected 3, got %d", total)
+	}
+}
+
+func TestRedisStore_DecrConns_Hierarchical(t *testing.T) {
+	store, _ := setupRedis(t)
+	ctx := context.Background()
+
+	store.IncrConns(ctx, "alice", "mongodb")
+	store.IncrConns(ctx, "alice", "mongodb")
+	store.DecrConns(ctx, "alice", "mongodb")
+
+	leaf, _ := store.GetConns(ctx, "alice", "mongodb")
+	if leaf != 1 {
+		t.Errorf("leaf: expected 1, got %d", leaf)
+	}
+	root, _ := store.GetConns(ctx, "alice", "")
+	if root != 1 {
+		t.Errorf("root: expected 1, got %d", root)
+	}
+}
+
 func TestRedisStore_DecrConnsToZero_Cleanup(t *testing.T) {
 	store, mr := setupRedis(t)
 	ctx := context.Background()
 
-	store.IncrConns(ctx, "bob")
-	store.DecrConns(ctx, "bob")
+	store.IncrConns(ctx, "bob", "pg-main")
+	store.DecrConns(ctx, "bob", "pg-main")
 
-	// Key should be deleted.
-	if mr.Exists(store.key("conns", "bob")) {
-		t.Error("expected key to be deleted at zero")
+	// Both leaf and root keys should be deleted at zero.
+	if mr.Exists("test:conns:bob/pg-main") {
+		t.Error("expected leaf key to be deleted at zero")
+	}
+	if mr.Exists("test:conns:bob") {
+		t.Error("expected root key to be deleted at zero")
 	}
 }
 
@@ -92,7 +178,7 @@ func TestRedisStore_GetConns_NonExistent(t *testing.T) {
 	store, _ := setupRedis(t)
 	ctx := context.Background()
 
-	count, err := store.GetConns(ctx, "nobody")
+	count, err := store.GetConns(ctx, "nobody", "pg-main")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,11 +187,32 @@ func TestRedisStore_GetConns_NonExistent(t *testing.T) {
 	}
 }
 
+func TestRedisStore_ScopedKeysIsolation(t *testing.T) {
+	store, _ := setupRedis(t)
+	ctx := context.Background()
+
+	// User A on listener X.
+	store.IncrConns(ctx, "alice", "mongodb")
+	store.IncrConns(ctx, "alice", "mongodb")
+	// User A on listener Y.
+	store.IncrConns(ctx, "alice", "mysql")
+
+	mongoCount, _ := store.GetConns(ctx, "alice", "mongodb")
+	mysqlCount, _ := store.GetConns(ctx, "alice", "mysql")
+
+	if mongoCount != 2 {
+		t.Errorf("mongodb scope: expected 2, got %d", mongoCount)
+	}
+	if mysqlCount != 1 {
+		t.Errorf("mysql scope: expected 1, got %d", mysqlCount)
+	}
+}
+
 func TestRedisStore_AddBytes(t *testing.T) {
 	store, _ := setupRedis(t)
 	ctx := context.Background()
 
-	total, err := store.AddBytes(ctx, "alice", 100)
+	total, err := store.AddBytes(ctx, "alice", "pg-main", 100)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -113,7 +220,7 @@ func TestRedisStore_AddBytes(t *testing.T) {
 		t.Errorf("expected 100, got %d", total)
 	}
 
-	total, err = store.AddBytes(ctx, "alice", 200)
+	total, err = store.AddBytes(ctx, "alice", "pg-main", 200)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -122,12 +229,30 @@ func TestRedisStore_AddBytes(t *testing.T) {
 	}
 }
 
+func TestRedisStore_AddBytes_Hierarchical(t *testing.T) {
+	store, _ := setupRedis(t)
+	ctx := context.Background()
+
+	store.AddBytes(ctx, "alice", "mongodb", 100)
+	store.AddBytes(ctx, "alice", "mysql", 50)
+
+	// Check root total via direct GET.
+	rdb := store.client
+	rootVal, err := rdb.Get(ctx, "test:bytes:alice").Int64()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rootVal != 150 {
+		t.Errorf("root total: expected 150, got %d", rootVal)
+	}
+}
+
 func TestRedisStore_BandwidthSlidingWindow(t *testing.T) {
 	store, _ := setupRedis(t)
 	ctx := context.Background()
 	tiers := []auth.BandwidthTier{{Bytes: 10000, Period: time.Hour}}
 
-	result, err := store.AddBandwidthBytesMulti(ctx, "alice", 500, tiers)
+	result, err := store.AddBandwidthBytesMulti(ctx, "alice", "pg-main", 500, tiers)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -135,7 +260,7 @@ func TestRedisStore_BandwidthSlidingWindow(t *testing.T) {
 		t.Error("did not expect limit exceeded")
 	}
 
-	result, err = store.AddBandwidthBytesMulti(ctx, "alice", 300, tiers)
+	result, err = store.AddBandwidthBytesMulti(ctx, "alice", "pg-main", 300, tiers)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -143,7 +268,7 @@ func TestRedisStore_BandwidthSlidingWindow(t *testing.T) {
 		t.Error("did not expect limit exceeded")
 	}
 
-	got, err := store.GetBandwidthBytes(ctx, "alice", time.Hour)
+	got, err := store.GetBandwidthBytes(ctx, "alice", "pg-main", time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -157,7 +282,7 @@ func TestRedisStore_BandwidthSlidingWindow_LimitExceeded(t *testing.T) {
 	ctx := context.Background()
 	tiers := []auth.BandwidthTier{{Bytes: 100, Period: time.Hour}}
 
-	result, err := store.AddBandwidthBytesMulti(ctx, "alice", 150, tiers)
+	result, err := store.AddBandwidthBytesMulti(ctx, "alice", "pg-main", 150, tiers)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -178,7 +303,7 @@ func TestRedisStore_BandwidthSlidingWindow_MultiTier(t *testing.T) {
 	}
 
 	// Add bytes under both limits.
-	result, err := store.AddBandwidthBytesMulti(ctx, "alice", 500, tiers)
+	result, err := store.AddBandwidthBytesMulti(ctx, "alice", "pg-main", 500, tiers)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -187,7 +312,7 @@ func TestRedisStore_BandwidthSlidingWindow_MultiTier(t *testing.T) {
 	}
 
 	// Add more to exceed hourly but not weekly.
-	result, err = store.AddBandwidthBytesMulti(ctx, "alice", 600, tiers)
+	result, err = store.AddBandwidthBytesMulti(ctx, "alice", "pg-main", 600, tiers)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -207,7 +332,7 @@ func TestRedisStore_BandwidthSlidingWindow_WeeklyExceeded(t *testing.T) {
 		{Bytes: 500, Period: 168 * time.Hour}, // tight weekly
 	}
 
-	result, err := store.AddBandwidthBytesMulti(ctx, "alice", 600, tiers)
+	result, err := store.AddBandwidthBytesMulti(ctx, "alice", "pg-main", 600, tiers)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -231,10 +356,10 @@ func TestRedisStore_BandwidthSlidingWindow_OldBucketsExpire(t *testing.T) {
 	baseTime := time.Unix(1000, 0)
 	store.nowFunc = func() time.Time { return baseTime }
 
-	store.AddBandwidthBytesMulti(ctx, "alice", 500, tiers)
+	store.AddBandwidthBytesMulti(ctx, "alice", "pg-main", 500, tiers)
 
 	// Read at the same time — should see 500.
-	got, err := store.GetBandwidthBytes(ctx, "alice", period)
+	got, err := store.GetBandwidthBytes(ctx, "alice", "pg-main", period)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -245,7 +370,7 @@ func TestRedisStore_BandwidthSlidingWindow_OldBucketsExpire(t *testing.T) {
 	// Advance time past the period — old buckets should fall out of the window.
 	store.nowFunc = func() time.Time { return baseTime.Add(period + 10*time.Second) }
 
-	got, err = store.GetBandwidthBytes(ctx, "alice", period)
+	got, err = store.GetBandwidthBytes(ctx, "alice", "pg-main", period)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -266,14 +391,14 @@ func TestRedisStore_BandwidthSlidingWindow_PartialExpiry(t *testing.T) {
 	store.nowFunc = func() time.Time { return baseTime }
 
 	// Write 500 bytes at t=1000 (bucket 100)
-	store.AddBandwidthBytesMulti(ctx, "alice", 500, tiers)
+	store.AddBandwidthBytesMulti(ctx, "alice", "pg-main", 500, tiers)
 
 	// Advance 50s, write 300 more (bucket 105)
 	store.nowFunc = func() time.Time { return baseTime.Add(50 * time.Second) }
-	store.AddBandwidthBytesMulti(ctx, "alice", 300, tiers)
+	store.AddBandwidthBytesMulti(ctx, "alice", "pg-main", 300, tiers)
 
 	// At t+50s, both buckets are within the 100s window.
-	got, err := store.GetBandwidthBytes(ctx, "alice", period)
+	got, err := store.GetBandwidthBytes(ctx, "alice", "pg-main", period)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -284,7 +409,7 @@ func TestRedisStore_BandwidthSlidingWindow_PartialExpiry(t *testing.T) {
 	// Advance another 60s (total +110s from base). The first bucket (t=1000) is
 	// now outside the 100s window, but the second (t=1050) is still valid.
 	store.nowFunc = func() time.Time { return baseTime.Add(110 * time.Second) }
-	got, err = store.GetBandwidthBytes(ctx, "alice", period)
+	got, err = store.GetBandwidthBytes(ctx, "alice", "pg-main", period)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -297,7 +422,7 @@ func TestRedisStore_BandwidthBytes_NonExistent(t *testing.T) {
 	store, _ := setupRedis(t)
 	ctx := context.Background()
 
-	got, err := store.GetBandwidthBytes(ctx, "nobody", time.Hour)
+	got, err := store.GetBandwidthBytes(ctx, "nobody", "pg-main", time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}

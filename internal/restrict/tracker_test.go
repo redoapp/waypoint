@@ -28,25 +28,25 @@ func TestTracker_AcquireAndRelease(t *testing.T) {
 	ctx := context.Background()
 	limits := auth.MergedLimits{MaxConns: 2}
 
-	release1, err := tracker.Acquire(ctx, "alice", limits)
+	release1, err := tracker.Acquire(ctx, "alice", limits, "test-listener")
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	release2, err := tracker.Acquire(ctx, "alice", limits)
+	release2, err := tracker.Acquire(ctx, "alice", limits, "test-listener")
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	// Third should fail.
-	_, err = tracker.Acquire(ctx, "alice", limits)
+	_, err = tracker.Acquire(ctx, "alice", limits, "test-listener")
 	if err == nil {
 		t.Fatal("expected error on third acquire")
 	}
 
 	// Release one, then acquire should work again.
 	release1()
-	release3, err := tracker.Acquire(ctx, "alice", limits)
+	release3, err := tracker.Acquire(ctx, "alice", limits, "test-listener")
 	if err != nil {
 		t.Fatalf("expected success after release, got: %v", err)
 	}
@@ -61,7 +61,7 @@ func TestTracker_AcquireNoLimit(t *testing.T) {
 	limits := auth.MergedLimits{} // no limit
 
 	for i := 0; i < 100; i++ {
-		release, err := tracker.Acquire(ctx, "bob", limits)
+		release, err := tracker.Acquire(ctx, "bob", limits, "test-listener")
 		if err != nil {
 			t.Fatalf("acquire %d failed: %v", i, err)
 		}
@@ -74,7 +74,7 @@ func TestTracker_ReleaseIdempotent(t *testing.T) {
 	ctx := context.Background()
 	limits := auth.MergedLimits{MaxConns: 1}
 
-	release, err := tracker.Acquire(ctx, "charlie", limits)
+	release, err := tracker.Acquire(ctx, "charlie", limits, "test-listener")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,7 +83,7 @@ func TestTracker_ReleaseIdempotent(t *testing.T) {
 	release() // Should not panic or decrement below zero.
 
 	// Should be able to acquire again.
-	release2, err := tracker.Acquire(ctx, "charlie", limits)
+	release2, err := tracker.Acquire(ctx, "charlie", limits, "test-listener")
 	if err != nil {
 		t.Fatalf("expected success after double release: %v", err)
 	}
@@ -95,14 +95,14 @@ func TestTracker_DifferentUsersIndependent(t *testing.T) {
 	ctx := context.Background()
 	limits := auth.MergedLimits{MaxConns: 1}
 
-	release1, err := tracker.Acquire(ctx, "alice", limits)
+	release1, err := tracker.Acquire(ctx, "alice", limits, "test-listener")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer release1()
 
 	// Different user should not be blocked.
-	release2, err := tracker.Acquire(ctx, "bob", limits)
+	release2, err := tracker.Acquire(ctx, "bob", limits, "test-listener")
 	if err != nil {
 		t.Fatal(err)
 	}
