@@ -67,7 +67,8 @@ type ListenerConfig struct {
 	BackendTLS          bool           `toml:"tls"`
 	Service             string         `toml:"service"`
 	Postgres            *PostgresAdmin `toml:"postgres"`
-	PortMap             map[int]int    `toml:"port_map,omitempty"`
+	PortMap             map[int]int    `toml:"-"`
+	RawPortMap          map[string]int `toml:"port_map,omitempty"`
 }
 
 // BackendPair holds a resolved listen address and backend address.
@@ -195,6 +196,19 @@ func validate(cfg *Config) error {
 		}
 		if l.Backend == "" {
 			return fmt.Errorf("listeners[%d].backend is required", i)
+		}
+
+		// Convert string-keyed port_map (TOML limitation) to int-keyed map.
+		if len(l.RawPortMap) > 0 {
+			l.PortMap = make(map[int]int, len(l.RawPortMap))
+			for k, v := range l.RawPortMap {
+				port, err := strconv.Atoi(k)
+				if err != nil {
+					return fmt.Errorf("listeners[%d]: port_map key %q is not a valid port number", i, k)
+				}
+				l.PortMap[port] = v
+			}
+			cfg.Listeners[i] = l
 		}
 
 		hasPortMap := len(l.PortMap) > 0

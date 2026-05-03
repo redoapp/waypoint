@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -544,6 +545,337 @@ service = "svc:waypoint-db"
 	_, err := Load(path)
 	if err != nil {
 		t.Errorf("expected no error, got: %v", err)
+	}
+}
+
+// --- PortMap parsing tests ---
+
+func TestLoad_PortMap(t *testing.T) {
+	content := `
+[tailscale]
+hostname = "waypoint-test"
+
+[[listeners]]
+name = "mongo"
+mode = "tcp"
+backend = "mongo.example.com"
+port_map = { "27017" = 27017, "27018" = 27018, "27019" = 27019 }
+`
+	path := writeTestConfig(t, content)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	l := cfg.Listeners[0]
+	if len(l.PortMap) != 3 {
+		t.Fatalf("PortMap len = %d, want 3", len(l.PortMap))
+	}
+	if l.PortMap[27017] != 27017 {
+		t.Errorf("PortMap[27017] = %d", l.PortMap[27017])
+	}
+	if l.PortMap[27018] != 27018 {
+		t.Errorf("PortMap[27018] = %d", l.PortMap[27018])
+	}
+	if l.PortMap[27019] != 27019 {
+		t.Errorf("PortMap[27019] = %d", l.PortMap[27019])
+	}
+	// RawPortMap should still be present with string keys.
+	if len(l.RawPortMap) != 3 {
+		t.Errorf("RawPortMap len = %d, want 3", len(l.RawPortMap))
+	}
+}
+
+func TestLoad_PortMap_SinglePort(t *testing.T) {
+	content := `
+[tailscale]
+hostname = "waypoint-test"
+
+[[listeners]]
+name = "single"
+mode = "tcp"
+backend = "db.example.com"
+port_map = { "5432" = 5432 }
+`
+	path := writeTestConfig(t, content)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	l := cfg.Listeners[0]
+	if len(l.PortMap) != 1 {
+		t.Fatalf("PortMap len = %d, want 1", len(l.PortMap))
+	}
+	if l.PortMap[5432] != 5432 {
+		t.Errorf("PortMap[5432] = %d", l.PortMap[5432])
+	}
+}
+
+func TestLoad_PortMap_DifferentPorts(t *testing.T) {
+	content := `
+[tailscale]
+hostname = "waypoint-test"
+
+[[listeners]]
+name = "remap"
+mode = "tcp"
+backend = "db.example.com"
+port_map = { "3000" = 5432, "3001" = 5433 }
+`
+	path := writeTestConfig(t, content)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	l := cfg.Listeners[0]
+	if l.PortMap[3000] != 5432 {
+		t.Errorf("PortMap[3000] = %d, want 5432", l.PortMap[3000])
+	}
+	if l.PortMap[3001] != 5433 {
+		t.Errorf("PortMap[3001] = %d, want 5433", l.PortMap[3001])
+	}
+}
+
+func TestLoad_PortMap_InvalidKey(t *testing.T) {
+	content := `
+[tailscale]
+hostname = "waypoint-test"
+
+[[listeners]]
+name = "bad"
+mode = "tcp"
+backend = "db.example.com"
+port_map = { "notanumber" = 5432 }
+`
+	path := writeTestConfig(t, content)
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "not a valid port number") {
+		t.Errorf("expected 'not a valid port number' error, got: %v", err)
+	}
+}
+
+// --- PortMap validation tests ---
+
+func TestValidate_PortMap_PostgresMode(t *testing.T) {
+	content := `
+[tailscale]
+hostname = "waypoint-test"
+
+[[listeners]]
+name = "bad"
+mode = "postgres"
+backend = "db.example.com"
+port_map = { "5432" = 5432 }
+
+[listeners.postgres]
+admin_user = "admin"
+admin_password = "pass"
+admin_database = "postgres"
+user_prefix = "wp_"
+`
+	path := writeTestConfig(t, content)
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "only supported for mode") {
+		t.Errorf("expected mode error, got: %v", err)
+	}
+}
+
+func TestValidate_PortMap_BackendWithPort(t *testing.T) {
+	content := `
+[tailscale]
+hostname = "waypoint-test"
+
+[[listeners]]
+name = "bad"
+mode = "tcp"
+backend = "db.example.com:5432"
+port_map = { "5432" = 5432 }
+`
+	path := writeTestConfig(t, content)
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "hostname without port") {
+		t.Errorf("expected 'hostname without port' error, got: %v", err)
+	}
+}
+
+func TestValidate_PortMap_ListenWithPort(t *testing.T) {
+	content := `
+[tailscale]
+hostname = "waypoint-test"
+
+[[listeners]]
+name = "bad"
+listen = ":5432"
+mode = "tcp"
+backend = "db.example.com"
+port_map = { "5432" = 5432 }
+`
+	path := writeTestConfig(t, content)
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "bind host without port") {
+		t.Errorf("expected 'bind host without port' error, got: %v", err)
+	}
+}
+
+func TestValidate_PortMap_InvalidListenPort(t *testing.T) {
+	tests := []struct {
+		name    string
+		portMap string
+		errMsg  string
+	}{
+		{"zero", `{ "0" = 5432 }`, "invalid listen port"},
+		{"too_high", `{ "70000" = 5432 }`, "invalid listen port"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			content := fmt.Sprintf(`
+[tailscale]
+hostname = "waypoint-test"
+
+[[listeners]]
+name = "bad"
+mode = "tcp"
+backend = "db.example.com"
+port_map = %s
+`, tt.portMap)
+			path := writeTestConfig(t, content)
+			_, err := Load(path)
+			if err == nil || !strings.Contains(err.Error(), tt.errMsg) {
+				t.Errorf("expected %q error, got: %v", tt.errMsg, err)
+			}
+		})
+	}
+}
+
+func TestValidate_PortMap_InvalidBackendPort(t *testing.T) {
+	tests := []struct {
+		name    string
+		portMap string
+		errMsg  string
+	}{
+		{"zero", `{ "5432" = 0 }`, "invalid backend port"},
+		{"too_high", `{ "5432" = 70000 }`, "invalid backend port"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			content := fmt.Sprintf(`
+[tailscale]
+hostname = "waypoint-test"
+
+[[listeners]]
+name = "bad"
+mode = "tcp"
+backend = "db.example.com"
+port_map = %s
+`, tt.portMap)
+			path := writeTestConfig(t, content)
+			_, err := Load(path)
+			if err == nil || !strings.Contains(err.Error(), tt.errMsg) {
+				t.Errorf("expected %q error, got: %v", tt.errMsg, err)
+			}
+		})
+	}
+}
+
+func TestValidate_PortMap_AddressCollision(t *testing.T) {
+	content := `
+[tailscale]
+hostname = "waypoint-test"
+
+[[listeners]]
+name = "first"
+mode = "tcp"
+backend = "db1.example.com"
+port_map = { "27017" = 27017 }
+
+[[listeners]]
+name = "second"
+mode = "tcp"
+backend = "db2.example.com"
+port_map = { "27017" = 27017 }
+`
+	path := writeTestConfig(t, content)
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "conflicts with") {
+		t.Errorf("expected address collision error, got: %v", err)
+	}
+}
+
+// --- ExpandedBackends tests ---
+
+func TestExpandedBackends_NoPortMap(t *testing.T) {
+	l := &ListenerConfig{
+		Listen:  ":5432",
+		Backend: "10.0.0.1:5432",
+	}
+	pairs := l.ExpandedBackends()
+	if len(pairs) != 1 {
+		t.Fatalf("expected 1 pair, got %d", len(pairs))
+	}
+	if pairs[0].Listen != ":5432" {
+		t.Errorf("Listen = %q", pairs[0].Listen)
+	}
+	if pairs[0].Backend != "10.0.0.1:5432" {
+		t.Errorf("Backend = %q", pairs[0].Backend)
+	}
+}
+
+func TestExpandedBackends_WithPortMap(t *testing.T) {
+	l := &ListenerConfig{
+		Backend: "mongo.example.com",
+		PortMap: map[int]int{27018: 27018, 27017: 27017, 27019: 27019},
+	}
+	pairs := l.ExpandedBackends()
+	if len(pairs) != 3 {
+		t.Fatalf("expected 3 pairs, got %d", len(pairs))
+	}
+	// Should be sorted by listen address.
+	expected := []BackendPair{
+		{Listen: ":27017", Backend: "mongo.example.com:27017"},
+		{Listen: ":27018", Backend: "mongo.example.com:27018"},
+		{Listen: ":27019", Backend: "mongo.example.com:27019"},
+	}
+	for i, want := range expected {
+		if pairs[i] != want {
+			t.Errorf("pairs[%d] = %+v, want %+v", i, pairs[i], want)
+		}
+	}
+}
+
+func TestExpandedBackends_WithBindHost(t *testing.T) {
+	l := &ListenerConfig{
+		Listen:  "0.0.0.0",
+		Backend: "db.example.com",
+		PortMap: map[int]int{5432: 5432},
+	}
+	pairs := l.ExpandedBackends()
+	if len(pairs) != 1 {
+		t.Fatalf("expected 1 pair, got %d", len(pairs))
+	}
+	if pairs[0].Listen != "0.0.0.0:5432" {
+		t.Errorf("Listen = %q, want 0.0.0.0:5432", pairs[0].Listen)
+	}
+	if pairs[0].Backend != "db.example.com:5432" {
+		t.Errorf("Backend = %q", pairs[0].Backend)
+	}
+}
+
+func TestExpandedBackends_DifferentPorts(t *testing.T) {
+	l := &ListenerConfig{
+		Backend: "db.example.com",
+		PortMap: map[int]int{3000: 5432, 3001: 5433},
+	}
+	pairs := l.ExpandedBackends()
+	if len(pairs) != 2 {
+		t.Fatalf("expected 2 pairs, got %d", len(pairs))
+	}
+	expected := []BackendPair{
+		{Listen: ":3000", Backend: "db.example.com:5432"},
+		{Listen: ":3001", Backend: "db.example.com:5433"},
+	}
+	for i, want := range expected {
+		if pairs[i] != want {
+			t.Errorf("pairs[%d] = %+v, want %+v", i, pairs[i], want)
+		}
 	}
 }
 

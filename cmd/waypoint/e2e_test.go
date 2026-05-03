@@ -339,6 +339,223 @@ backend = "%s"
 	}
 }
 
+// TestE2E_TCPProxy_PortMap verifies that port_map listeners work end-to-end
+// through the real runServer() code path. It starts two echo backends, writes
+// a TOML config with port_map mapping two listen ports to those backends, and
+// verifies that data flows through both mapped ports. This is a regression
+// test for the TOML integer-key bug where port_map silently produced an empty
+// map, causing only a single (broken) listener to be created.
+func TestE2E_TCPProxy_PortMap(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	// --- Test infrastructure ---
+
+	netns.SetEnabled(false)
+	t.Cleanup(func() { netns.SetEnabled(true) })
+
+	derpMap := integration.RunDERPAndSTUN(t, logger.Discard, "127.0.0.1")
+	control := &testcontrol.Server{
+		DERPMap:        derpMap,
+		DNSConfig:      &tailcfg.DNSConfig{Proxied: true},
+		MagicDNSDomain: "tail-scale.ts.net",
+	}
+	control.HTTPTestServer = httptest.NewUnstartedServer(control)
+	control.HTTPTestServer.Start()
+	t.Cleanup(control.HTTPTestServer.Close)
+	controlURL := control.HTTPTestServer.URL
+
+	// Set waypoint capabilities for all peers.
+	capRule := auth.CapRule{
+		Limits: &auth.LimitsCap{MaxConns: 5},
+		Backends: map[string]auth.BackendCap{
+			"portmap-echo": {},
+		},
+	}
+	capJSON, err := json.Marshal(capRule)
+	if err != nil {
+		t.Fatalf("marshal cap rule: %v", err)
+	}
+	control.SetGlobalAppCaps(tailcfg.PeerCapMap{
+		tailcfg.PeerCapability(auth.WaypointCap): {tailcfg.RawMessage(capJSON)},
+	})
+
+	// Redis (via testcontainer).
+	rdb := testutil.RedisClient(t)
+
+	// Two backend echo servers on separate ports.
+	echoLn1, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("echo1 listen: %v", err)
+	}
+	t.Cleanup(func() { echoLn1.Close() })
+
+	echoLn2, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("echo2 listen: %v", err)
+	}
+	t.Cleanup(func() { echoLn2.Close() })
+
+	for _, ln := range []net.Listener{echoLn1, echoLn2} {
+		ln := ln
+		go func() {
+			for {
+				conn, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				go func() {
+					defer conn.Close()
+					io.Copy(conn, conn)
+				}()
+			}
+		}()
+	}
+
+	_, echo1Port, _ := net.SplitHostPort(echoLn1.Addr().String())
+	_, echo2Port, _ := net.SplitHostPort(echoLn2.Addr().String())
+
+	// --- Config file with port_map ---
+
+	stateDir := filepath.Join(t.TempDir(), "wp-state")
+	os.MkdirAll(stateDir, 0755)
+
+	configContent := fmt.Sprintf(`
+[tailscale]
+hostname = "waypoint-portmap-e2e"
+control_url = "%s"
+state_dir = "%s"
+ephemeral = true
+
+[redis]
+address = "%s"
+key_prefix = "e2e-pm:"
+
+[[listeners]]
+name = "portmap-echo"
+mode = "tcp"
+backend = "127.0.0.1"
+port_map = { "7780" = %s, "7781" = %s }
+`, controlURL, stateDir, rdb.Options().Addr, echo1Port, echo2Port)
+
+	configPath := filepath.Join(t.TempDir(), "waypoint.toml")
+	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	// --- Start waypoint via the real run() code path ---
+
+	runCtx, runCancel := context.WithCancel(ctx)
+	defer runCancel()
+
+	var testLevelVar slog.LevelVar
+	testLevelVar.Set(slog.LevelDebug)
+	lgr := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: &testLevelVar}))
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- runServer(runCtx, configPath, lgr, &testLevelVar, nil)
+	}()
+
+	// Check for early startup failure.
+	select {
+	case err := <-errCh:
+		t.Fatalf("runServer exited early: %v", err)
+	case <-time.After(2 * time.Second):
+	}
+
+	// --- Client node ---
+
+	clientDir := filepath.Join(t.TempDir(), "client")
+	os.MkdirAll(clientDir, 0755)
+
+	clientNode := &tsnet.Server{
+		Dir:        clientDir,
+		ControlURL: controlURL,
+		Hostname:   "e2e-pm-client",
+		Store:      new(mem.Store),
+		Ephemeral:  true,
+	}
+	t.Cleanup(func() { clientNode.Close() })
+
+	if _, err := clientNode.Up(ctx); err != nil {
+		t.Fatalf("client Up: %v", err)
+	}
+
+	// Wait for the waypoint peer to appear.
+	var waypointIP string
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		st, err := clientNode.LocalClient()
+		if err != nil {
+			t.Fatalf("client LocalClient: %v", err)
+		}
+		status, err := st.Status(ctx)
+		if err != nil {
+			t.Fatalf("client status: %v", err)
+		}
+		for _, peer := range status.Peer {
+			if peer.HostName == "waypoint-portmap-e2e" {
+				waypointIP = peer.TailscaleIPs[0].String()
+				break
+			}
+		}
+		if waypointIP != "" {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	if waypointIP == "" {
+		t.Fatal("timed out waiting for waypoint-portmap-e2e peer")
+	}
+
+	// --- Verify: dial both mapped ports and echo data ---
+
+	for _, port := range []string{"7780", "7781"} {
+		port := port
+		t.Run("port_"+port, func(t *testing.T) {
+			var conn net.Conn
+			dialDeadline := time.Now().Add(30 * time.Second)
+			for time.Now().Before(dialDeadline) {
+				conn, err = clientNode.Dial(ctx, "tcp", fmt.Sprintf("%s:%s", waypointIP, port))
+				if err == nil {
+					break
+				}
+				time.Sleep(500 * time.Millisecond)
+			}
+			if err != nil {
+				t.Fatalf("client dial port %s: %v", port, err)
+			}
+			defer conn.Close()
+
+			msg := fmt.Sprintf("hello-portmap-%s\n", port)
+			if _, err := conn.Write([]byte(msg)); err != nil {
+				t.Fatalf("write: %v", err)
+			}
+
+			buf := make([]byte, len(msg))
+			conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+			n, err := io.ReadFull(conn, buf)
+			if err != nil {
+				t.Fatalf("echo read failed on port %s: %v", port, err)
+			}
+			if string(buf[:n]) != msg {
+				t.Fatalf("echo mismatch on port %s: got %q, want %q", port, string(buf[:n]), msg)
+			}
+		})
+	}
+
+	// --- Shutdown ---
+	runCancel()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("runServer: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for shutdown")
+	}
+}
+
 // TestE2E_SplitDNS_ResolveViaTailscale verifies that the tsdns package
 // correctly resolves hostnames through the Tailscale local API when DNS
 // extra records are configured on the fake control plane. This is a

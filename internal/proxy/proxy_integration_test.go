@@ -1440,3 +1440,88 @@ func TestIntegration_ListenService_MultiInstance(t *testing.T) {
 	}
 	t.Logf("both instances registered as %s", svcLn1.FQDN)
 }
+
+// TestIntegration_TCPProxy_PortMap loads a TOML config with port_map,
+// verifies ExpandedBackends produces correct pairs, then wires up a
+// TCPProxy for each pair and verifies data flows on every mapped port.
+// This catches the original bug where TOML's string-keyed maps silently
+// produced an empty PortMap, resulting in only a single backend pair.
+func TestIntegration_TCPProxy_PortMap(t *testing.T) {
+	// Start two independent echo servers (simulating a multi-port backend).
+	echo1Addr := startEchoServer(t)
+	echo2Addr := startEchoServer(t)
+
+	// Extract the ports from the echo server addresses.
+	_, echo1Port, _ := net.SplitHostPort(echo1Addr)
+	_, echo2Port, _ := net.SplitHostPort(echo2Addr)
+
+	// Build and load a TOML config with port_map.
+	tomlContent := fmt.Sprintf(`
+[tailscale]
+hostname = "waypoint-portmap-test"
+
+[[listeners]]
+name = "multi-port"
+mode = "tcp"
+backend = "127.0.0.1"
+port_map = { "10001" = %s, "10002" = %s }
+`, echo1Port, echo2Port)
+
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "waypoint.toml")
+	if err := os.WriteFile(configPath, []byte(tomlContent), 0644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		t.Fatalf("Load config: %v", err)
+	}
+
+	l := cfg.Listeners[0]
+
+	// Verify PortMap was populated from TOML (the original bug: this was empty).
+	if len(l.PortMap) != 2 {
+		t.Fatalf("PortMap len = %d, want 2 (port_map parsing may have silently failed)", len(l.PortMap))
+	}
+
+	backends := l.ExpandedBackends()
+	if len(backends) != 2 {
+		t.Fatalf("ExpandedBackends returned %d pairs, want 2", len(backends))
+	}
+
+	// Wire up a TCPProxy for each expanded backend and verify echo works.
+	authResult := &auth.AuthResult{
+		LoginName: "portmap-test@example.com",
+		NodeName:  "test-node",
+		Limits:    auth.MergedLimits{MaxConns: 10},
+	}
+
+	for _, be := range backends {
+		be := be
+		t.Run(be.Listen, func(t *testing.T) {
+			addr, _ := setupTCPProxy(t, be.Backend, &mockAuthorizer{result: authResult})
+
+			conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+			if err != nil {
+				t.Fatalf("dial proxy: %v", err)
+			}
+			defer conn.Close()
+
+			msg := fmt.Sprintf("echo-portmap-%s\n", be.Listen)
+			if _, err := conn.Write([]byte(msg)); err != nil {
+				t.Fatalf("write: %v", err)
+			}
+
+			buf := make([]byte, len(msg))
+			conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+			n, err := io.ReadFull(conn, buf)
+			if err != nil {
+				t.Fatalf("read: %v", err)
+			}
+			if string(buf[:n]) != msg {
+				t.Fatalf("echo mismatch: got %q, want %q", string(buf[:n]), msg)
+			}
+		})
+	}
+}
