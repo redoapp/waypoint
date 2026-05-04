@@ -407,6 +407,46 @@ func runServer(ctx context.Context, configPath string, logger *slog.Logger, leve
 					BytesWritten:  &bytesWritten,
 				}
 				go acceptLoop(ctx, &wg, ln, p.HandleConn, logger.With("listener", lCfg.Name))
+
+			case "mongodb":
+				if lCfg.MongoDB == nil {
+					return fmt.Errorf("mongodb listener %s requires [listeners.mongodb] config", lCfg.Name)
+				}
+
+				mongoPeerService := lCfg.Name
+				if lCfg.MongoDB.ServiceName != "" {
+					mongoPeerService = lCfg.MongoDB.ServiceName
+				}
+
+				mongoProvisioner := provision.NewMongoProvisioner(
+					lCfg.MongoDB.AdminUser,
+					lCfg.MongoDB.AdminPassword,
+					be.Backend,
+					lCfg.MongoDB.AuthDatabase,
+					lCfg.MongoDB.UserPrefix,
+					mongoPeerService,
+					lCfg.BackendTLS,
+					store,
+					logger.With("component", "mongo-provisioner", "listener", lCfg.Name),
+					dialer,
+				)
+
+				mp := &proxy.MongoDBProxy{
+					Backend:       be.Backend,
+					Name:          lCfg.Name,
+					ListenAddr:    be.Listen,
+					Auth:          &proxy.TailscaleAuthorizer{LC: lc, Logger: logger.With("listener", lCfg.Name)},
+					Tracker:       tracker,
+					Provisioner:   mongoProvisioner,
+					Metrics:       m,
+					MongoConfig:   lCfg.MongoDB,
+					RevalInterval: revalInterval,
+					Logger:        logger.With("listener", lCfg.Name),
+					Dialer:        dialer,
+					BytesRead:     &bytesRead,
+					BytesWritten:  &bytesWritten,
+				}
+				go acceptLoop(ctx, &wg, ln, mp.HandleConn, logger.With("listener", lCfg.Name))
 			}
 
 			m.SystemListeners.Add(ctx, 1, m.Attrs("waypoint.system.listeners"))

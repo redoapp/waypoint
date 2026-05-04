@@ -71,6 +71,7 @@ type ListenerConfig struct {
 	KeyFile             string         `toml:"key_file"`
 	Service             string         `toml:"service"`
 	Postgres            *PostgresAdmin `toml:"postgres"`
+	MongoDB             *MongoDBAdmin  `toml:"mongodb"`
 	PortMap             map[int]int    `toml:"-"`
 	RawPortMap          map[string]int `toml:"port_map,omitempty"`
 }
@@ -174,6 +175,24 @@ func (p *PostgresAdmin) UserTTLDuration() time.Duration {
 	return d
 }
 
+// MongoDBAdmin holds admin credentials for MongoDB user provisioning.
+type MongoDBAdmin struct {
+	AdminUser     string `toml:"admin_user"`
+	AdminPassword string `toml:"admin_password"`
+	AuthDatabase  string `toml:"auth_database"` // usually "admin"
+	UserPrefix    string `toml:"user_prefix"`
+	UserTTL       string `toml:"user_ttl"`
+	ServiceName   string `toml:"service_name"` // peer.service override for OTel (default: listener name)
+}
+
+func (m *MongoDBAdmin) UserTTLDuration() time.Duration {
+	d, err := time.ParseDuration(m.UserTTL)
+	if err != nil {
+		return 24 * time.Hour
+	}
+	return d
+}
+
 // Load reads and parses a TOML config file, expanding environment variables
 // in string values using ${VAR} syntax.
 func Load(path string) (*Config, error) {
@@ -220,8 +239,8 @@ func validate(cfg *Config) error {
 		names[l.Name] = true
 
 		mode := strings.ToLower(l.Mode)
-		if mode != "tcp" && mode != "postgres" {
-			return fmt.Errorf("listeners[%d].mode must be 'tcp' or 'postgres', got %q", i, l.Mode)
+		if mode != "tcp" && mode != "postgres" && mode != "mongodb" {
+			return fmt.Errorf("listeners[%d].mode must be 'tcp', 'postgres', or 'mongodb', got %q", i, l.Mode)
 		}
 		if l.Backend == "" {
 			return fmt.Errorf("listeners[%d].backend is required", i)
@@ -244,7 +263,7 @@ func validate(cfg *Config) error {
 
 		if hasPortMap {
 			if mode != "tcp" {
-				return fmt.Errorf("listeners[%d]: port_map is only supported for mode \"tcp\", got %q", i, l.Mode)
+				return fmt.Errorf("listeners[%d]: port_map is only supported for mode %q, got %q", i, "tcp", l.Mode)
 			}
 			// Backend must be a host without port when port_map is set.
 			if _, _, err := net.SplitHostPort(l.Backend); err == nil {

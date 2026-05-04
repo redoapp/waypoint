@@ -15,6 +15,7 @@ type CapRule struct {
 // BackendCap holds per-backend capabilities and limits.
 type BackendCap struct {
 	PG     *PGCap     `json:"pg,omitempty"`
+	Mongo  *MongoCap  `json:"mongo,omitempty"`
 	Limits *LimitsCap `json:"limits,omitempty"`
 }
 
@@ -33,6 +34,17 @@ type DBPermissions struct {
 	Permissions []string `json:"permissions"`
 	Schemas     []string `json:"schemas,omitempty"`
 	SQL         []string `json:"sql,omitempty"`
+}
+
+// MongoCap holds MongoDB-specific capabilities.
+type MongoCap struct {
+	Databases map[string]MongoDBPermissions `json:"databases"`
+}
+
+// MongoDBPermissions defines access grants for a MongoDB database.
+// Permissions holds preset names ("readonly", "readwrite", "admin").
+type MongoDBPermissions struct {
+	Permissions []string `json:"permissions"`
 }
 
 // LimitsCap defines per-user restriction overrides from ACL grants.
