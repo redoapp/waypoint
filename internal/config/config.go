@@ -63,6 +63,7 @@ type ListenerConfig struct {
 	Listen              string         `toml:"listen"`
 	Mode                string         `toml:"mode"`
 	Backend             string         `toml:"backend"`
+	Advertise           string         `toml:"advertise"`
 	BackendViaTailscale bool           `toml:"backend_via_tailscale"`
 	BackendTLS          bool           `toml:"tls"`
 	PostgresTLSMode     string         `toml:"tls_mode"`
@@ -103,8 +104,9 @@ func (l ListenerConfig) EffectiveUseTailscaleTLS() bool {
 
 // BackendPair holds a resolved listen address and backend address.
 type BackendPair struct {
-	Listen  string
-	Backend string
+	Listen    string
+	Backend   string
+	Advertise string
 }
 
 // ExpandedBackends returns (listenAddr, backendAddr) pairs.
@@ -112,8 +114,23 @@ type BackendPair struct {
 // For multi-port listeners (PortMap set), returns one pair per mapping,
 // sorted by listen port for deterministic ordering.
 func (l *ListenerConfig) ExpandedBackends() []BackendPair {
+	if l.MongoDB != nil && len(l.MongoDB.Members) > 0 {
+		pairs := make([]BackendPair, 0, len(l.MongoDB.Members))
+		for _, member := range l.MongoDB.Members {
+			pairs = append(pairs, BackendPair{
+				Listen:    member.Listen,
+				Backend:   member.Backend,
+				Advertise: member.Advertise,
+			})
+		}
+		sort.Slice(pairs, func(i, j int) bool {
+			return pairs[i].Listen < pairs[j].Listen
+		})
+		return pairs
+	}
+
 	if len(l.PortMap) == 0 {
-		return []BackendPair{{Listen: l.Listen, Backend: l.Backend}}
+		return []BackendPair{{Listen: l.Listen, Backend: l.Backend, Advertise: l.Advertise}}
 	}
 
 	// Extract bind host from Listen field (e.g., "0.0.0.0" → "0.0.0.0", "" → "").
@@ -177,12 +194,21 @@ func (p *PostgresAdmin) UserTTLDuration() time.Duration {
 
 // MongoDBAdmin holds admin credentials for MongoDB user provisioning.
 type MongoDBAdmin struct {
-	AdminUser     string `toml:"admin_user"`
-	AdminPassword string `toml:"admin_password"`
-	AuthDatabase  string `toml:"auth_database"` // usually "admin"
-	UserPrefix    string `toml:"user_prefix"`
-	UserTTL       string `toml:"user_ttl"`
-	ServiceName   string `toml:"service_name"` // peer.service override for OTel (default: listener name)
+	AdminUser     string          `toml:"admin_user"`
+	AdminPassword string          `toml:"admin_password"`
+	AuthDatabase  string          `toml:"auth_database"` // usually "admin"
+	UserPrefix    string          `toml:"user_prefix"`
+	UserTTL       string          `toml:"user_ttl"`
+	ServiceName   string          `toml:"service_name"` // peer.service override for OTel (default: listener name)
+	ReplicaSet    string          `toml:"replica_set"`  // optional replica set name for admin provisioning
+	Members       []MongoDBMember `toml:"members"`
+}
+
+// MongoDBMember maps one replica set member to a Waypoint listener.
+type MongoDBMember struct {
+	Backend   string `toml:"backend"`   // backend address as MongoDB advertises it, e.g. mongo1:27017
+	Listen    string `toml:"listen"`    // Waypoint bind address for this member, e.g. :27017
+	Advertise string `toml:"advertise"` // client-visible proxy address, e.g. waypoint-db:27017
 }
 
 func (m *MongoDBAdmin) UserTTLDuration() time.Duration {
@@ -242,8 +268,13 @@ func validate(cfg *Config) error {
 		if mode != "tcp" && mode != "postgres" && mode != "mongodb" {
 			return fmt.Errorf("listeners[%d].mode must be 'tcp', 'postgres', or 'mongodb', got %q", i, l.Mode)
 		}
-		if l.Backend == "" {
+		hasMongoMembers := mode == "mongodb" && l.MongoDB != nil && len(l.MongoDB.Members) > 0
+		if l.Backend == "" && !hasMongoMembers {
 			return fmt.Errorf("listeners[%d].backend is required", i)
+		}
+		if hasMongoMembers && l.Backend == "" {
+			l.Backend = l.MongoDB.Members[0].Backend
+			cfg.Listeners[i] = l
 		}
 
 		// Convert string-keyed port_map (TOML limitation) to int-keyed map.
@@ -283,9 +314,46 @@ func validate(cfg *Config) error {
 					return fmt.Errorf("listeners[%d]: invalid backend port %d in port_map", i, bp)
 				}
 			}
-		} else {
+		} else if !hasMongoMembers {
 			if l.Listen == "" {
 				return fmt.Errorf("listeners[%d].listen is required", i)
+			}
+		}
+
+		if l.Advertise != "" {
+			if _, _, err := net.SplitHostPort(l.Advertise); err != nil {
+				return fmt.Errorf("listeners[%d].advertise must be host:port, got %q: %w", i, l.Advertise, err)
+			}
+		}
+
+		if l.MongoDB != nil && len(l.MongoDB.Members) > 0 {
+			if mode != "mongodb" {
+				return fmt.Errorf("listeners[%d]: mongodb.members is only supported for mode %q, got %q", i, "mongodb", l.Mode)
+			}
+			if len(l.PortMap) > 0 {
+				return fmt.Errorf("listeners[%d]: mongodb.members cannot be combined with port_map", i)
+			}
+			for j, member := range l.MongoDB.Members {
+				if member.Backend == "" {
+					return fmt.Errorf("listeners[%d].mongodb.members[%d].backend is required", i, j)
+				}
+				if member.Listen == "" {
+					return fmt.Errorf("listeners[%d].mongodb.members[%d].listen is required", i, j)
+				}
+				if _, _, err := net.SplitHostPort(member.Backend); err != nil {
+					return fmt.Errorf("listeners[%d].mongodb.members[%d].backend must be host:port, got %q: %w", i, j, member.Backend, err)
+				}
+				if _, _, err := net.SplitHostPort(member.Listen); err != nil {
+					return fmt.Errorf("listeners[%d].mongodb.members[%d].listen must be host:port, got %q: %w", i, j, member.Listen, err)
+				}
+				if member.Advertise != "" {
+					if _, _, err := net.SplitHostPort(member.Advertise); err != nil {
+						return fmt.Errorf("listeners[%d].mongodb.members[%d].advertise must be host:port, got %q: %w", i, j, member.Advertise, err)
+					}
+				}
+				if l.Service != "" && member.Advertise == "" && l.Advertise == "" {
+					return fmt.Errorf("listeners[%d].mongodb.members[%d].advertise is required when service is set", i, j)
+				}
 			}
 		}
 

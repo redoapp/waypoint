@@ -1,6 +1,7 @@
 package mongowire
 
 import (
+	"bytes"
 	"encoding/binary"
 	"io"
 	"net"
@@ -18,8 +19,9 @@ import (
 // This is inserted between restrict.Relay and the real backend connection
 // so that the raw relay's byte counting still works correctly.
 type TopologyRewriter struct {
-	conn      net.Conn
-	proxyAddr string
+	conn        net.Conn
+	proxyAddr   string
+	topologyMap map[string]string
 
 	mu     sync.Mutex
 	buf    []byte // buffered rewritten bytes not yet consumed by Read
@@ -29,10 +31,18 @@ type TopologyRewriter struct {
 // NewTopologyRewriter creates a wrapper that rewrites topology responses
 // read from conn, replacing member addresses with proxyAddr.
 func NewTopologyRewriter(conn net.Conn, proxyAddr string) *TopologyRewriter {
+	return NewTopologyRewriterWithMap(conn, proxyAddr, nil)
+}
+
+// NewTopologyRewriterWithMap creates a wrapper that rewrites topology
+// responses using topologyMap for known replica set members and proxyAddr as
+// the fallback for unknown members.
+func NewTopologyRewriterWithMap(conn net.Conn, proxyAddr string, topologyMap map[string]string) *TopologyRewriter {
 	return &TopologyRewriter{
-		conn:      conn,
-		proxyAddr: proxyAddr,
-		rawBuf:    make([]byte, 64*1024),
+		conn:        conn,
+		proxyAddr:   proxyAddr,
+		topologyMap: cloneTopologyMap(topologyMap),
+		rawBuf:      make([]byte, 64*1024),
 	}
 }
 
@@ -77,14 +87,18 @@ func (r *TopologyRewriter) Read(p []byte) (int, error) {
 		opCode := int32(binary.LittleEndian.Uint32(msg[12:16]))
 		if opCode == OpMsg {
 			body := msg[headerSize:]
-			rewritten := RewriteTopology(body, r.proxyAddr)
-			if len(rewritten) != len(body) {
-				// Body size changed — rebuild the complete message.
-				newMsg := make([]byte, headerSize+len(rewritten))
-				binary.LittleEndian.PutUint32(newMsg[0:4], uint32(len(newMsg)))
-				copy(newMsg[4:headerSize], msg[4:headerSize]) // requestID, responseTo, opCode
-				copy(newMsg[headerSize:], rewritten)
-				msg = newMsg
+			rewritten := RewriteTopologyWithMap(body, r.proxyAddr, r.topologyMap)
+			if !bytes.Equal(rewritten, body) {
+				// Rebuild the complete message if the rewrite changed size.
+				if len(rewritten) != len(body) {
+					newMsg := make([]byte, headerSize+len(rewritten))
+					binary.LittleEndian.PutUint32(newMsg[0:4], uint32(len(newMsg)))
+					copy(newMsg[4:headerSize], msg[4:headerSize]) // requestID, responseTo, opCode
+					copy(newMsg[headerSize:], rewritten)
+					msg = newMsg
+				} else {
+					copy(msg[headerSize:], rewritten)
+				}
 			}
 		}
 	}
@@ -95,6 +109,17 @@ func (r *TopologyRewriter) Read(p []byte) (int, error) {
 		r.buf = append(r.buf[:0], msg[n:]...)
 	}
 	return n, nil
+}
+
+func cloneTopologyMap(topologyMap map[string]string) map[string]string {
+	if len(topologyMap) == 0 {
+		return nil
+	}
+	cloned := make(map[string]string, len(topologyMap))
+	for k, v := range topologyMap {
+		cloned[k] = v
+	}
+	return cloned
 }
 
 // Write passes through to the underlying connection unchanged.

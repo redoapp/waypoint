@@ -60,6 +60,21 @@ func TestMongoFormatUsername_ShortNoHash(t *testing.T) {
 	}
 }
 
+func TestMongoAdminURI_Standalone(t *testing.T) {
+	uri := mongoAdminURI("admin", "pass", []string{"mongo1:27017"}, "", "admin", false)
+	if uri != "mongodb://admin:pass@mongo1:27017/admin?directConnection=true" {
+		t.Fatalf("uri = %q", uri)
+	}
+}
+
+func TestMongoAdminURI_ReplicaSet(t *testing.T) {
+	uri := mongoAdminURI("admin", "pass", []string{"mongo1:27017", "mongo2:27017", "mongo3:27017"}, "rs0", "admin", true)
+	want := "mongodb://admin:pass@mongo1:27017,mongo2:27017,mongo3:27017/admin?replicaSet=rs0&tls=true"
+	if uri != want {
+		t.Fatalf("uri = %q, want %q", uri, want)
+	}
+}
+
 func TestExpandMongoPresets_Readonly(t *testing.T) {
 	roles, err := ExpandMongoPresets([]string{"readonly"}, "mydb")
 	if err != nil {

@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -48,25 +50,21 @@ type MongoProvisioner struct {
 
 // NewMongoProvisioner creates a new MongoProvisioner.
 func NewMongoProvisioner(adminUser, adminPassword, backend, authDatabase, userPrefix, peerService string, backendTLS bool, store *restrict.RedisStore, logger *slog.Logger, dialFunc func(ctx context.Context, network, addr string) (net.Conn, error)) *MongoProvisioner {
-	scheme := "mongodb"
-	if backendTLS {
-		scheme = "mongodb+srv"
-	}
-	// directConnection=true prevents the Go driver from attempting RS topology
-	// discovery with internal addresses. Not compatible with mongodb+srv.
-	connOpts := "?directConnection=true"
-	if backendTLS {
-		connOpts = "" // SRV URIs don't support directConnection
-	}
-	uri := fmt.Sprintf("%s://%s:%s@%s/%s%s",
-		scheme, adminUser, adminPassword, backend, authDatabase, connOpts)
+	return NewMongoReplicaSetProvisioner(adminUser, adminPassword, []string{backend}, "", authDatabase, userPrefix, peerService, backendTLS, store, logger, dialFunc)
+}
 
+// NewMongoReplicaSetProvisioner creates a Mongo provisioner that can discover
+// the primary from a replica set seed list. When replicaSet is empty and a
+// single backend is supplied, it uses directConnection=true for standalone
+// compatibility.
+func NewMongoReplicaSetProvisioner(adminUser, adminPassword string, backends []string, replicaSet, authDatabase, userPrefix, peerService string, backendTLS bool, store *restrict.RedisStore, logger *slog.Logger, dialFunc func(ctx context.Context, network, addr string) (net.Conn, error)) *MongoProvisioner {
 	if userPrefix == "" {
 		userPrefix = "wp_"
 	}
 	if authDatabase == "" {
 		authDatabase = "admin"
 	}
+	uri := mongoAdminURI(adminUser, adminPassword, backends, replicaSet, authDatabase, backendTLS)
 
 	return &MongoProvisioner{
 		adminURI:    uri,
@@ -77,6 +75,42 @@ func NewMongoProvisioner(adminUser, adminPassword, backend, authDatabase, userPr
 		logger:      logger,
 		dialFunc:    dialFunc,
 	}
+}
+
+func mongoAdminURI(adminUser, adminPassword string, backends []string, replicaSet, authDatabase string, backendTLS bool) string {
+	cleanBackends := make([]string, 0, len(backends))
+	for _, backend := range backends {
+		if backend != "" {
+			cleanBackends = append(cleanBackends, backend)
+		}
+	}
+	if len(cleanBackends) == 0 {
+		cleanBackends = []string{"localhost:27017"}
+	}
+
+	q := url.Values{}
+	if replicaSet != "" {
+		q.Set("replicaSet", replicaSet)
+	} else if len(cleanBackends) == 1 {
+		// Keep standalone and single-seed behavior from trying to discover
+		// internal replica-set addresses unless explicitly configured.
+		q.Set("directConnection", "true")
+	}
+	if backendTLS {
+		q.Set("tls", "true")
+	}
+
+	query := q.Encode()
+	if query != "" {
+		query = "?" + query
+	}
+
+	return fmt.Sprintf("mongodb://%s@%s/%s%s",
+		url.UserPassword(adminUser, adminPassword).String(),
+		strings.Join(cleanBackends, ","),
+		url.PathEscape(authDatabase),
+		query,
+	)
 }
 
 // EnsureUser creates or updates a dynamic MongoDB user for the given identity

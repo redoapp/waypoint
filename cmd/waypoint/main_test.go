@@ -247,3 +247,51 @@ func mustNamedCertificateFiles(t *testing.T, dnsName string) (string, string) {
 func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
+
+func TestAdvertisedAddrUsesMemberAdvertise(t *testing.T) {
+	got, err := advertisedAddr(config.ListenerConfig{}, config.BackendPair{
+		Listen:    ":27017",
+		Advertise: "mongo-proxy:27017",
+	}, "waypoint-db", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "mongo-proxy:27017" {
+		t.Fatalf("advertisedAddr = %q, want mongo-proxy:27017", got)
+	}
+}
+
+func TestAdvertisedAddrDefaultsToTailscaleHostname(t *testing.T) {
+	got, err := advertisedAddr(config.ListenerConfig{}, config.BackendPair{
+		Listen: ":27018",
+	}, "waypoint-db", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "waypoint-db:27018" {
+		t.Fatalf("advertisedAddr = %q, want waypoint-db:27018", got)
+	}
+}
+
+func TestBuildMongoTopologyMap(t *testing.T) {
+	lCfg := config.ListenerConfig{
+		Name: "mongo-prod",
+		MongoDB: &config.MongoDBAdmin{
+			Members: []config.MongoDBMember{
+				{Backend: "mongo1.internal:27017", Listen: ":27017", Advertise: "waypoint:27017"},
+				{Backend: "mongo2.internal:27017", Listen: ":27018", Advertise: "waypoint:27018"},
+			},
+		},
+	}
+	pairs := lCfg.ExpandedBackends()
+	topologyMap, err := buildMongoTopologyMap(lCfg, pairs, "waypoint")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if topologyMap["mongo1.internal:27017"] != "waypoint:27017" {
+		t.Fatalf("mongo1 map = %q", topologyMap["mongo1.internal:27017"])
+	}
+	if topologyMap["mongo2.internal:27017"] != "waypoint:27018" {
+		t.Fatalf("mongo2 map = %q", topologyMap["mongo2.internal:27017"])
+	}
+}

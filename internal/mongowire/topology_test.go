@@ -85,6 +85,76 @@ func TestRewriteTopology_ReplicaSet(t *testing.T) {
 	}
 }
 
+func TestRewriteTopology_ReplicaSetWithMap(t *testing.T) {
+	body := buildTestOpMsgBody(bson.D{
+		{Key: "ismaster", Value: true},
+		{Key: "hosts", Value: bson.A{"mongo1.internal:27017", "mongo2.internal:27017", "mongo3.internal:27017"}},
+		{Key: "me", Value: "mongo2.internal:27017"},
+		{Key: "primary", Value: "mongo1.internal:27017"},
+		{Key: "setName", Value: "rs0"},
+		{Key: "ok", Value: 1.0},
+	})
+
+	rewritten := RewriteTopologyWithMap(body, "waypoint-fallback:27017", map[string]string{
+		"mongo1.internal:27017": "waypoint:27017",
+		"mongo2.internal:27017": "waypoint:27018",
+		"mongo3.internal:27017": "waypoint:27019",
+	})
+	doc := parseTestOpMsgBody(t, rewritten)
+
+	for _, e := range doc {
+		switch e.Key {
+		case "hosts":
+			arr := e.Value.(bson.A)
+			want := []string{"waypoint:27017", "waypoint:27018", "waypoint:27019"}
+			for i := range want {
+				if arr[i] != want[i] {
+					t.Errorf("hosts[%d] = %q, want %q", i, arr[i], want[i])
+				}
+			}
+		case "me":
+			if e.Value != "waypoint:27018" {
+				t.Errorf("me = %q, want waypoint:27018", e.Value)
+			}
+		case "primary":
+			if e.Value != "waypoint:27017" {
+				t.Errorf("primary = %q, want waypoint:27017", e.Value)
+			}
+		}
+	}
+}
+
+func TestRewriteTopology_ReplicaSetWithMapFallback(t *testing.T) {
+	body := buildTestOpMsgBody(bson.D{
+		{Key: "ismaster", Value: true},
+		{Key: "hosts", Value: bson.A{"mongo1.internal:27017", "mongo2.internal:27017"}},
+		{Key: "primary", Value: "mongo2.internal:27017"},
+		{Key: "ok", Value: 1.0},
+	})
+
+	rewritten := RewriteTopologyWithMap(body, "waypoint-fallback:27017", map[string]string{
+		"mongo1.internal:27017": "waypoint:27017",
+	})
+	doc := parseTestOpMsgBody(t, rewritten)
+
+	for _, e := range doc {
+		switch e.Key {
+		case "hosts":
+			arr := e.Value.(bson.A)
+			if arr[0] != "waypoint:27017" {
+				t.Errorf("hosts[0] = %q, want waypoint:27017", arr[0])
+			}
+			if arr[1] != "waypoint-fallback:27017" {
+				t.Errorf("hosts[1] = %q, want waypoint-fallback:27017", arr[1])
+			}
+		case "primary":
+			if e.Value != "waypoint-fallback:27017" {
+				t.Errorf("primary = %q, want waypoint-fallback:27017", e.Value)
+			}
+		}
+	}
+}
+
 func TestRewriteTopology_NoTopologyFields(t *testing.T) {
 	body := buildTestOpMsgBody(bson.D{
 		{Key: "ok", Value: 1.0},

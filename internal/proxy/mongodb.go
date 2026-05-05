@@ -31,6 +31,7 @@ type MongoDBProxy struct {
 	Provisioner   *provision.MongoProvisioner
 	Metrics       *metrics.Metrics
 	MongoConfig   *config.MongoDBAdmin
+	TopologyMap   map[string]string
 	RevalInterval time.Duration
 	Logger        *slog.Logger
 	Dialer        func(ctx context.Context, network, addr string) (net.Conn, error)
@@ -247,7 +248,7 @@ func (p *MongoDBProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 		proxyAddr = clientConn.LocalAddr().String()
 	}
 
-	hsResult, err := mongowire.CompleteHandshake(clientConn, clientHello, backendHelloDoc, proxyAddr)
+	hsResult, err := mongowire.CompleteHandshakeWithTopologyMap(clientConn, clientHello, backendHelloDoc, proxyAddr, p.TopologyMap)
 	if err != nil {
 		setupSpan.RecordError(err)
 		setupSpan.SetStatus(codes.Error, "client handshake failed")
@@ -295,7 +296,7 @@ func (p *MongoDBProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 			return
 		}
 		if resp.Header.OpCode == mongowire.OpMsg {
-			resp.Body = mongowire.RewriteTopology(resp.Body, proxyAddr)
+			resp.Body = mongowire.RewriteTopologyWithMap(resp.Body, proxyAddr, p.TopologyMap)
 			// Update message length if body size changed.
 			resp.Header.MessageLength = int32(mongowire.HeaderSize + len(resp.Body))
 		}
@@ -314,7 +315,7 @@ func (p *MongoDBProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 
 	// Step 10: Wrap backend with topology rewriter so replica set member
 	// addresses in hello/isMaster responses point to the proxy.
-	rewrittenBackend := mongowire.NewTopologyRewriter(backendConn, proxyAddr)
+	rewrittenBackend := mongowire.NewTopologyRewriterWithMap(backendConn, proxyAddr, p.TopologyMap)
 
 	// Step 11: Bidirectional relay with limits.
 	cl := p.Tracker.WrapConn(ctx, result.LoginName, result.Limits, p.Name)

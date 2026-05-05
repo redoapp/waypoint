@@ -108,6 +108,107 @@ func TestTopologyRewriter_RewritesTopology(t *testing.T) {
 	}
 }
 
+func TestTopologyRewriter_RewritesTopologyWithMap(t *testing.T) {
+	raw, _ := bson.Marshal(bson.D{
+		{Key: "ismaster", Value: true},
+		{Key: "hosts", Value: bson.A{"mongo1:27017", "mongo2:27017"}},
+		{Key: "me", Value: "mongo2:27017"},
+		{Key: "primary", Value: "mongo1:27017"},
+		{Key: "ok", Value: 1.0},
+	})
+	body := BuildOpMsg(0, raw)
+	wireMsg := buildWireMessage(OpMsg, body)
+
+	serverConn, clientConn := net.Pipe()
+	defer serverConn.Close()
+	defer clientConn.Close()
+
+	go func() {
+		serverConn.Write(wireMsg)
+		serverConn.Close()
+	}()
+
+	rw := NewTopologyRewriterWithMap(clientConn, "proxy-fallback:27017", map[string]string{
+		"mongo1:27017": "proxy:27017",
+		"mongo2:27017": "proxy:27018",
+	})
+
+	result, err := readFullMessage(rw)
+	if err != nil {
+		t.Fatalf("read message: %v", err)
+	}
+
+	_, doc, err := ParseOpMsgBody(result[headerSize:])
+	if err != nil {
+		t.Fatalf("ParseOpMsgBody: %v", err)
+	}
+	var d bson.D
+	if err := bson.Unmarshal(doc, &d); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	for _, e := range d {
+		switch e.Key {
+		case "hosts":
+			arr := e.Value.(bson.A)
+			if arr[0] != "proxy:27017" || arr[1] != "proxy:27018" {
+				t.Errorf("hosts not mapped: %v", arr)
+			}
+		case "me":
+			if e.Value != "proxy:27018" {
+				t.Errorf("me = %q, want proxy:27018", e.Value)
+			}
+		case "primary":
+			if e.Value != "proxy:27017" {
+				t.Errorf("primary = %q, want proxy:27017", e.Value)
+			}
+		}
+	}
+}
+
+func TestTopologyRewriter_RewritesSameLengthAddress(t *testing.T) {
+	raw, _ := bson.Marshal(bson.D{
+		{Key: "ismaster", Value: true},
+		{Key: "hosts", Value: bson.A{"mongo1:27017"}},
+		{Key: "ok", Value: 1.0},
+	})
+	wireMsg := buildWireMessage(OpMsg, BuildOpMsg(0, raw))
+
+	serverConn, clientConn := net.Pipe()
+	defer serverConn.Close()
+	defer clientConn.Close()
+
+	go func() {
+		serverConn.Write(wireMsg)
+		serverConn.Close()
+	}()
+
+	rw := NewTopologyRewriterWithMap(clientConn, "proxy1:27017", map[string]string{
+		"mongo1:27017": "proxy1:27017",
+	})
+	result, err := readFullMessage(rw)
+	if err != nil {
+		t.Fatalf("read message: %v", err)
+	}
+
+	_, doc, err := ParseOpMsgBody(result[headerSize:])
+	if err != nil {
+		t.Fatalf("ParseOpMsgBody: %v", err)
+	}
+	var d bson.D
+	if err := bson.Unmarshal(doc, &d); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	for _, e := range d {
+		if e.Key == "hosts" {
+			arr := e.Value.(bson.A)
+			if arr[0] != "proxy1:27017" {
+				t.Fatalf("hosts[0] = %q, want proxy1:27017", arr[0])
+			}
+		}
+	}
+}
+
 func TestTopologyRewriter_PassthroughNonTopology(t *testing.T) {
 	// Build a non-topology OP_MSG.
 	raw, _ := bson.Marshal(bson.D{

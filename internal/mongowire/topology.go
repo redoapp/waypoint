@@ -2,6 +2,7 @@ package mongowire
 
 import (
 	"encoding/binary"
+	"net"
 	"strings"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -24,6 +25,13 @@ var topologyFields = []string{"hosts", "passives", "arbiters"}
 // 4-byte CRC32 is stripped and the flag is cleared, since the checksum
 // would be invalidated by rewriting.
 func RewriteTopology(body []byte, proxyAddr string) []byte {
+	return RewriteTopologyWithMap(body, proxyAddr, nil)
+}
+
+// RewriteTopologyWithMap is like RewriteTopology, but it maps each backend
+// member address to a specific proxy address when topologyMap contains one.
+// Addresses missing from topologyMap fall back to proxyAddr.
+func RewriteTopologyWithMap(body []byte, proxyAddr string, topologyMap map[string]string) []byte {
 	if len(body) < 5 {
 		return body
 	}
@@ -62,7 +70,7 @@ func RewriteTopology(body []byte, proxyAddr string) []byte {
 	}
 
 	// Rewrite the document.
-	rewritten, err := rewriteTopologyDoc(doc, proxyAddr)
+	rewritten, err := rewriteTopologyDoc(doc, proxyAddr, topologyMap)
 	if err != nil {
 		return body // on error, pass through unchanged
 	}
@@ -82,7 +90,7 @@ func RewriteTopology(body []byte, proxyAddr string) []byte {
 }
 
 // rewriteTopologyDoc rewrites topology fields in a hello/isMaster BSON document.
-func rewriteTopologyDoc(doc bson.Raw, proxyAddr string) ([]byte, error) {
+func rewriteTopologyDoc(doc bson.Raw, proxyAddr string, topologyMap map[string]string) ([]byte, error) {
 	// Decode into ordered D so we preserve field order.
 	var d bson.D
 	if err := bson.Unmarshal(doc, &d); err != nil {
@@ -97,7 +105,9 @@ func rewriteTopologyDoc(doc bson.Raw, proxyAddr string) ([]byte, error) {
 			if key == tf {
 				if arr, ok := d[i].Value.(bson.A); ok {
 					for j := range arr {
-						arr[j] = proxyAddr
+						if s, ok := arr[j].(string); ok {
+							arr[j] = rewriteTopologyAddr(s, proxyAddr, topologyMap)
+						}
 					}
 					d[i].Value = arr
 				}
@@ -107,14 +117,49 @@ func rewriteTopologyDoc(doc bson.Raw, proxyAddr string) ([]byte, error) {
 
 		// Rewrite "me" field.
 		if key == "me" {
-			d[i].Value = proxyAddr
+			if s, ok := d[i].Value.(string); ok {
+				d[i].Value = rewriteTopologyAddr(s, proxyAddr, topologyMap)
+			}
 		}
 
 		// Rewrite "primary" field.
 		if key == "primary" {
-			d[i].Value = proxyAddr
+			if s, ok := d[i].Value.(string); ok {
+				d[i].Value = rewriteTopologyAddr(s, proxyAddr, topologyMap)
+			}
 		}
 	}
 
 	return bson.Marshal(d)
+}
+
+func rewriteTopologyAddr(addr, proxyAddr string, topologyMap map[string]string) string {
+	if mapped := lookupTopologyMap(addr, topologyMap); mapped != "" {
+		return mapped
+	}
+	if proxyAddr != "" {
+		return proxyAddr
+	}
+	return addr
+}
+
+func lookupTopologyMap(addr string, topologyMap map[string]string) string {
+	if len(topologyMap) == 0 {
+		return ""
+	}
+	if mapped := topologyMap[addr]; mapped != "" {
+		return mapped
+	}
+	if mapped := topologyMap[strings.ToLower(addr)]; mapped != "" {
+		return mapped
+	}
+
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return ""
+	}
+	if mapped := topologyMap[net.JoinHostPort(strings.ToLower(host), port)]; mapped != "" {
+		return mapped
+	}
+	return topologyMap[strings.ToLower(host)+":"+port]
 }

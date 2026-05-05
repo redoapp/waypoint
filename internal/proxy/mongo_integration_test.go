@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
@@ -231,37 +232,93 @@ func TestIntegration_MongoProxy_NoPermissions(t *testing.T) {
 }
 
 func TestIntegration_MongoProxy_ConnectionLimit(t *testing.T) {
-	// Use maxConns=3 to allow the Go driver's connection pool (2 conns)
-	// for the first client, then reject the third from the second client.
 	result := makeMongoAuthResult(map[string]auth.MongoDBPermissions{
 		"limitdb": {Permissions: []string{"readonly"}},
-	}, &auth.LimitsCap{MaxConns: 3})
+	}, &auth.LimitsCap{MaxConns: 2})
 
 	addr := setupMongoProxy(t, result, nil)
 
-	// First client (uses 2 pool connections).
-	client1 := mongoProxyConnect(t, addr, "limitdb")
-	if err := client1.Ping(context.Background(), nil); err != nil {
-		t.Fatalf("first client ping: %v", err)
-	}
+	// Hold two raw Mongo handshakes open so the proxy slots are deterministically
+	// occupied without relying on driver pool/monitor socket behavior.
+	conn1, doc1 := openMongoProxyHello(t, addr)
+	t.Cleanup(func() { conn1.Close() })
+	assertMongoHelloOK(t, doc1)
 
-	// Second client — should push over the limit.
-	uri := fmt.Sprintf("mongodb://%s/limitdb?serverSelectionTimeoutMS=5000", addr)
-	opts := options.Client().ApplyURI(uri)
-	client2, err := mongo.Connect(opts)
+	conn2, doc2 := openMongoProxyHello(t, addr)
+	t.Cleanup(func() { conn2.Close() })
+	assertMongoHelloOK(t, doc2)
+
+	conn3, doc3 := openMongoProxyHello(t, addr)
+	t.Cleanup(func() { conn3.Close() })
+
+	var resp struct {
+		OK     float64 `bson:"ok"`
+		Errmsg string  `bson:"errmsg"`
+	}
+	if err := bson.Unmarshal(doc3, &resp); err != nil {
+		t.Fatalf("unmarshal limit response: %v", err)
+	}
+	if resp.OK != 0 || !strings.Contains(resp.Errmsg, "too many connections") {
+		t.Fatalf("expected connection limit error, got ok=%v errmsg=%q", resp.OK, resp.Errmsg)
+	}
+}
+
+func openMongoProxyHello(t *testing.T, addr string) (net.Conn, bson.Raw) {
+	t.Helper()
+
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
 	if err != nil {
-		t.Fatalf("connect: %v", err)
+		t.Fatalf("dial proxy: %v", err)
 	}
-	defer client2.Disconnect(context.Background())
 
-	err = client2.Ping(context.Background(), nil)
-	if err == nil {
-		t.Fatal("expected second client to be rejected due to limit")
+	hello, err := mongowire.BuildHelloCommand("admin")
+	if err != nil {
+		conn.Close()
+		t.Fatalf("build hello: %v", err)
 	}
-	// Verify the error is connection-related (limit or auth failure from closed conn).
-	errStr := err.Error()
-	if !strings.Contains(errStr, "too many connections") && !strings.Contains(errStr, "connection") && !strings.Contains(errStr, "auth") {
-		t.Errorf("unexpected error type (expected connection limit): %v", err)
+	if err := mongowire.WriteMessage(conn, hello); err != nil {
+		conn.Close()
+		t.Fatalf("write hello: %v", err)
+	}
+
+	if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		conn.Close()
+		t.Fatalf("set read deadline: %v", err)
+	}
+	msg, err := mongowire.ReadMessage(conn)
+	if err != nil {
+		conn.Close()
+		t.Fatalf("read hello response: %v", err)
+	}
+	if err := conn.SetReadDeadline(time.Time{}); err != nil {
+		conn.Close()
+		t.Fatalf("clear read deadline: %v", err)
+	}
+	if msg.Header.OpCode != mongowire.OpMsg {
+		conn.Close()
+		t.Fatalf("hello response opcode = %d, want %d", msg.Header.OpCode, mongowire.OpMsg)
+	}
+
+	_, doc, err := mongowire.ParseOpMsgBody(msg.Body)
+	if err != nil {
+		conn.Close()
+		t.Fatalf("parse hello response: %v", err)
+	}
+	return conn, doc
+}
+
+func assertMongoHelloOK(t *testing.T, doc bson.Raw) {
+	t.Helper()
+
+	var resp struct {
+		OK     float64 `bson:"ok"`
+		Errmsg string  `bson:"errmsg"`
+	}
+	if err := bson.Unmarshal(doc, &resp); err != nil {
+		t.Fatalf("unmarshal hello response: %v", err)
+	}
+	if resp.OK != 1 {
+		t.Fatalf("expected successful hello, got ok=%v errmsg=%q", resp.OK, resp.Errmsg)
 	}
 }
 

@@ -108,6 +108,12 @@ func ReadClientHello(clientConn net.Conn) (*ClientHello, error) {
 //     If it's a regular command, buffers it in FirstCommand.
 //   - With credentials: full SCRAM-SHA-256 exchange using DummyPassword.
 func CompleteHandshake(clientConn net.Conn, hello *ClientHello, backendHelloDoc bson.Raw, proxyAddr string) (*ClientHandshakeResult, error) {
+	return CompleteHandshakeWithTopologyMap(clientConn, hello, backendHelloDoc, proxyAddr, nil)
+}
+
+// CompleteHandshakeWithTopologyMap is like CompleteHandshake, but rewrites
+// each known backend replica-set member to its configured proxy address.
+func CompleteHandshakeWithTopologyMap(clientConn net.Conn, hello *ClientHello, backendHelloDoc bson.Raw, proxyAddr string, topologyMap map[string]string) (*ClientHandshakeResult, error) {
 	result := &ClientHandshakeResult{
 		AuthDB:   hello.AuthDB,
 		Username: hello.Username,
@@ -116,11 +122,11 @@ func CompleteHandshake(clientConn net.Conn, hello *ClientHello, backendHelloDoc 
 	if hello.SpecAuth != nil {
 		// Client has credentials and is doing speculative auth.
 		srv := NewSCRAMServer()
-		return handleSpecAuth(clientConn, hello, srv, backendHelloDoc, proxyAddr, result)
+		return handleSpecAuth(clientConn, hello, srv, backendHelloDoc, proxyAddr, topologyMap, result)
 	}
 
 	// No speculative auth. Send hello reply and see what the client does next.
-	return handlePostHello(clientConn, hello, backendHelloDoc, proxyAddr, result)
+	return handlePostHello(clientConn, hello, backendHelloDoc, proxyAddr, topologyMap, result)
 }
 
 // HandleClientHandshake is a convenience wrapper that uses a fabricated hello
@@ -140,8 +146,8 @@ func HandleClientHandshake(clientConn net.Conn) (*ClientHandshakeResult, error) 
 
 // handlePostHello sends the hello reply and reads the next message to determine
 // whether the client is authenticating or sending a regular command.
-func handlePostHello(clientConn net.Conn, hello *ClientHello, backendHelloDoc bson.Raw, proxyAddr string, result *ClientHandshakeResult) (*ClientHandshakeResult, error) {
-	if err := sendHelloReply(clientConn, hello, backendHelloDoc, proxyAddr); err != nil {
+func handlePostHello(clientConn net.Conn, hello *ClientHello, backendHelloDoc bson.Raw, proxyAddr string, topologyMap map[string]string, result *ClientHandshakeResult) (*ClientHandshakeResult, error) {
+	if err := sendHelloReply(clientConn, hello, backendHelloDoc, proxyAddr, topologyMap); err != nil {
 		return nil, err
 	}
 
@@ -209,7 +215,7 @@ func handleSASLStart(clientConn net.Conn, startMsg *Message, startDoc bson.Raw, 
 }
 
 // handleSpecAuth handles the speculative authentication path.
-func handleSpecAuth(clientConn net.Conn, hello *ClientHello, srv *SCRAMServer, backendHelloDoc bson.Raw, proxyAddr string, result *ClientHandshakeResult) (*ClientHandshakeResult, error) {
+func handleSpecAuth(clientConn net.Conn, hello *ClientHello, srv *SCRAMServer, backendHelloDoc bson.Raw, proxyAddr string, topologyMap map[string]string, result *ClientHandshakeResult) (*ClientHandshakeResult, error) {
 	var specCmd struct {
 		Mechanism string      `bson:"mechanism"`
 		Payload   bson.Binary `bson:"payload"`
@@ -246,7 +252,7 @@ func handleSpecAuth(clientConn net.Conn, hello *ClientHello, srv *SCRAMServer, b
 	}
 
 	// Build hello reply from backend's real capabilities + topology rewriting.
-	helloReplyDoc, err := buildClientHelloReply(backendHelloDoc, proxyAddr)
+	helloReplyDoc, err := buildClientHelloReply(backendHelloDoc, proxyAddr, topologyMap)
 	if err != nil {
 		return nil, fmt.Errorf("build hello reply: %w", err)
 	}
@@ -329,8 +335,8 @@ func readAndCompleteSASL(clientConn net.Conn, srv *SCRAMServer, clientFirst, ser
 
 // sendHelloReply sends a hello reply in either OP_MSG or OP_REPLY format,
 // using the backend's real hello document with topology rewriting.
-func sendHelloReply(conn net.Conn, hello *ClientHello, backendHelloDoc bson.Raw, proxyAddr string) error {
-	replyDoc, err := buildClientHelloReply(backendHelloDoc, proxyAddr)
+func sendHelloReply(conn net.Conn, hello *ClientHello, backendHelloDoc bson.Raw, proxyAddr string, topologyMap map[string]string) error {
+	replyDoc, err := buildClientHelloReply(backendHelloDoc, proxyAddr, topologyMap)
 	if err != nil {
 		return fmt.Errorf("build hello reply: %w", err)
 	}
@@ -344,7 +350,7 @@ func sendHelloReply(conn net.Conn, hello *ClientHello, backendHelloDoc bson.Raw,
 // buildClientHelloReply takes the backend's real hello response and prepares
 // it for the client. It rewrites topology fields to the proxy address, ensures
 // SCRAM-SHA-256 is advertised, and strips compression.
-func buildClientHelloReply(backendHelloDoc bson.Raw, proxyAddr string) (bson.Raw, error) {
+func buildClientHelloReply(backendHelloDoc bson.Raw, proxyAddr string, topologyMap map[string]string) (bson.Raw, error) {
 	var d bson.D
 	if err := bson.Unmarshal(backendHelloDoc, &d); err != nil {
 		return nil, fmt.Errorf("unmarshal backend hello: %w", err)
@@ -360,7 +366,9 @@ func buildClientHelloReply(backendHelloDoc bson.Raw, proxyAddr string) (bson.Raw
 			if key == tf {
 				if arr, ok := d[i].Value.(bson.A); ok && proxyAddr != "" {
 					for j := range arr {
-						arr[j] = proxyAddr
+						if s, ok := arr[j].(string); ok {
+							arr[j] = rewriteTopologyAddr(s, proxyAddr, topologyMap)
+						}
 					}
 					d[i].Value = arr
 				}
@@ -370,7 +378,9 @@ func buildClientHelloReply(backendHelloDoc bson.Raw, proxyAddr string) (bson.Raw
 
 		// Rewrite singular topology fields.
 		if (key == "me" || key == "primary") && proxyAddr != "" {
-			d[i].Value = proxyAddr
+			if s, ok := d[i].Value.(string); ok {
+				d[i].Value = rewriteTopologyAddr(s, proxyAddr, topologyMap)
+			}
 		}
 
 		// Override saslSupportedMechs to only advertise what we support.
