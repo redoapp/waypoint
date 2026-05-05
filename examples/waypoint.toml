@@ -89,13 +89,38 @@ listen = ":3306"
 mode = "tcp"
 backend = "10.0.1.5:3306"
 
-# Example: multi-port TCP proxy for MongoDB replica set.
-# All ports share the listener name for metrics and limit scoping.
+# Example: MongoDB replica set reachable only from Waypoint over Tailscale.
+# Clients connect to waypoint-db:27017, waypoint-db:27018, and waypoint-db:27019;
+# Waypoint rewrites MongoDB topology responses so drivers never connect directly
+# to the production member addresses.
 # [[listeners]]
-# name = "mongodb"
-# mode = "tcp"
-# backend = "mongo.example.com"
-# port_map = { 27017 = 27017, 27018 = 27018, 27019 = 27019 }
+# name = "mongo-prod"
+# mode = "mongodb"
+# backend_via_tailscale = true
+# advertise = "waypoint-db:27017" # optional host override; member ports are preserved
+#
+# [listeners.mongodb]
+# admin_user = "waypoint_admin"
+# admin_password = "${MONGO_ADMIN_PASSWORD}"
+# auth_database = "admin"
+# user_prefix = "wp_"
+# user_ttl = "24h"
+# replica_set = "rs0"
+#
+# [[listeners.mongodb.members]]
+# backend = "mongo1.prod.internal:27017"
+# listen = ":27017"
+# advertise = "waypoint-db:27017"
+#
+# [[listeners.mongodb.members]]
+# backend = "mongo2.prod.internal:27017"
+# listen = ":27018"
+# advertise = "waypoint-db:27018"
+#
+# [[listeners.mongodb.members]]
+# backend = "mongo3.prod.internal:27017"
+# listen = ":27019"
+# advertise = "waypoint-db:27019"
 
 # Example: backend reachable only via Tailscale (MagicDNS name or 100.x.y.z IP).
 # [[listeners]]

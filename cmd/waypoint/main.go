@@ -314,10 +314,43 @@ func runServer(ctx context.Context, configPath string, logger *slog.Logger, leve
 		// Expand port mappings. For single-port configs, returns one entry.
 		backends := lCfg.ExpandedBackends()
 
+		var mongoProvisioner *provision.MongoProvisioner
+		var mongoTopologyMap map[string]string
+		if mode == "mongodb" {
+			if lCfg.MongoDB == nil {
+				return fmt.Errorf("mongodb listener %s requires [listeners.mongodb] config", lCfg.Name)
+			}
+
+			mongoPeerService := lCfg.Name
+			if lCfg.MongoDB.ServiceName != "" {
+				mongoPeerService = lCfg.MongoDB.ServiceName
+			}
+
+			mongoProvisioner = provision.NewMongoReplicaSetProvisioner(
+				lCfg.MongoDB.AdminUser,
+				lCfg.MongoDB.AdminPassword,
+				mongoProvisionBackends(lCfg, backends),
+				lCfg.MongoDB.ReplicaSet,
+				lCfg.MongoDB.AuthDatabase,
+				lCfg.MongoDB.UserPrefix,
+				mongoPeerService,
+				lCfg.BackendTLS,
+				store,
+				logger.With("component", "mongo-provisioner", "listener", lCfg.Name),
+				dialer,
+			)
+
+			mongoTopologyMap, err = buildMongoTopologyMap(lCfg, backends, cfg.Tailscale.Hostname)
+			if err != nil {
+				return err
+			}
+		}
+
 		for _, be := range backends {
 			be := be
 
 			var ln net.Listener
+			var serviceFQDN string
 			if lCfg.Service != "" {
 				_, portStr, err := net.SplitHostPort(be.Listen)
 				if err != nil {
@@ -334,6 +367,7 @@ func runServer(ctx context.Context, configPath string, logger *slog.Logger, leve
 				if err != nil {
 					return fmt.Errorf("listen service %s (%s): %w", lCfg.Name, lCfg.Service, err)
 				}
+				serviceFQDN = svcLn.FQDN
 				logger.Info("registered tailscale service", "name", lCfg.Name, "service", lCfg.Service, "fqdn", svcLn.FQDN, "port", port64)
 				ln = &proxyproto.Listener{Listener: svcLn}
 			} else {
@@ -407,6 +441,30 @@ func runServer(ctx context.Context, configPath string, logger *slog.Logger, leve
 					BytesWritten:  &bytesWritten,
 				}
 				go acceptLoop(ctx, &wg, ln, p.HandleConn, logger.With("listener", lCfg.Name))
+
+			case "mongodb":
+				proxyAddr, err := advertisedAddr(lCfg, be, cfg.Tailscale.Hostname, serviceFQDN)
+				if err != nil {
+					return fmt.Errorf("mongodb listener %s advertise address: %w", lCfg.Name, err)
+				}
+
+				mp := &proxy.MongoDBProxy{
+					Backend:       be.Backend,
+					Name:          lCfg.Name,
+					ListenAddr:    proxyAddr,
+					Auth:          &proxy.TailscaleAuthorizer{LC: lc, Logger: logger.With("listener", lCfg.Name)},
+					Tracker:       tracker,
+					Provisioner:   mongoProvisioner,
+					Metrics:       m,
+					MongoConfig:   lCfg.MongoDB,
+					TopologyMap:   mongoTopologyMap,
+					RevalInterval: revalInterval,
+					Logger:        logger.With("listener", lCfg.Name),
+					Dialer:        dialer,
+					BytesRead:     &bytesRead,
+					BytesWritten:  &bytesWritten,
+				}
+				go acceptLoop(ctx, &wg, ln, mp.HandleConn, logger.With("listener", lCfg.Name))
 			}
 
 			m.SystemListeners.Add(ctx, 1, m.Attrs("waypoint.system.listeners"))
@@ -536,4 +594,84 @@ func acceptLoop(ctx context.Context, wg *sync.WaitGroup, ln net.Listener, handle
 			handler(ctx, conn)
 		}()
 	}
+}
+
+func mongoProvisionBackends(lCfg config.ListenerConfig, backends []config.BackendPair) []string {
+	if lCfg.MongoDB == nil || len(lCfg.MongoDB.Members) == 0 {
+		return []string{lCfg.Backend}
+	}
+
+	seen := make(map[string]bool, len(backends))
+	result := make([]string, 0, len(backends))
+	for _, be := range backends {
+		if be.Backend == "" || seen[be.Backend] {
+			continue
+		}
+		seen[be.Backend] = true
+		result = append(result, be.Backend)
+	}
+	return result
+}
+
+func buildMongoTopologyMap(lCfg config.ListenerConfig, backends []config.BackendPair, tailscaleHostname string) (map[string]string, error) {
+	if lCfg.MongoDB == nil || len(lCfg.MongoDB.Members) == 0 {
+		return nil, nil
+	}
+
+	topologyMap := make(map[string]string, len(backends))
+	for _, be := range backends {
+		advertise, err := advertisedAddr(lCfg, be, tailscaleHostname, "")
+		if err != nil {
+			return nil, fmt.Errorf("mongodb listener %s member %s advertise address: %w", lCfg.Name, be.Backend, err)
+		}
+		addTopologyMapAddr(topologyMap, be.Backend, advertise)
+	}
+	return topologyMap, nil
+}
+
+func advertisedAddr(lCfg config.ListenerConfig, be config.BackendPair, tailscaleHostname, serviceFQDN string) (string, error) {
+	if be.Advertise != "" {
+		return be.Advertise, nil
+	}
+
+	_, port, err := net.SplitHostPort(be.Listen)
+	if err != nil {
+		return "", fmt.Errorf("split listen address %q: %w", be.Listen, err)
+	}
+
+	host := strings.TrimSuffix(serviceFQDN, ".")
+	if host == "" {
+		host = lCfg.Advertise
+		if host != "" {
+			if advertiseHost, advertisePort, err := net.SplitHostPort(host); err == nil {
+				if advertisePort == port {
+					return host, nil
+				}
+				host = advertiseHost
+			}
+		}
+	}
+	if host == "" {
+		host = tailscaleHostname
+	}
+	if host == "" {
+		return "", fmt.Errorf("no tailscale hostname available")
+	}
+
+	return net.JoinHostPort(host, port), nil
+}
+
+func addTopologyMapAddr(topologyMap map[string]string, backend, advertise string) {
+	if backend == "" || advertise == "" {
+		return
+	}
+	topologyMap[backend] = advertise
+	topologyMap[strings.ToLower(backend)] = advertise
+
+	host, port, err := net.SplitHostPort(backend)
+	if err != nil {
+		return
+	}
+	topologyMap[net.JoinHostPort(strings.ToLower(host), port)] = advertise
+	topologyMap[strings.ToLower(host)+":"+port] = advertise
 }

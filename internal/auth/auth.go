@@ -230,6 +230,36 @@ func DatabasePermissions(result *AuthResult, backend string, database string) *D
 	}
 }
 
+// MongoDatabasePermissions returns the merged MongoDB permissions for a specific
+// database from the matched rules for the given backend. Returns nil if no
+// rules grant access to the database.
+func MongoDatabasePermissions(result *AuthResult, backend string, database string) *MongoDBPermissions {
+	var perms []string
+	found := false
+
+	for _, r := range result.MatchedRules {
+		bc, ok := r.Backends[backend]
+		if !ok || bc.Mongo == nil {
+			continue
+		}
+		if db, ok := bc.Mongo.Databases[database]; ok {
+			perms = append(perms, db.Permissions...)
+			found = true
+		}
+		if db, ok := bc.Mongo.Databases["*"]; ok {
+			perms = append(perms, db.Permissions...)
+			found = true
+		}
+	}
+
+	if !found {
+		return nil
+	}
+	return &MongoDBPermissions{
+		Permissions: perms,
+	}
+}
+
 // mergeRules collects all permissions and picks the most restrictive limits.
 // backend is used to look up the BackendCap entry in each rule.
 func mergeRules(rules []CapRule, backend string) ([]string, MergedLimits) {
@@ -243,6 +273,11 @@ func mergeRules(rules []CapRule, backend string) ([]string, MergedLimits) {
 		}
 		if bc.PG != nil {
 			for _, db := range bc.PG.Databases {
+				perms = append(perms, db.Permissions...)
+			}
+		}
+		if bc.Mongo != nil {
+			for _, db := range bc.Mongo.Databases {
 				perms = append(perms, db.Permissions...)
 			}
 		}

@@ -6,6 +6,7 @@ Waypoint is a Tailscale-aware database proxy that authenticates connections usin
 
 - **Tailscale-native auth** — identifies callers via `tsnet` + `WhoIs`, checks `redo.com/cap/waypoint` capability grants from your ACL policy
 - **Postgres mode** — intercepts the PG wire protocol, dynamically provisions per-user database roles with scoped `GRANT` permissions, and cleans up expired users
+- **MongoDB mode** — provisions scoped MongoDB users and rewrites replica-set topology so clients stay on the proxy
 - **TCP mode** — transparent L4 proxy for any TCP backend (MySQL, Redis, etc.)
 - **Connection tracking** — per-user limits on concurrent connections, bytes transferred, connection duration, and bandwidth budgets, all stored in Redis/Valkey
 - **Mid-session revalidation** — periodically re-checks Tailscale identity during long-lived connections
@@ -63,6 +64,38 @@ Postgres listeners default to `tls_mode = "optional"`. If a client sends a Postg
 Set `use_tailscale_tls = false` to disable Tailscale certificate lookup and use only the configured file-based certificate.
 
 Use `tls_mode = "require"` to reject plaintext Postgres clients.
+
+MongoDB replica sets can be exposed as one logical listener with one Waypoint
+port per member. Set `backend_via_tailscale = true` when Waypoint must reach the
+members over Tailscale or subnet routes:
+
+```toml
+[[listeners]]
+name = "mongo-prod"
+mode = "mongodb"
+backend_via_tailscale = true
+
+[listeners.mongodb]
+admin_user = "waypoint_admin"
+admin_password = "${MONGO_ADMIN_PASSWORD}"
+auth_database = "admin"
+replica_set = "rs0"
+
+[[listeners.mongodb.members]]
+backend = "mongo1.prod.internal:27017"
+listen = ":27017"
+advertise = "waypoint-db:27017"
+
+[[listeners.mongodb.members]]
+backend = "mongo2.prod.internal:27017"
+listen = ":27018"
+advertise = "waypoint-db:27018"
+
+[[listeners.mongodb.members]]
+backend = "mongo3.prod.internal:27017"
+listen = ":27019"
+advertise = "waypoint-db:27019"
+```
 
 ### Tailscale ACL grants
 

@@ -951,6 +951,126 @@ port_map = { "27017" = 27017 }
 	}
 }
 
+// --- MongoDB replica set member tests ---
+
+func TestLoad_MongoDBMembers(t *testing.T) {
+	content := `
+[tailscale]
+hostname = "waypoint-test"
+
+[[listeners]]
+name = "mongo-prod"
+mode = "mongodb"
+backend_via_tailscale = true
+
+[listeners.mongodb]
+admin_user = "admin"
+admin_password = "pass"
+auth_database = "admin"
+replica_set = "rs0"
+
+[[listeners.mongodb.members]]
+backend = "mongo1.internal:27017"
+listen = ":27017"
+advertise = "waypoint-test:27017"
+
+[[listeners.mongodb.members]]
+backend = "mongo2.internal:27017"
+listen = ":27018"
+advertise = "waypoint-test:27018"
+
+[[listeners.mongodb.members]]
+backend = "mongo3.internal:27017"
+listen = ":27019"
+advertise = "waypoint-test:27019"
+`
+	path := writeTestConfig(t, content)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	l := cfg.Listeners[0]
+	if l.Backend != "mongo1.internal:27017" {
+		t.Errorf("Backend = %q, want first member backend", l.Backend)
+	}
+	if !l.BackendViaTailscale {
+		t.Error("BackendViaTailscale should be true")
+	}
+	if l.MongoDB.ReplicaSet != "rs0" {
+		t.Errorf("ReplicaSet = %q, want rs0", l.MongoDB.ReplicaSet)
+	}
+
+	pairs := l.ExpandedBackends()
+	if len(pairs) != 3 {
+		t.Fatalf("ExpandedBackends len = %d, want 3", len(pairs))
+	}
+	expected := []BackendPair{
+		{Listen: ":27017", Backend: "mongo1.internal:27017", Advertise: "waypoint-test:27017"},
+		{Listen: ":27018", Backend: "mongo2.internal:27017", Advertise: "waypoint-test:27018"},
+		{Listen: ":27019", Backend: "mongo3.internal:27017", Advertise: "waypoint-test:27019"},
+	}
+	for i, want := range expected {
+		if pairs[i] != want {
+			t.Errorf("pairs[%d] = %+v, want %+v", i, pairs[i], want)
+		}
+	}
+}
+
+func TestValidate_MongoDBMembersWrongMode(t *testing.T) {
+	content := `
+[tailscale]
+hostname = "waypoint-test"
+
+[[listeners]]
+name = "mongo-prod"
+mode = "tcp"
+listen = ":27017"
+backend = "mongo1.internal:27017"
+
+[listeners.mongodb]
+admin_user = "admin"
+admin_password = "pass"
+
+[[listeners.mongodb.members]]
+backend = "mongo1.internal:27017"
+listen = ":27017"
+`
+	path := writeTestConfig(t, content)
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "mongodb.members is only supported") {
+		t.Errorf("expected mongodb.members mode error, got: %v", err)
+	}
+}
+
+func TestValidate_MongoDBMembersAddressCollision(t *testing.T) {
+	content := `
+[tailscale]
+hostname = "waypoint-test"
+
+[[listeners]]
+name = "mongo-prod"
+mode = "mongodb"
+
+[listeners.mongodb]
+admin_user = "admin"
+admin_password = "pass"
+
+[[listeners.mongodb.members]]
+backend = "mongo1.internal:27017"
+listen = ":27017"
+
+[[listeners.mongodb.members]]
+backend = "mongo2.internal:27017"
+listen = ":27017"
+`
+	path := writeTestConfig(t, content)
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "conflicts with") {
+		t.Errorf("expected listen collision error, got: %v", err)
+	}
+}
+
 // --- ExpandedBackends tests ---
 
 func TestExpandedBackends_NoPortMap(t *testing.T) {
@@ -967,6 +1087,30 @@ func TestExpandedBackends_NoPortMap(t *testing.T) {
 	}
 	if pairs[0].Backend != "10.0.0.1:5432" {
 		t.Errorf("Backend = %q", pairs[0].Backend)
+	}
+}
+
+func TestExpandedBackends_WithMongoDBMembers(t *testing.T) {
+	l := &ListenerConfig{
+		MongoDB: &MongoDBAdmin{
+			Members: []MongoDBMember{
+				{Backend: "mongo2:27017", Listen: ":27018", Advertise: "waypoint:27018"},
+				{Backend: "mongo1:27017", Listen: ":27017", Advertise: "waypoint:27017"},
+			},
+		},
+	}
+	pairs := l.ExpandedBackends()
+	if len(pairs) != 2 {
+		t.Fatalf("expected 2 pairs, got %d", len(pairs))
+	}
+	expected := []BackendPair{
+		{Listen: ":27017", Backend: "mongo1:27017", Advertise: "waypoint:27017"},
+		{Listen: ":27018", Backend: "mongo2:27017", Advertise: "waypoint:27018"},
+	}
+	for i, want := range expected {
+		if pairs[i] != want {
+			t.Errorf("pairs[%d] = %+v, want %+v", i, pairs[i], want)
+		}
 	}
 }
 
