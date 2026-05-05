@@ -631,8 +631,8 @@ tls_mode = "require"
 `
 	path := writeTestConfig(t, content)
 	_, err := Load(path)
-	if err == nil || !strings.Contains(err.Error(), "tls_mode is only supported for mode \"postgres\"") {
-		t.Errorf("expected tls_mode postgres-only error, got: %v", err)
+	if err == nil || !strings.Contains(err.Error(), "tls_mode is only supported for mode \"postgres\" or \"mongodb\"") {
+		t.Errorf("expected tls_mode mode error, got: %v", err)
 	}
 }
 
@@ -675,8 +675,8 @@ key_file = "/tmp/server.key"
 `
 	path := writeTestConfig(t, content)
 	_, err := Load(path)
-	if err == nil || !strings.Contains(err.Error(), "cert_file and key_file are only supported for mode \"postgres\"") {
-		t.Errorf("expected postgres-only cert error, got: %v", err)
+	if err == nil || !strings.Contains(err.Error(), "cert_file and key_file are only supported for mode \"postgres\" or \"mongodb\"") {
+		t.Errorf("expected cert mode error, got: %v", err)
 	}
 }
 
@@ -694,8 +694,50 @@ use_tailscale_tls = false
 `
 	path := writeTestConfig(t, content)
 	_, err := Load(path)
-	if err == nil || !strings.Contains(err.Error(), "use_tailscale_tls is only supported for mode \"postgres\"") {
-		t.Errorf("expected postgres-only use_tailscale_tls error, got: %v", err)
+	if err == nil || !strings.Contains(err.Error(), "use_tailscale_tls is only supported for mode \"postgres\" or \"mongodb\"") {
+		t.Errorf("expected use_tailscale_tls mode error, got: %v", err)
+	}
+}
+
+func TestLoad_MongoDBClientTLSConfig(t *testing.T) {
+	content := `
+[tailscale]
+hostname = "waypoint-test"
+
+[[listeners]]
+name = "mongo"
+listen = ":27017"
+mode = "mongodb"
+backend = "mongo.example.com:27017"
+tls = true
+tls_mode = "require"
+use_tailscale_tls = false
+cert_file = "/tmp/server.crt"
+key_file = "/tmp/server.key"
+
+[listeners.mongodb]
+admin_user = "admin"
+admin_password = "pass"
+auth_database = "admin"
+`
+	path := writeTestConfig(t, content)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	l := cfg.Listeners[0]
+	if !l.BackendTLS {
+		t.Fatal("expected backend TLS to be enabled")
+	}
+	if got := l.EffectiveTLSMode(); got != TLSRequire {
+		t.Fatalf("tls mode = %q, want %q", got, TLSRequire)
+	}
+	if l.EffectiveUseTailscaleTLS() {
+		t.Fatal("expected use_tailscale_tls=false")
+	}
+	if l.CertFile != "/tmp/server.crt" || l.KeyFile != "/tmp/server.key" {
+		t.Fatalf("cert/key = %q/%q", l.CertFile, l.KeyFile)
 	}
 }
 

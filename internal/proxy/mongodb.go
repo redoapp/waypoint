@@ -1,7 +1,10 @@
 package proxy
 
 import (
+	"bufio"
 	"context"
+	"crypto/tls"
+	"fmt"
 	"log/slog"
 	"net"
 	"sync/atomic"
@@ -31,6 +34,9 @@ type MongoDBProxy struct {
 	Provisioner   *provision.MongoProvisioner
 	Metrics       *metrics.Metrics
 	MongoConfig   *config.MongoDBAdmin
+	ClientTLSMode config.TLSMode
+	ClientTLS     *tls.Config
+	BackendTLS    bool
 	TopologyMap   map[string]string
 	RevalInterval time.Duration
 	Logger        *slog.Logger
@@ -46,6 +52,15 @@ func (p *MongoDBProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 	connID := logging.NewConnID()
 	log := p.Logger.With("conn_id", connID, "remote", clientConn.RemoteAddr())
 	log.DebugContext(ctx, "connection accepted")
+
+	clientConn, clientSNI, err := p.acceptClientTLS(clientConn)
+	if err != nil {
+		log.WarnContext(ctx, "client TLS failed", "error", err)
+		return
+	}
+	if clientSNI != "" {
+		log.DebugContext(ctx, "client TLS established", "sni", clientSNI)
+	}
 
 	m := p.Metrics
 	tracer := m.Tracer()
@@ -197,6 +212,24 @@ func (p *MongoDBProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 		mongowire.SendErrorAsHelloReply(clientConn, clientHello, 18, "backend unavailable")
 		return
 	}
+
+	if p.BackendTLS {
+		upgradedConn, err := upgradeMongoBackendTLS(backendConn, p.Backend)
+		if err != nil {
+			backendConn.Close()
+			dialSpan.RecordError(err)
+			dialSpan.SetStatus(codes.Error, "backend TLS failed")
+			dialSpan.End()
+			setupSpan.RecordError(err)
+			setupSpan.SetStatus(codes.Error, "backend TLS failed")
+			setupSpan.End()
+			log.ErrorContext(ctx, "backend TLS failed", "backend", p.Backend, "error", err)
+			mongowire.SendErrorAsHelloReply(clientConn, clientHello, 18, "backend TLS failed")
+			return
+		}
+		backendConn = upgradedConn
+		log.DebugContext(ctx, "backend TLS established")
+	}
 	dialSpan.End()
 	defer backendConn.Close()
 
@@ -247,8 +280,10 @@ func (p *MongoDBProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 	if proxyAddr == "" {
 		proxyAddr = clientConn.LocalAddr().String()
 	}
+	proxyAddr = topologyAddrWithSNI(proxyAddr, clientSNI)
+	topologyMap := topologyMapWithSNI(p.TopologyMap, clientSNI)
 
-	hsResult, err := mongowire.CompleteHandshakeWithTopologyMap(clientConn, clientHello, backendHelloDoc, proxyAddr, p.TopologyMap)
+	hsResult, err := mongowire.CompleteHandshakeWithTopologyMap(clientConn, clientHello, backendHelloDoc, proxyAddr, topologyMap)
 	if err != nil {
 		setupSpan.RecordError(err)
 		setupSpan.SetStatus(codes.Error, "client handshake failed")
@@ -296,7 +331,7 @@ func (p *MongoDBProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 			return
 		}
 		if resp.Header.OpCode == mongowire.OpMsg {
-			resp.Body = mongowire.RewriteTopologyWithMap(resp.Body, proxyAddr, p.TopologyMap)
+			resp.Body = mongowire.RewriteTopologyWithMap(resp.Body, proxyAddr, topologyMap)
 			// Update message length if body size changed.
 			resp.Header.MessageLength = int32(mongowire.HeaderSize + len(resp.Body))
 		}
@@ -315,7 +350,7 @@ func (p *MongoDBProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 
 	// Step 10: Wrap backend with topology rewriter so replica set member
 	// addresses in hello/isMaster responses point to the proxy.
-	rewrittenBackend := mongowire.NewTopologyRewriterWithMap(backendConn, proxyAddr, p.TopologyMap)
+	rewrittenBackend := mongowire.NewTopologyRewriterWithMap(backendConn, proxyAddr, topologyMap)
 
 	// Step 11: Bidirectional relay with limits.
 	cl := p.Tracker.WrapConn(ctx, result.LoginName, result.Limits, p.Name)
@@ -410,6 +445,105 @@ func (p *MongoDBProxy) collectRoles(result *auth.AuthResult) ([]provision.MongoR
 	}
 
 	return allRoles, grantedDBs
+}
+
+func (p *MongoDBProxy) acceptClientTLS(conn net.Conn) (net.Conn, string, error) {
+	switch p.ClientTLSMode {
+	case "", config.TLSOff:
+		return conn, "", nil
+	case config.TLSRequire:
+		return acceptRequiredMongoTLS(conn, p.ClientTLS)
+	case config.TLSOptional:
+		if p.ClientTLS == nil {
+			return conn, "", nil
+		}
+		buffered := &bufferedConn{
+			Conn:   conn,
+			reader: bufio.NewReader(conn),
+		}
+		isTLS, err := looksLikeTLSClientHello(buffered.reader)
+		if err != nil {
+			return conn, "", err
+		}
+		if !isTLS {
+			return buffered, "", nil
+		}
+		return acceptRequiredMongoTLS(buffered, p.ClientTLS)
+	default:
+		return conn, "", fmt.Errorf("unsupported TLS mode %q", p.ClientTLSMode)
+	}
+}
+
+func acceptRequiredMongoTLS(conn net.Conn, tlsConfig *tls.Config) (net.Conn, string, error) {
+	if tlsConfig == nil {
+		return conn, "", fmt.Errorf("TLS config is required")
+	}
+	tlsConn := tls.Server(conn, tlsConfig)
+	if err := tlsConn.Handshake(); err != nil {
+		return conn, "", fmt.Errorf("TLS handshake: %w", err)
+	}
+	return tlsConn, tlsConn.ConnectionState().ServerName, nil
+}
+
+type bufferedConn struct {
+	net.Conn
+	reader *bufio.Reader
+}
+
+func (c *bufferedConn) Read(p []byte) (int, error) {
+	return c.reader.Read(p)
+}
+
+func looksLikeTLSClientHello(reader *bufio.Reader) (bool, error) {
+	header, err := reader.Peek(5)
+	if err != nil {
+		return false, err
+	}
+
+	recordLength := int(header[3])<<8 | int(header[4])
+	return header[0] == 0x16 &&
+		header[1] == 0x03 &&
+		header[2] >= 0x01 &&
+		header[2] <= 0x04 &&
+		recordLength > 0, nil
+}
+
+func upgradeMongoBackendTLS(conn net.Conn, backend string) (net.Conn, error) {
+	tlsConfig := &tls.Config{
+		MinVersion:         tls.VersionTLS12,
+		InsecureSkipVerify: true,
+	}
+	if host, _, err := net.SplitHostPort(backend); err == nil {
+		tlsConfig.ServerName = host
+	}
+
+	tlsConn := tls.Client(conn, tlsConfig)
+	if err := tlsConn.Handshake(); err != nil {
+		return nil, fmt.Errorf("TLS handshake: %w", err)
+	}
+	return tlsConn, nil
+}
+
+func topologyMapWithSNI(topologyMap map[string]string, sni string) map[string]string {
+	if sni == "" || len(topologyMap) == 0 {
+		return topologyMap
+	}
+	rewritten := make(map[string]string, len(topologyMap))
+	for backend, advertise := range topologyMap {
+		rewritten[backend] = topologyAddrWithSNI(advertise, sni)
+	}
+	return rewritten
+}
+
+func topologyAddrWithSNI(addr, sni string) string {
+	if sni == "" {
+		return addr
+	}
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil || port == "" {
+		return sni
+	}
+	return net.JoinHostPort(sni, port)
 }
 
 // revalidateLoop periodically re-checks WhoIs + caps. Closes connections

@@ -176,6 +176,33 @@ func TestResolvePostgresClientTLS_AdminFilesOnly(t *testing.T) {
 	}
 }
 
+func TestResolveMongoClientTLS_AdminFilesOnly(t *testing.T) {
+	certFile, keyFile := mustNamedCertificateFiles(t, "mongo.example.com")
+	useTailscale := false
+	lCfg := config.ListenerConfig{
+		Name:            "mongo",
+		Mode:            "mongodb",
+		PostgresTLSMode: string(config.TLSRequire),
+		UseTailscaleTLS: &useTailscale,
+		CertFile:        certFile,
+		KeyFile:         keyFile,
+	}
+	mode, tlsConf, err := resolveMongoClientTLS(lCfg, &tsnet.Server{}, nil, discardLogger())
+	if err != nil {
+		t.Fatalf("resolveMongoClientTLS: %v", err)
+	}
+	if mode != config.TLSRequire {
+		t.Fatalf("mode = %q, want %q", mode, config.TLSRequire)
+	}
+	got, err := tlsConf.GetCertificate(&tls.ClientHelloInfo{ServerName: "mongo.example.com"})
+	if err != nil {
+		t.Fatalf("GetCertificate: %v", err)
+	}
+	if got == nil {
+		t.Fatal("expected certificate")
+	}
+}
+
 func mustNamedCertificate(t *testing.T, dnsName string) *tls.Certificate {
 	t.Helper()
 

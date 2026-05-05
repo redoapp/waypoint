@@ -97,6 +97,11 @@ backend = "10.0.1.5:3306"
 # name = "mongo-prod"
 # mode = "mongodb"
 # backend_via_tailscale = true
+# tls = true                # optional: use TLS to MongoDB backends
+# tls_mode = "require"      # off | optional | require for clients
+# use_tailscale_tls = true  # set false to use only cert_file/key_file
+# cert_file = "/etc/waypoint/mongo.crt" # optional custom-domain cert
+# key_file = "/etc/waypoint/mongo.key"
 # advertise = "waypoint-db:27017" # optional host override; member ports are preserved
 #
 # [listeners.mongodb]

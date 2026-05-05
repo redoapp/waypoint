@@ -6,7 +6,7 @@ Waypoint is a Tailscale-aware database proxy that authenticates connections usin
 
 - **Tailscale-native auth** — identifies callers via `tsnet` + `WhoIs`, checks `redo.com/cap/waypoint` capability grants from your ACL policy
 - **Postgres mode** — intercepts the PG wire protocol, dynamically provisions per-user database roles with scoped `GRANT` permissions, and cleans up expired users
-- **MongoDB mode** — provisions scoped MongoDB users and rewrites replica-set topology so clients stay on the proxy
+- **MongoDB mode** — provisions scoped MongoDB users and rewrites replica-set topology so clients stay on the proxy, including TLS-terminated clients
 - **TCP mode** — transparent L4 proxy for any TCP backend (MySQL, Redis, etc.)
 - **Connection tracking** — per-user limits on concurrent connections, bytes transferred, connection duration, and bandwidth budgets, all stored in Redis/Valkey
 - **Mid-session revalidation** — periodically re-checks Tailscale identity during long-lived connections
@@ -74,6 +74,11 @@ members over Tailscale or subnet routes:
 name = "mongo-prod"
 mode = "mongodb"
 backend_via_tailscale = true
+tls = true                              # optional: use TLS to MongoDB backends
+tls_mode = "require"                    # off | optional | require for clients
+use_tailscale_tls = true                # default: allow *.ts.net cert lookup
+# cert_file = "/etc/waypoint/mongo.crt" # optional: custom-domain cert
+# key_file = "/etc/waypoint/mongo.key"
 
 [listeners.mongodb]
 admin_user = "waypoint_admin"
@@ -96,6 +101,12 @@ backend = "mongo3.prod.internal:27017"
 listen = ":27019"
 advertise = "waypoint-db:27019"
 ```
+
+For MongoDB listeners, `tls = true` enables TLS from Waypoint to each backend
+member. `tls_mode` controls client-facing TLS using the same values as
+Postgres: `off`, `optional`, or `require`. When MongoDB clients connect over
+TLS with SNI, Waypoint rewrites replica-set topology hosts to that SNI hostname
+while preserving the advertised listener/member ports.
 
 ### Tailscale ACL grants
 

@@ -77,25 +77,35 @@ type ListenerConfig struct {
 	RawPortMap          map[string]int `toml:"port_map,omitempty"`
 }
 
-type PostgresTLSMode string
+type TLSMode string
 
 const (
-	PostgresTLSOff      PostgresTLSMode = "off"
-	PostgresTLSOptional PostgresTLSMode = "optional"
-	PostgresTLSRequire  PostgresTLSMode = "require"
+	TLSOff      TLSMode = "off"
+	TLSOptional TLSMode = "optional"
+	TLSRequire  TLSMode = "require"
+
+	PostgresTLSOff      = TLSOff
+	PostgresTLSOptional = TLSOptional
+	PostgresTLSRequire  = TLSRequire
 )
 
-func (l ListenerConfig) EffectivePostgresTLSMode() PostgresTLSMode {
+type PostgresTLSMode = TLSMode
+
+func (l ListenerConfig) EffectiveTLSMode() TLSMode {
 	switch strings.ToLower(strings.TrimSpace(l.PostgresTLSMode)) {
-	case "", string(PostgresTLSOptional):
-		return PostgresTLSOptional
-	case string(PostgresTLSOff):
-		return PostgresTLSOff
-	case string(PostgresTLSRequire):
-		return PostgresTLSRequire
+	case "", string(TLSOptional):
+		return TLSOptional
+	case string(TLSOff):
+		return TLSOff
+	case string(TLSRequire):
+		return TLSRequire
 	default:
-		return PostgresTLSMode(strings.ToLower(strings.TrimSpace(l.PostgresTLSMode)))
+		return TLSMode(strings.ToLower(strings.TrimSpace(l.PostgresTLSMode)))
 	}
+}
+
+func (l ListenerConfig) EffectivePostgresTLSMode() PostgresTLSMode {
+	return l.EffectiveTLSMode()
 }
 
 func (l ListenerConfig) EffectiveUseTailscaleTLS() bool {
@@ -372,24 +382,28 @@ func validate(cfg *Config) error {
 			return fmt.Errorf("listeners[%d].service %q conflicts with tailscale.hostname %q — the service name (without \"svc:\" prefix) must differ from the hostname to avoid DNS shadowing", i, l.Service, cfg.Tailscale.Hostname)
 		}
 		if l.PostgresTLSMode != "" {
-			switch l.EffectivePostgresTLSMode() {
-			case PostgresTLSOff, PostgresTLSOptional, PostgresTLSRequire:
+			switch l.EffectiveTLSMode() {
+			case TLSOff, TLSOptional, TLSRequire:
 			default:
-				return fmt.Errorf("listeners[%d].tls_mode must be one of %q, %q, or %q, got %q", i, PostgresTLSOff, PostgresTLSOptional, PostgresTLSRequire, l.PostgresTLSMode)
+				return fmt.Errorf("listeners[%d].tls_mode must be one of %q, %q, or %q, got %q", i, TLSOff, TLSOptional, TLSRequire, l.PostgresTLSMode)
 			}
 		}
 		if (l.CertFile == "") != (l.KeyFile == "") {
 			return fmt.Errorf("listeners[%d] must set both cert_file and key_file together", i)
 		}
-		if (l.CertFile != "" || l.KeyFile != "") && mode != "postgres" {
-			return fmt.Errorf("listeners[%d].cert_file and key_file are only supported for mode \"postgres\"", i)
+		if (l.CertFile != "" || l.KeyFile != "") && !supportsClientTLS(mode) {
+			return fmt.Errorf("listeners[%d].cert_file and key_file are only supported for mode \"postgres\" or \"mongodb\"", i)
 		}
-		if l.PostgresTLSMode != "" && mode != "postgres" {
-			return fmt.Errorf("listeners[%d].tls_mode is only supported for mode \"postgres\"", i)
+		if l.PostgresTLSMode != "" && !supportsClientTLS(mode) {
+			return fmt.Errorf("listeners[%d].tls_mode is only supported for mode \"postgres\" or \"mongodb\"", i)
 		}
-		if l.UseTailscaleTLS != nil && mode != "postgres" {
-			return fmt.Errorf("listeners[%d].use_tailscale_tls is only supported for mode \"postgres\"", i)
+		if l.UseTailscaleTLS != nil && !supportsClientTLS(mode) {
+			return fmt.Errorf("listeners[%d].use_tailscale_tls is only supported for mode \"postgres\" or \"mongodb\"", i)
 		}
 	}
 	return nil
+}
+
+func supportsClientTLS(mode string) bool {
+	return mode == "postgres" || mode == "mongodb"
 }

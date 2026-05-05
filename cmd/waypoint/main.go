@@ -316,6 +316,8 @@ func runServer(ctx context.Context, configPath string, logger *slog.Logger, leve
 
 		var mongoProvisioner *provision.MongoProvisioner
 		var mongoTopologyMap map[string]string
+		var mongoClientTLSMode config.TLSMode
+		var mongoClientTLSConfig *tls.Config
 		if mode == "mongodb" {
 			if lCfg.MongoDB == nil {
 				return fmt.Errorf("mongodb listener %s requires [listeners.mongodb] config", lCfg.Name)
@@ -343,6 +345,11 @@ func runServer(ctx context.Context, configPath string, logger *slog.Logger, leve
 			mongoTopologyMap, err = buildMongoTopologyMap(lCfg, backends, cfg.Tailscale.Hostname)
 			if err != nil {
 				return err
+			}
+
+			mongoClientTLSMode, mongoClientTLSConfig, err = resolveMongoClientTLS(lCfg, srv, lc, logger.With("listener", lCfg.Name))
+			if err != nil {
+				return fmt.Errorf("configure client TLS for listener %s: %w", lCfg.Name, err)
 			}
 		}
 
@@ -457,6 +464,9 @@ func runServer(ctx context.Context, configPath string, logger *slog.Logger, leve
 					Provisioner:   mongoProvisioner,
 					Metrics:       m,
 					MongoConfig:   lCfg.MongoDB,
+					ClientTLSMode: mongoClientTLSMode,
+					ClientTLS:     mongoClientTLSConfig,
+					BackendTLS:    lCfg.BackendTLS,
 					TopologyMap:   mongoTopologyMap,
 					RevalInterval: revalInterval,
 					Logger:        logger.With("listener", lCfg.Name),
@@ -487,8 +497,16 @@ func runServer(ctx context.Context, configPath string, logger *slog.Logger, leve
 }
 
 func resolvePostgresClientTLS(lCfg config.ListenerConfig, srv *tsnet.Server, lc *local.Client, logger *slog.Logger) (config.PostgresTLSMode, *tls.Config, error) {
-	mode := lCfg.EffectivePostgresTLSMode()
-	if mode == config.PostgresTLSOff {
+	return resolveClientTLS(lCfg, srv, lc, logger)
+}
+
+func resolveMongoClientTLS(lCfg config.ListenerConfig, srv *tsnet.Server, lc *local.Client, logger *slog.Logger) (config.TLSMode, *tls.Config, error) {
+	return resolveClientTLS(lCfg, srv, lc, logger)
+}
+
+func resolveClientTLS(lCfg config.ListenerConfig, srv *tsnet.Server, lc *local.Client, logger *slog.Logger) (config.TLSMode, *tls.Config, error) {
+	mode := lCfg.EffectiveTLSMode()
+	if mode == config.TLSOff {
 		return mode, nil, nil
 	}
 
@@ -525,17 +543,17 @@ func resolvePostgresClientTLS(lCfg config.ListenerConfig, srv *tsnet.Server, lc 
 	}
 
 	if adminCert == nil && tailscaleGetCertificate == nil {
-		if mode == config.PostgresTLSRequire {
+		if mode == config.TLSRequire {
 			return "", nil, fmt.Errorf("tls_mode=require but no usable certificate source is available")
 		}
 		logger.Warn("client TLS requested but no certificate source is available; downgrading listener to plaintext",
 			"mode", mode,
 			"listener", lCfg.Name,
 		)
-		return config.PostgresTLSOff, nil, nil
+		return config.TLSOff, nil, nil
 	}
 
-	return mode, buildPostgresClientTLSConfig(adminCert, tailscaleGetCertificate), nil
+	return mode, buildClientTLSConfig(adminCert, tailscaleGetCertificate), nil
 }
 
 func tailscaleCertDomains(srv *tsnet.Server) (domains []string) {
@@ -551,6 +569,10 @@ func tailscaleCertDomains(srv *tsnet.Server) (domains []string) {
 }
 
 func buildPostgresClientTLSConfig(adminCert *tls.Certificate, tailscaleGetCertificate func(*tls.ClientHelloInfo) (*tls.Certificate, error)) *tls.Config {
+	return buildClientTLSConfig(adminCert, tailscaleGetCertificate)
+}
+
+func buildClientTLSConfig(adminCert *tls.Certificate, tailscaleGetCertificate func(*tls.ClientHelloInfo) (*tls.Certificate, error)) *tls.Config {
 	return &tls.Config{
 		MinVersion: tls.VersionTLS12,
 		GetCertificate: func(hi *tls.ClientHelloInfo) (*tls.Certificate, error) {
