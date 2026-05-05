@@ -36,6 +36,10 @@ name = "pg-main"
 listen = ":5432"
 mode = "postgres"
 backend = "10.0.1.10:5432"
+tls_mode = "optional"                   # off | optional | require
+use_tailscale_tls = true                # default: allow *.ts.net cert lookup
+cert_file = "/etc/waypoint/server.crt"  # optional: custom-domain cert
+key_file = "/etc/waypoint/server.key"
 
 [listeners.postgres]
 admin_user = "waypoint_admin"
@@ -51,6 +55,14 @@ listen = ":3306"
 mode = "tcp"
 backend = "10.0.1.5:3306"
 ```
+
+Postgres listeners default to `tls_mode = "optional"`. If a client sends a PostgreSQL `SSLRequest`, Waypoint now upgrades that session to TLS and serves the certificate that matches the requested server name:
+- admin-provided `cert_file`/`key_file` for custom domains such as `waypoint.redo.run`
+- Tailscale-managed certificates for `*.ts.net` names when HTTPS certificates are enabled in the tailnet
+
+Set `use_tailscale_tls = false` to disable Tailscale certificate lookup and use only the configured file-based certificate.
+
+Use `tls_mode = "require"` to reject plaintext Postgres clients.
 
 ### Tailscale ACL grants
 

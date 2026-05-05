@@ -70,6 +70,10 @@ name = "pg-main"
 listen = ":5432"
 mode = "postgres"
 backend = "10.0.1.10:5432"
+tls_mode = "optional"                   # off | optional | require
+use_tailscale_tls = true                # set false to use only cert_file/key_file
+# cert_file = "/etc/waypoint/server.crt" # optional custom-domain cert
+# key_file = "/etc/waypoint/server.key"
 
 [listeners.postgres]
 admin_user = "waypoint_admin"
@@ -107,4 +111,5 @@ backend = "10.0.1.5:3306"
 # listen = ":5432"
 # mode = "postgres"
 # backend = "10.0.1.10:5432"
+# tls_mode = "require"
 # service = "svc:waypoint-db"

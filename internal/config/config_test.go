@@ -70,6 +70,10 @@ name = "pg-main"
 listen = ":5432"
 mode = "postgres"
 backend = "10.0.1.10:5432"
+tls_mode = "require"
+use_tailscale_tls = false
+cert_file = "/etc/waypoint/server.crt"
+key_file = "/etc/waypoint/server.key"
 
 [listeners.postgres]
 admin_user = "admin"
@@ -121,6 +125,18 @@ backend = "10.0.1.5:3306"
 	}
 	if pg.Postgres.UserTTLDuration() != 12*time.Hour {
 		t.Errorf("user_ttl = %v", pg.Postgres.UserTTLDuration())
+	}
+	if pg.EffectivePostgresTLSMode() != PostgresTLSRequire {
+		t.Errorf("tls mode = %q, want %q", pg.EffectivePostgresTLSMode(), PostgresTLSRequire)
+	}
+	if pg.CertFile != "/etc/waypoint/server.crt" {
+		t.Errorf("cert_file = %q", pg.CertFile)
+	}
+	if pg.KeyFile != "/etc/waypoint/server.key" {
+		t.Errorf("key_file = %q", pg.KeyFile)
+	}
+	if pg.EffectiveUseTailscaleTLS() {
+		t.Errorf("use_tailscale_tls = true, want false")
 	}
 }
 
@@ -317,6 +333,35 @@ func TestPostgresAdmin_UserTTLCustom(t *testing.T) {
 	p := &PostgresAdmin{UserTTL: "6h"}
 	if p.UserTTLDuration() != 6*time.Hour {
 		t.Errorf("expected 6h, got %v", p.UserTTLDuration())
+	}
+}
+
+func TestListenerConfig_EffectivePostgresTLSMode_Default(t *testing.T) {
+	var l ListenerConfig
+	if got := l.EffectivePostgresTLSMode(); got != PostgresTLSOptional {
+		t.Fatalf("default tls mode = %q, want %q", got, PostgresTLSOptional)
+	}
+}
+
+func TestListenerConfig_EffectivePostgresTLSMode_CaseInsensitive(t *testing.T) {
+	l := ListenerConfig{PostgresTLSMode: "ReQuIrE"}
+	if got := l.EffectivePostgresTLSMode(); got != PostgresTLSRequire {
+		t.Fatalf("tls mode = %q, want %q", got, PostgresTLSRequire)
+	}
+}
+
+func TestListenerConfig_EffectiveUseTailscaleTLS_Default(t *testing.T) {
+	var l ListenerConfig
+	if !l.EffectiveUseTailscaleTLS() {
+		t.Fatal("expected default use_tailscale_tls to be true")
+	}
+}
+
+func TestListenerConfig_EffectiveUseTailscaleTLS_False(t *testing.T) {
+	v := false
+	l := ListenerConfig{UseTailscaleTLS: &v}
+	if l.EffectiveUseTailscaleTLS() {
+		t.Fatal("expected use_tailscale_tls=false to be respected")
 	}
 }
 
@@ -545,6 +590,112 @@ service = "svc:waypoint-db"
 	_, err := Load(path)
 	if err != nil {
 		t.Errorf("expected no error, got: %v", err)
+	}
+}
+
+func TestValidate_PostgresTLSModeInvalid(t *testing.T) {
+	content := `
+[tailscale]
+hostname = "waypoint-test"
+
+[[listeners]]
+name = "pg"
+listen = ":5432"
+mode = "postgres"
+backend = "db.example.com:5432"
+tls_mode = "sometimes"
+
+[listeners.postgres]
+admin_user = "admin"
+admin_password = "pass"
+admin_database = "postgres"
+`
+	path := writeTestConfig(t, content)
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "tls_mode must be one of") {
+		t.Errorf("expected tls_mode error, got: %v", err)
+	}
+}
+
+func TestValidate_PostgresTLSModeOnTCP(t *testing.T) {
+	content := `
+[tailscale]
+hostname = "waypoint-test"
+
+[[listeners]]
+name = "tcp"
+listen = ":5432"
+mode = "tcp"
+backend = "db.example.com:5432"
+tls_mode = "require"
+`
+	path := writeTestConfig(t, content)
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "tls_mode is only supported for mode \"postgres\"") {
+		t.Errorf("expected tls_mode postgres-only error, got: %v", err)
+	}
+}
+
+func TestValidate_PostgresTLSCertPairRequired(t *testing.T) {
+	content := `
+[tailscale]
+hostname = "waypoint-test"
+
+[[listeners]]
+name = "pg"
+listen = ":5432"
+mode = "postgres"
+backend = "db.example.com:5432"
+cert_file = "/tmp/server.crt"
+
+[listeners.postgres]
+admin_user = "admin"
+admin_password = "pass"
+admin_database = "postgres"
+`
+	path := writeTestConfig(t, content)
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "both cert_file and key_file together") {
+		t.Errorf("expected cert pair error, got: %v", err)
+	}
+}
+
+func TestValidate_PostgresTLSCertOnTCP(t *testing.T) {
+	content := `
+[tailscale]
+hostname = "waypoint-test"
+
+[[listeners]]
+name = "tcp"
+listen = ":5432"
+mode = "tcp"
+backend = "db.example.com:5432"
+cert_file = "/tmp/server.crt"
+key_file = "/tmp/server.key"
+`
+	path := writeTestConfig(t, content)
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "cert_file and key_file are only supported for mode \"postgres\"") {
+		t.Errorf("expected postgres-only cert error, got: %v", err)
+	}
+}
+
+func TestValidate_UseTailscaleTLSOnTCP(t *testing.T) {
+	content := `
+[tailscale]
+hostname = "waypoint-test"
+
+[[listeners]]
+name = "tcp"
+listen = ":5432"
+mode = "tcp"
+backend = "db.example.com:5432"
+use_tailscale_tls = false
+`
+	path := writeTestConfig(t, content)
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "use_tailscale_tls is only supported for mode \"postgres\"") {
+		t.Errorf("expected postgres-only use_tailscale_tls error, got: %v", err)
 	}
 }
 

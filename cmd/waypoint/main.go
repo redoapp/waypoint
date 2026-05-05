@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -31,6 +32,7 @@ import (
 	"github.com/redoapp/waypoint/internal/proxy"
 	"github.com/redoapp/waypoint/internal/restrict"
 	"github.com/redoapp/waypoint/internal/tsdns"
+	"tailscale.com/client/local"
 	"tailscale.com/ipn"
 	"tailscale.com/tsnet"
 	"tailscale.com/types/nettype"
@@ -362,6 +364,10 @@ func runServer(ctx context.Context, configPath string, logger *slog.Logger, leve
 				if lCfg.Postgres == nil {
 					return fmt.Errorf("postgres listener %s requires [listeners.postgres] config", lCfg.Name)
 				}
+				clientTLSMode, clientTLSConfig, err := resolvePostgresClientTLS(lCfg, srv, lc, logger.With("listener", lCfg.Name))
+				if err != nil {
+					return fmt.Errorf("configure client TLS for listener %s: %w", lCfg.Name, err)
+				}
 
 				pgPeerService := lCfg.Name
 				if lCfg.Postgres.ServiceName != "" {
@@ -391,6 +397,8 @@ func runServer(ctx context.Context, configPath string, logger *slog.Logger, leve
 					Provisioner:   provisioner,
 					Metrics:       m,
 					PGConfig:      lCfg.Postgres,
+					ClientTLSMode: clientTLSMode,
+					ClientTLS:     clientTLSConfig,
 					BackendTLS:    lCfg.BackendTLS,
 					RevalInterval: revalInterval,
 					Logger:        logger.With("listener", lCfg.Name),
@@ -418,6 +426,93 @@ func runServer(ctx context.Context, configPath string, logger *slog.Logger, leve
 	wg.Wait()
 	logger.Info("shutdown complete")
 	return nil
+}
+
+func resolvePostgresClientTLS(lCfg config.ListenerConfig, srv *tsnet.Server, lc *local.Client, logger *slog.Logger) (config.PostgresTLSMode, *tls.Config, error) {
+	mode := lCfg.EffectivePostgresTLSMode()
+	if mode == config.PostgresTLSOff {
+		return mode, nil, nil
+	}
+
+	var adminCert *tls.Certificate
+	if lCfg.CertFile != "" && lCfg.KeyFile != "" {
+		cert, err := tls.LoadX509KeyPair(lCfg.CertFile, lCfg.KeyFile)
+		if err != nil {
+			return "", nil, fmt.Errorf("load cert/key pair: %w", err)
+		}
+		if len(cert.Certificate) > 0 {
+			leaf, err := x509.ParseCertificate(cert.Certificate[0])
+			if err != nil {
+				return "", nil, fmt.Errorf("parse admin certificate: %w", err)
+			}
+			cert.Leaf = leaf
+		}
+		adminCert = &cert
+	}
+
+	certDomains := tailscaleCertDomains(srv)
+	var tailscaleGetCertificate func(*tls.ClientHelloInfo) (*tls.Certificate, error)
+	if lCfg.EffectiveUseTailscaleTLS() && len(certDomains) > 0 {
+		defaultServerName := certDomains[0]
+		tailscaleGetCertificate = func(hi *tls.ClientHelloInfo) (*tls.Certificate, error) {
+			if hi == nil {
+				hi = &tls.ClientHelloInfo{}
+			}
+			hello := *hi
+			if hello.ServerName == "" {
+				hello.ServerName = defaultServerName
+			}
+			return lc.GetCertificate(&hello)
+		}
+	}
+
+	if adminCert == nil && tailscaleGetCertificate == nil {
+		if mode == config.PostgresTLSRequire {
+			return "", nil, fmt.Errorf("tls_mode=require but no usable certificate source is available")
+		}
+		logger.Warn("client TLS requested but no certificate source is available; downgrading listener to plaintext",
+			"mode", mode,
+			"listener", lCfg.Name,
+		)
+		return config.PostgresTLSOff, nil, nil
+	}
+
+	return mode, buildPostgresClientTLSConfig(adminCert, tailscaleGetCertificate), nil
+}
+
+func tailscaleCertDomains(srv *tsnet.Server) (domains []string) {
+	if srv == nil {
+		return nil
+	}
+	defer func() {
+		if recover() != nil {
+			domains = nil
+		}
+	}()
+	return srv.CertDomains()
+}
+
+func buildPostgresClientTLSConfig(adminCert *tls.Certificate, tailscaleGetCertificate func(*tls.ClientHelloInfo) (*tls.Certificate, error)) *tls.Config {
+	return &tls.Config{
+		MinVersion: tls.VersionTLS12,
+		GetCertificate: func(hi *tls.ClientHelloInfo) (*tls.Certificate, error) {
+			if adminCert != nil {
+				if hi == nil || hi.ServerName == "" {
+					return adminCert, nil
+				}
+				if adminCert.Leaf != nil && adminCert.Leaf.VerifyHostname(hi.ServerName) == nil {
+					return adminCert, nil
+				}
+			}
+			if tailscaleGetCertificate != nil {
+				return tailscaleGetCertificate(hi)
+			}
+			if adminCert != nil {
+				return adminCert, nil
+			}
+			return nil, fmt.Errorf("no TLS certificate available")
+		},
+	}
 }
 
 func acceptLoop(ctx context.Context, wg *sync.WaitGroup, ln net.Listener, handler func(context.Context, net.Conn), logger *slog.Logger) {

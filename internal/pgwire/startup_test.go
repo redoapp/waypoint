@@ -1,11 +1,22 @@
 package pgwire
 
 import (
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+	"errors"
+	"math/big"
 	"net"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgproto3"
+
+	"github.com/redoapp/waypoint/internal/config"
 )
 
 func TestReadWriteStartupMessage(t *testing.T) {
@@ -23,7 +34,7 @@ func TestReadWriteStartupMessage(t *testing.T) {
 	}()
 
 	// Read it from the "server" side.
-	msg, err := ReadStartupMessage(server)
+	_, msg, err := ReadStartupMessage(server, config.PostgresTLSOff, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -61,7 +72,7 @@ func TestReadStartupMessage_SSLDenied(t *testing.T) {
 		WriteStartupMessage(client, "ssluser", "ssldb", nil)
 	}()
 
-	msg, err := ReadStartupMessage(server)
+	_, msg, err := ReadStartupMessage(server, config.PostgresTLSOff, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -81,7 +92,7 @@ func TestReadStartupMessage_InvalidLength(t *testing.T) {
 		client.Close()
 	}()
 
-	_, err := ReadStartupMessage(server)
+	_, _, err := ReadStartupMessage(server, config.PostgresTLSOff, nil)
 	if err == nil {
 		t.Fatal("expected error for invalid length")
 	}
@@ -101,7 +112,7 @@ func TestWriteStartupMessage_SkipsDuplicateUserDB(t *testing.T) {
 		})
 	}()
 
-	msg, err := ReadStartupMessage(server)
+	_, msg, err := ReadStartupMessage(server, config.PostgresTLSOff, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -177,9 +188,102 @@ func TestReadStartupMessage_OversizedLength(t *testing.T) {
 		client.Close()
 	}()
 
-	_, err := ReadStartupMessage(server)
+	_, _, err := ReadStartupMessage(server, config.PostgresTLSOff, nil)
 	if err == nil {
 		t.Fatal("expected error for oversized length")
+	}
+}
+
+func TestReadStartupMessage_TLSOptionalAcceptsSSL(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	serverTLS := mustServerTLSConfig(t)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		sslReq := []byte{0, 0, 0, 8, 0x04, 0xD2, 0x16, 0x2F}
+		if _, err := client.Write(sslReq); err != nil {
+			t.Errorf("write ssl request: %v", err)
+			return
+		}
+
+		buf := make([]byte, 1)
+		if _, err := client.Read(buf); err != nil {
+			t.Errorf("read ssl response: %v", err)
+			return
+		}
+		if buf[0] != 'S' {
+			t.Errorf("expected 'S', got %q", buf[0])
+			return
+		}
+
+		tlsClient := tls.Client(client, &tls.Config{InsecureSkipVerify: true})
+		if err := tlsClient.Handshake(); err != nil {
+			t.Errorf("client handshake: %v", err)
+			return
+		}
+		if err := WriteStartupMessage(tlsClient, "ssluser", "ssldb", nil); err != nil {
+			t.Errorf("write startup over tls: %v", err)
+		}
+	}()
+
+	gotConn, msg, err := ReadStartupMessage(server, config.PostgresTLSOptional, serverTLS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gotConn.Close()
+	<-done
+
+	if _, ok := gotConn.(*tls.Conn); !ok {
+		t.Fatalf("expected TLS-wrapped connection, got %T", gotConn)
+	}
+	if msg.Parameters["user"] != "ssluser" {
+		t.Errorf("user = %q, want ssluser", msg.Parameters["user"])
+	}
+}
+
+func TestReadStartupMessage_TLSRequireRejectsPlaintext(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	go func() {
+		if err := WriteStartupMessage(client, "plainuser", "plaindb", nil); err != nil {
+			t.Errorf("write startup: %v", err)
+		}
+	}()
+
+	_, _, err := ReadStartupMessage(server, config.PostgresTLSRequire, mustServerTLSConfig(t))
+	if !errors.Is(err, ErrTLSRequired) {
+		t.Fatalf("expected ErrTLSRequired, got %v", err)
+	}
+}
+
+func TestReadStartupMessage_TLSOptionalAllowsPlaintext(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	go func() {
+		if err := WriteStartupMessage(client, "plainuser", "plaindb", nil); err != nil {
+			t.Errorf("write startup: %v", err)
+		}
+	}()
+
+	gotConn, msg, err := ReadStartupMessage(server, config.PostgresTLSOptional, mustServerTLSConfig(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotConn == nil {
+		t.Fatal("expected connection")
+	}
+	if _, ok := gotConn.(*tls.Conn); ok {
+		t.Fatal("expected plaintext connection")
+	}
+	if msg.Parameters["user"] != "plainuser" {
+		t.Errorf("user = %q, want plainuser", msg.Parameters["user"])
 	}
 }
 
@@ -255,6 +359,43 @@ func TestForwardPostAuth_UnknownMessageForwarded(t *testing.T) {
 
 	if err := <-done; err != nil {
 		t.Fatalf("ForwardPostAuth returned error: %v", err)
+	}
+}
+
+func mustServerTLSConfig(t *testing.T) *tls.Config {
+	t.Helper()
+
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject: pkix.Name{
+			CommonName: "localhost",
+		},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		DNSNames:              []string{"localhost"},
+		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("create certificate: %v", err)
+	}
+
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
+	cert, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		t.Fatalf("load key pair: %v", err)
+	}
+	return &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS12,
 	}
 }
 

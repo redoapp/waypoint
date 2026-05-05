@@ -4,11 +4,18 @@ package proxy_test
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"math/big"
 	"net"
 	"net/http/httptest"
 	"os"
@@ -51,6 +58,10 @@ func (m *mockAuthorizer) Authorize(_ context.Context, _ string, _ string) (*auth
 // provisioner and tracker, wires a PostgresProxy with the given mock auth,
 // and starts an accept loop on localhost. Returns the proxy listen address.
 func setupProxy(t *testing.T, authResult *auth.AuthResult, authErr error) string {
+	return setupProxyWithClientTLS(t, authResult, authErr, config.PostgresTLSOff, nil)
+}
+
+func setupProxyWithClientTLS(t *testing.T, authResult *auth.AuthResult, authErr error, clientTLSMode config.PostgresTLSMode, clientTLS *tls.Config) string {
 	t.Helper()
 
 	rdb := testutil.RedisClient(t)
@@ -63,16 +74,18 @@ func setupProxy(t *testing.T, authResult *auth.AuthResult, authErr error) string
 	provisioner := provision.NewProvisioner("admin", "adminpass", "waypoint_test", backend, "wp_", false, true, "test", store, logger, nil, nil)
 
 	p := &proxy.PostgresProxy{
-		Backend:      backend,
-		Name:         "test-listener",
-		Auth:         &mockAuthorizer{result: authResult, err: authErr},
-		Tracker:      tracker,
-		Provisioner:  provisioner,
-		Metrics:      m,
-		PGConfig:     &config.PostgresAdmin{},
-		Logger:       logger,
-		BytesRead:    &atomic.Int64{},
-		BytesWritten: &atomic.Int64{},
+		Backend:       backend,
+		Name:          "test-listener",
+		Auth:          &mockAuthorizer{result: authResult, err: authErr},
+		Tracker:       tracker,
+		Provisioner:   provisioner,
+		Metrics:       m,
+		PGConfig:      &config.PostgresAdmin{},
+		ClientTLSMode: clientTLSMode,
+		ClientTLS:     clientTLS,
+		Logger:        logger,
+		BytesRead:     &atomic.Int64{},
+		BytesWritten:  &atomic.Int64{},
 	}
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -108,10 +121,37 @@ func proxyConnect(t *testing.T, addr, database string) *pgx.Conn {
 	return conn
 }
 
+func proxyConnectSSLRequire(t *testing.T, addr, database string) *pgx.Conn {
+	t.Helper()
+	connStr := fmt.Sprintf("postgres://ignored:ignored@%s/%s?sslmode=require", addr, database)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	conn, err := pgx.Connect(ctx, connStr)
+	if err != nil {
+		t.Fatalf("proxy connect with sslmode=require: %v", err)
+	}
+	t.Cleanup(func() { conn.Close(context.Background()) })
+	return conn
+}
+
 // proxyConnectErr dials the proxy expecting an error.
 func proxyConnectErr(t *testing.T, addr, database string) error {
 	t.Helper()
 	connStr := fmt.Sprintf("postgres://ignored:ignored@%s/%s?sslmode=disable", addr, database)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	conn, err := pgx.Connect(ctx, connStr)
+	if err != nil {
+		return err
+	}
+	conn.Close(context.Background())
+	t.Fatal("expected connection error but succeeded")
+	return nil
+}
+
+func proxyConnectErrWithSSLMode(t *testing.T, addr, database, sslmode string) error {
+	t.Helper()
+	connStr := fmt.Sprintf("postgres://ignored:ignored@%s/%s?sslmode=%s", addr, database, sslmode)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	conn, err := pgx.Connect(ctx, connStr)
@@ -270,8 +310,76 @@ func setupProxyWithAuth(t *testing.T, authorizer proxy.Authorizer, opts ...func(
 	return ln.Addr().String()
 }
 
+func mustTestServerTLSConfig(t *testing.T) *tls.Config {
+	t.Helper()
+
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject: pkix.Name{
+			CommonName: "localhost",
+		},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		DNSNames:              []string{"localhost"},
+		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("create certificate: %v", err)
+	}
+
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
+	cert, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		t.Fatalf("load key pair: %v", err)
+	}
+	return &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS12,
+	}
+}
+
 // Ensure redis import is used.
 var _ *redis.Client
+
+func TestIntegration_Proxy_SSLModeRequireAllowed(t *testing.T) {
+	result := makeAuthResult("waypoint_test", auth.DBPermissions{
+		Permissions: []string{"readonly"},
+	}, nil)
+
+	addr := setupProxyWithClientTLS(t, result, nil, config.PostgresTLSOptional, mustTestServerTLSConfig(t))
+	t.Cleanup(func() { cleanupRole(t, "testuser@example.com", "test-node", "waypoint_test") })
+
+	conn := proxyConnectSSLRequire(t, addr, "waypoint_test")
+
+	var val int
+	if err := conn.QueryRow(context.Background(), "SELECT 1").Scan(&val); err != nil {
+		t.Fatalf("SELECT 1 failed over TLS: %v", err)
+	}
+	if val != 1 {
+		t.Fatalf("expected 1, got %d", val)
+	}
+}
+
+func TestIntegration_Proxy_TLSRequiredRejectsPlaintext(t *testing.T) {
+	result := makeAuthResult("waypoint_test", auth.DBPermissions{
+		Permissions: []string{"readonly"},
+	}, nil)
+
+	addr := setupProxyWithClientTLS(t, result, nil, config.PostgresTLSRequire, mustTestServerTLSConfig(t))
+	err := proxyConnectErrWithSSLMode(t, addr, "waypoint_test", "disable")
+	if err == nil {
+		t.Fatal("expected plaintext connection to fail")
+	}
+}
 
 func TestIntegration_Proxy_SelectAllowed(t *testing.T) {
 	result := makeAuthResult("waypoint_test", auth.DBPermissions{

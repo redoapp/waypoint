@@ -2,52 +2,91 @@ package pgwire
 
 import (
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 
 	"github.com/jackc/pgx/v5/pgproto3"
+
+	"github.com/redoapp/waypoint/internal/config"
 )
 
-// ReadStartupMessage reads the initial PG startup message from the client.
-// Handles SSL negotiation (denies SSL, client retries with plaintext).
-func ReadStartupMessage(conn net.Conn) (*pgproto3.StartupMessage, error) {
+var ErrTLSRequired = errors.New("postgres client TLS required")
+
+const sslRequestCode = 80877103
+
+// ReadStartupMessage reads the initial PG startup message from the client and
+// negotiates Postgres SSL/TLS when enabled. It returns the live client
+// connection to use for the rest of the session, which may be TLS-wrapped.
+func ReadStartupMessage(conn net.Conn, mode config.PostgresTLSMode, tlsConfig *tls.Config) (net.Conn, *pgproto3.StartupMessage, error) {
+	tlsAccepted := false
 	for {
-		header := make([]byte, 4)
-		if _, err := io.ReadFull(conn, header); err != nil {
-			return nil, fmt.Errorf("read startup header: %w", err)
-		}
-		msgLen := int(header[0])<<24 | int(header[1])<<16 | int(header[2])<<8 | int(header[3])
-
-		if msgLen < 4 || msgLen > 10240 {
-			return nil, fmt.Errorf("invalid startup message length: %d", msgLen)
+		msgLen, body, err := readStartupPacket(conn)
+		if err != nil {
+			return conn, nil, err
 		}
 
-		body := make([]byte, msgLen-4)
-		if _, err := io.ReadFull(conn, body); err != nil {
-			return nil, fmt.Errorf("read startup body: %w", err)
-		}
-
-		// Check for SSLRequest (version 80877103 = 0x04D2162F).
-		if msgLen == 8 {
-			version := int(body[0])<<24 | int(body[1])<<16 | int(body[2])<<8 | int(body[3])
-			if version == 80877103 {
-				// Deny SSL with 'N'.
+		if isSSLRequest(msgLen, body) {
+			switch mode {
+			case config.PostgresTLSOff:
 				if _, err := conn.Write([]byte{'N'}); err != nil {
-					return nil, fmt.Errorf("deny SSL: %w", err)
+					return conn, nil, fmt.Errorf("deny SSL: %w", err)
 				}
-				continue
+			case config.PostgresTLSOptional, config.PostgresTLSRequire:
+				if tlsConfig == nil {
+					return conn, nil, fmt.Errorf("TLS requested but no server TLS config is available")
+				}
+				if _, err := conn.Write([]byte{'S'}); err != nil {
+					return conn, nil, fmt.Errorf("accept SSL: %w", err)
+				}
+				tlsConn := tls.Server(conn, tlsConfig)
+				if err := tlsConn.Handshake(); err != nil {
+					return conn, nil, fmt.Errorf("TLS handshake: %w", err)
+				}
+				conn = tlsConn
+				tlsAccepted = true
+			default:
+				return conn, nil, fmt.Errorf("unsupported TLS mode %q", mode)
 			}
+			continue
 		}
 
-		// Decode expects the message body without the 4-byte length prefix.
+		if mode == config.PostgresTLSRequire && !tlsAccepted {
+			return conn, nil, ErrTLSRequired
+		}
+
 		var startup pgproto3.StartupMessage
 		if err := startup.Decode(body); err != nil {
-			return nil, fmt.Errorf("decode startup: %w", err)
+			return conn, nil, fmt.Errorf("decode startup: %w", err)
 		}
-
-		return &startup, nil
+		return conn, &startup, nil
 	}
+}
+
+func readStartupPacket(conn net.Conn) (int, []byte, error) {
+	header := make([]byte, 4)
+	if _, err := io.ReadFull(conn, header); err != nil {
+		return 0, nil, fmt.Errorf("read startup header: %w", err)
+	}
+	msgLen := int(header[0])<<24 | int(header[1])<<16 | int(header[2])<<8 | int(header[3])
+	if msgLen < 4 || msgLen > 10240 {
+		return 0, nil, fmt.Errorf("invalid startup message length: %d", msgLen)
+	}
+
+	body := make([]byte, msgLen-4)
+	if _, err := io.ReadFull(conn, body); err != nil {
+		return 0, nil, fmt.Errorf("read startup body: %w", err)
+	}
+	return msgLen, body, nil
+}
+
+func isSSLRequest(msgLen int, body []byte) bool {
+	if msgLen != 8 || len(body) != 4 {
+		return false
+	}
+	version := int(body[0])<<24 | int(body[1])<<16 | int(body[2])<<8 | int(body[3])
+	return version == sslRequestCode
 }
 
 // UpgradeToTLS sends an SSLRequest to the backend and upgrades the connection

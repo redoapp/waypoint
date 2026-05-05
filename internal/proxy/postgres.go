@@ -2,6 +2,8 @@ package proxy
 
 import (
 	"context"
+	"crypto/tls"
+	"errors"
 	"log/slog"
 	"net"
 	"sync/atomic"
@@ -30,6 +32,8 @@ type PostgresProxy struct {
 	Provisioner   *provision.Provisioner
 	Metrics       *metrics.Metrics
 	PGConfig      *config.PostgresAdmin
+	ClientTLSMode config.PostgresTLSMode
+	ClientTLS     *tls.Config
 	BackendTLS    bool
 	RevalInterval time.Duration
 	Logger        *slog.Logger
@@ -40,7 +44,11 @@ type PostgresProxy struct {
 
 // HandleConn processes a single inbound PostgreSQL connection.
 func (p *PostgresProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
-	defer clientConn.Close()
+	defer func() {
+		if clientConn != nil {
+			clientConn.Close()
+		}
+	}()
 
 	connID := logging.NewConnID()
 	log := p.Logger.With("conn_id", connID, "remote", clientConn.RemoteAddr())
@@ -121,8 +129,16 @@ func (p *PostgresProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 	}()
 
 	// Step 3: Read client's StartupMessage to get requested database.
-	startup, err := pgwire.ReadStartupMessage(clientConn)
+	clientConn, startup, err := pgwire.ReadStartupMessage(clientConn, p.ClientTLSMode, p.ClientTLS)
 	if err != nil {
+		if errors.Is(err, pgwire.ErrTLSRequired) {
+			setupSpan.RecordError(err)
+			setupSpan.SetStatus(codes.Error, "tls required")
+			setupSpan.End()
+			log.WarnContext(ctx, "client attempted plaintext on TLS-required listener")
+			pgwire.SendErrorResponse(clientConn, "FATAL", "28000", "TLS is required for this listener")
+			return
+		}
 		setupSpan.RecordError(err)
 		setupSpan.SetStatus(codes.Error, "read startup failed")
 		setupSpan.End()

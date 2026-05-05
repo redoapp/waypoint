@@ -65,10 +65,39 @@ type ListenerConfig struct {
 	Backend             string         `toml:"backend"`
 	BackendViaTailscale bool           `toml:"backend_via_tailscale"`
 	BackendTLS          bool           `toml:"tls"`
+	PostgresTLSMode     string         `toml:"tls_mode"`
+	UseTailscaleTLS     *bool          `toml:"use_tailscale_tls"`
+	CertFile            string         `toml:"cert_file"`
+	KeyFile             string         `toml:"key_file"`
 	Service             string         `toml:"service"`
 	Postgres            *PostgresAdmin `toml:"postgres"`
 	PortMap             map[int]int    `toml:"-"`
 	RawPortMap          map[string]int `toml:"port_map,omitempty"`
+}
+
+type PostgresTLSMode string
+
+const (
+	PostgresTLSOff      PostgresTLSMode = "off"
+	PostgresTLSOptional PostgresTLSMode = "optional"
+	PostgresTLSRequire  PostgresTLSMode = "require"
+)
+
+func (l ListenerConfig) EffectivePostgresTLSMode() PostgresTLSMode {
+	switch strings.ToLower(strings.TrimSpace(l.PostgresTLSMode)) {
+	case "", string(PostgresTLSOptional):
+		return PostgresTLSOptional
+	case string(PostgresTLSOff):
+		return PostgresTLSOff
+	case string(PostgresTLSRequire):
+		return PostgresTLSRequire
+	default:
+		return PostgresTLSMode(strings.ToLower(strings.TrimSpace(l.PostgresTLSMode)))
+	}
+}
+
+func (l ListenerConfig) EffectiveUseTailscaleTLS() bool {
+	return l.UseTailscaleTLS == nil || *l.UseTailscaleTLS
 }
 
 // BackendPair holds a resolved listen address and backend address.
@@ -254,6 +283,25 @@ func validate(cfg *Config) error {
 		}
 		if l.Service != "" && strings.TrimPrefix(l.Service, "svc:") == cfg.Tailscale.Hostname {
 			return fmt.Errorf("listeners[%d].service %q conflicts with tailscale.hostname %q — the service name (without \"svc:\" prefix) must differ from the hostname to avoid DNS shadowing", i, l.Service, cfg.Tailscale.Hostname)
+		}
+		if l.PostgresTLSMode != "" {
+			switch l.EffectivePostgresTLSMode() {
+			case PostgresTLSOff, PostgresTLSOptional, PostgresTLSRequire:
+			default:
+				return fmt.Errorf("listeners[%d].tls_mode must be one of %q, %q, or %q, got %q", i, PostgresTLSOff, PostgresTLSOptional, PostgresTLSRequire, l.PostgresTLSMode)
+			}
+		}
+		if (l.CertFile == "") != (l.KeyFile == "") {
+			return fmt.Errorf("listeners[%d] must set both cert_file and key_file together", i)
+		}
+		if (l.CertFile != "" || l.KeyFile != "") && mode != "postgres" {
+			return fmt.Errorf("listeners[%d].cert_file and key_file are only supported for mode \"postgres\"", i)
+		}
+		if l.PostgresTLSMode != "" && mode != "postgres" {
+			return fmt.Errorf("listeners[%d].tls_mode is only supported for mode \"postgres\"", i)
+		}
+		if l.UseTailscaleTLS != nil && mode != "postgres" {
+			return fmt.Errorf("listeners[%d].use_tailscale_tls is only supported for mode \"postgres\"", i)
 		}
 	}
 	return nil
