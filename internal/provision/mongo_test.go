@@ -16,6 +16,15 @@ func TestMongoFormatUsername_Basic(t *testing.T) {
 	}
 }
 
+func TestMongoFormatUsername_RedisScopeDoesNotAffectDatabaseUsername(t *testing.T) {
+	p := (&MongoProvisioner{userPrefix: "wp_"}).WithRedisScope("mongo-prod")
+
+	name := p.formatUsername("alice@example.com", "my-node")
+	if strings.Contains(name, "mongo_prod") || strings.Contains(name, "mongo-prod") {
+		t.Errorf("database username should not contain redis scope: %q", name)
+	}
+}
+
 func TestMongoFormatUsername_Truncation(t *testing.T) {
 	p := &MongoProvisioner{userPrefix: "wp_"}
 	longLogin := strings.Repeat("a", 100) + "@example.com"

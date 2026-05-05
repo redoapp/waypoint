@@ -38,6 +38,7 @@ type MongoProvisioner struct {
 	authDB      string
 	userPrefix  string
 	peerService string
+	redisScope  string
 	store       *restrict.RedisStore
 	logger      *slog.Logger
 	dialFunc    func(ctx context.Context, network, addr string) (net.Conn, error)
@@ -75,6 +76,13 @@ func NewMongoReplicaSetProvisioner(adminUser, adminPassword string, backends []s
 		logger:      logger,
 		dialFunc:    dialFunc,
 	}
+}
+
+// WithRedisScope scopes Redis provisioning metadata and locks without changing
+// the generated MongoDB username.
+func (p *MongoProvisioner) WithRedisScope(scope string) *MongoProvisioner {
+	p.redisScope = scope
+	return p
 }
 
 func mongoAdminURI(adminUser, adminPassword string, backends []string, replicaSet, authDatabase string, backendTLS bool) string {
@@ -140,7 +148,7 @@ func (p *MongoProvisioner) EnsureUser(ctx context.Context, loginName, nodeName s
 	ctx, lockSpan := tracer.Start(ctx, "waypoint.mongo.provision.acquire_lock")
 	var lockToken string
 	for i := 0; i < maxRetries; i++ {
-		token, err := p.store.AcquireLock(ctx, "role:"+mongoUser, lockTTL)
+		token, err := p.store.AcquireScopedLock(ctx, p.redisScope, "role:"+mongoUser, lockTTL)
 		if err != nil {
 			lockSpan.RecordError(err)
 			lockSpan.SetStatus(codes.Error, "acquire lock failed")
@@ -168,7 +176,7 @@ func (p *MongoProvisioner) EnsureUser(ctx context.Context, loginName, nodeName s
 		return "", "", err
 	}
 	lockSpan.End()
-	defer p.store.ReleaseLock(ctx, "role:"+mongoUser, lockToken)
+	defer p.store.ReleaseScopedLock(ctx, p.redisScope, "role:"+mongoUser, lockToken)
 	p.logger.DebugContext(ctx, "acquired lock", "user", mongoUser)
 
 	// Connect to admin database.
@@ -230,7 +238,7 @@ func (p *MongoProvisioner) EnsureUser(ctx context.Context, loginName, nodeName s
 					return "", "", fmt.Errorf("update roles: %w", err)
 				}
 				userSpan.End()
-				p.store.TouchLastUsed(ctx, mongoUser)
+				p.store.TouchLastUsedScoped(ctx, p.redisScope, mongoUser)
 				return mongoUser, cc.password, nil
 			}
 			// User was deleted externally — fall through to full create.
@@ -282,7 +290,7 @@ func (p *MongoProvisioner) EnsureUser(ctx context.Context, loginName, nodeName s
 		expires:  time.Now().Add(credentialTTL),
 	})
 
-	p.store.TouchLastUsed(ctx, mongoUser)
+	p.store.TouchLastUsedScoped(ctx, p.redisScope, mongoUser)
 
 	return mongoUser, password, nil
 }

@@ -29,6 +29,7 @@ type Provisioner struct {
 	userPrefix   string
 	allowRawSQL  bool
 	peerService  string
+	redisScope   string
 	store        *restrict.RedisStore
 	logger       *slog.Logger
 	dialFunc     func(ctx context.Context, network, addr string) (net.Conn, error)
@@ -63,6 +64,13 @@ func NewProvisioner(adminUser, adminPassword, adminDatabase, backend, userPrefix
 	}
 }
 
+// WithRedisScope scopes Redis provisioning metadata and locks without changing
+// the generated database role name.
+func (p *Provisioner) WithRedisScope(scope string) *Provisioner {
+	p.redisScope = scope
+	return p
+}
+
 // EnsureUser creates or updates a dynamic PG role for the given identity,
 // node, and database. Returns the PG username and password.
 func (p *Provisioner) EnsureUser(ctx context.Context, loginName, nodeName, database string, perms *auth.DBPermissions) (string, string, error) {
@@ -87,7 +95,7 @@ func (p *Provisioner) EnsureUser(ctx context.Context, loginName, nodeName, datab
 	ctx, lockSpan := tracer.Start(ctx, "waypoint.provision.acquire_lock")
 	var lockToken string
 	for i := 0; i < maxRetries; i++ {
-		token, err := p.store.AcquireLock(ctx, "role:"+pgUser, lockTTL)
+		token, err := p.store.AcquireScopedLock(ctx, p.redisScope, "role:"+pgUser, lockTTL)
 		if err != nil {
 			lockSpan.RecordError(err)
 			lockSpan.SetStatus(codes.Error, "acquire lock failed")
@@ -115,7 +123,7 @@ func (p *Provisioner) EnsureUser(ctx context.Context, loginName, nodeName, datab
 		return "", "", err
 	}
 	lockSpan.End()
-	defer p.store.ReleaseLock(ctx, "role:"+pgUser, lockToken)
+	defer p.store.ReleaseScopedLock(ctx, p.redisScope, "role:"+pgUser, lockToken)
 	p.logger.DebugContext(ctx, "acquired lock", "role", pgUser)
 
 	connCfg, err := pgx.ParseConfig(p.adminConnStr)
@@ -265,7 +273,7 @@ func (p *Provisioner) EnsureUser(ctx context.Context, loginName, nodeName, datab
 	grantSpan.End()
 
 	// Touch last-used timestamp.
-	p.store.TouchLastUsed(ctx, pgUser)
+	p.store.TouchLastUsedScoped(ctx, p.redisScope, pgUser)
 
 	return pgUser, password, nil
 }

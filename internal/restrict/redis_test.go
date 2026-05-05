@@ -450,6 +450,42 @@ func TestRedisStore_TouchAndGetLastUsed(t *testing.T) {
 	}
 }
 
+func TestRedisStore_TouchAndGetLastUsedScoped(t *testing.T) {
+	store, _ := setupRedis(t)
+	ctx := context.Background()
+
+	user := "wp_alice_laptop_appdb"
+	before := time.Now().Add(-time.Second)
+	if err := store.TouchLastUsedScoped(ctx, "pg-main", user); err != nil {
+		t.Fatal(err)
+	}
+	after := time.Now().Add(time.Second)
+
+	ts, err := store.GetLastUsedScoped(ctx, "pg-main", user)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ts.Before(before) || ts.After(after) {
+		t.Errorf("timestamp %v not in expected range [%v, %v]", ts, before, after)
+	}
+
+	unscoped, err := store.GetLastUsed(ctx, user)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !unscoped.IsZero() {
+		t.Errorf("expected unscoped last-used to be empty, got %v", unscoped)
+	}
+
+	otherScope, err := store.GetLastUsedScoped(ctx, "pg-analytics", user)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !otherScope.IsZero() {
+		t.Errorf("expected other scope to be empty, got %v", otherScope)
+	}
+}
+
 func TestRedisStore_GetLastUsed_NonExistent(t *testing.T) {
 	store, _ := setupRedis(t)
 	ctx := context.Background()
@@ -460,6 +496,47 @@ func TestRedisStore_GetLastUsed_NonExistent(t *testing.T) {
 	}
 	if !ts.IsZero() {
 		t.Errorf("expected zero time for nonexistent, got %v", ts)
+	}
+}
+
+func TestRedisStore_AcquireScopedLock(t *testing.T) {
+	store, _ := setupRedis(t)
+	ctx := context.Background()
+	name := "role:wp_alice_laptop_appdb"
+
+	tokenMain, err := store.AcquireScopedLock(ctx, "pg-main", name, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tokenMain == "" {
+		t.Fatal("expected lock token for pg-main")
+	}
+
+	tokenMainAgain, err := store.AcquireScopedLock(ctx, "pg-main", name, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tokenMainAgain != "" {
+		t.Fatalf("expected same scoped lock to be held, got token %q", tokenMainAgain)
+	}
+
+	tokenAnalytics, err := store.AcquireScopedLock(ctx, "pg-analytics", name, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tokenAnalytics == "" {
+		t.Fatal("expected same role name to lock independently in another scope")
+	}
+
+	if err := store.ReleaseScopedLock(ctx, "pg-main", name, tokenMain); err != nil {
+		t.Fatal(err)
+	}
+	tokenMainAfterRelease, err := store.AcquireScopedLock(ctx, "pg-main", name, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tokenMainAfterRelease == "" {
+		t.Fatal("expected lock token after releasing pg-main")
 	}
 }
 

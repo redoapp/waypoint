@@ -42,6 +42,18 @@ func TestFormatUsername_Basic(t *testing.T) {
 	}
 }
 
+func TestFormatUsername_RedisScopeDoesNotAffectDatabaseUsername(t *testing.T) {
+	p := (&Provisioner{userPrefix: "wp_"}).WithRedisScope("pg-main")
+
+	got := p.formatUsername("alice@example.com", "alice-laptop", "app_db")
+	if got != "wp_alice_example_com_alice_laptop_app_db" {
+		t.Errorf("got %q", got)
+	}
+	if strings.Contains(got, "pg_main") || strings.Contains(got, "pg-main") {
+		t.Errorf("database username should not contain redis scope: %q", got)
+	}
+}
+
 func TestFormatUsername_NodeWithDomain(t *testing.T) {
 	p := &Provisioner{userPrefix: "wp_"}
 	got := p.formatUsername("bob@corp.com", "bob-desktop.tail12345.ts.net", "mydb")
