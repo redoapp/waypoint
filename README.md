@@ -67,11 +67,14 @@ Use `tls_mode = "require"` to reject plaintext Postgres clients.
 
 MongoDB replica sets can be exposed as one logical listener with one Waypoint
 port per member. Set `backend_via_tailscale = true` when Waypoint must reach the
-members over Tailscale or subnet routes:
+members over Tailscale or subnet routes. For SRV-backed clusters, omit
+`[[listeners.mongodb.members]]`; Waypoint resolves the SRV record at startup and
+allocates consecutive listener ports starting from `listen`:
 
 ```toml
 [[listeners]]
 name = "mongo-prod"
+listen = ":27017"
 mode = "mongodb"
 backend_via_tailscale = true
 tls = true                              # optional: use TLS to MongoDB backends
@@ -79,6 +82,27 @@ tls_mode = "require"                    # off | optional | require for clients
 use_tailscale_tls = true                # default: allow *.ts.net cert lookup
 # cert_file = "/etc/waypoint/mongo.crt" # optional: custom-domain cert
 # key_file = "/etc/waypoint/mongo.key"
+
+[listeners.mongodb]
+admin_user = "waypoint_admin"
+admin_password = "${MONGO_ADMIN_PASSWORD}"
+auth_database = "admin"
+replica_set = "rs0"
+srv = "cluster.example.com"             # resolves _mongodb._tcp.cluster.example.com
+srv_max_members = 3                     # binds :27017, :27018, and :27019
+```
+
+When combining MongoDB SRV discovery with a Tailscale Service, set `advertise`
+so topology rewrites can be built before service listeners are registered.
+
+You can also map members explicitly when you need fixed backend/member
+addresses:
+
+```toml
+[[listeners]]
+name = "mongo-prod"
+mode = "mongodb"
+backend_via_tailscale = true
 
 [listeners.mongodb]
 admin_user = "waypoint_admin"

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/tls"
@@ -17,6 +18,8 @@ import (
 	"log/slog"
 
 	"github.com/redoapp/waypoint/internal/config"
+	"github.com/redoapp/waypoint/internal/tsdns"
+	"golang.org/x/net/dns/dnsmessage"
 	"tailscale.com/tsnet"
 )
 
@@ -321,4 +324,135 @@ func TestBuildMongoTopologyMap(t *testing.T) {
 	if topologyMap["mongo2.internal:27017"] != "waypoint:27018" {
 		t.Fatalf("mongo2 map = %q", topologyMap["mongo2.internal:27017"])
 	}
+}
+
+func TestMaterializeMongoSRVBackends(t *testing.T) {
+	lCfg := config.ListenerConfig{
+		Name:      "mongo-prod",
+		Listen:    ":27017",
+		Advertise: "waypoint-db",
+		MongoDB: &config.MongoDBAdmin{
+			SRV:           "cluster.example.com",
+			SRVMaxMembers: 3,
+		},
+	}
+	backends := lCfg.ExpandedBackends()
+	query := func(_ context.Context, name, qtype string) ([]byte, error) {
+		if name != "_mongodb._tcp.cluster.example.com." {
+			t.Fatalf("query name = %q", name)
+		}
+		if qtype != "SRV" {
+			t.Fatalf("query type = %q", qtype)
+		}
+		return buildTestSRVDNSResponse(t, "_mongodb._tcp.cluster.example.com",
+			tsdns.SRVRecord{Target: "mongo2.example.com", Port: 27017, Priority: 10},
+			tsdns.SRVRecord{Target: "mongo1.example.com", Port: 27017, Priority: 10},
+		), nil
+	}
+
+	resolved, err := materializeMongoSRVBackends(context.Background(), lCfg, backends, query)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := []config.BackendPair{
+		{Listen: ":27017", Backend: "mongo1.example.com:27017", Advertise: "waypoint-db"},
+		{Listen: ":27018", Backend: "mongo2.example.com:27017", Advertise: "waypoint-db"},
+	}
+	if len(resolved) != len(expected) {
+		t.Fatalf("resolved len = %d, want %d", len(resolved), len(expected))
+	}
+	for i, want := range expected {
+		if resolved[i] != want {
+			t.Fatalf("resolved[%d] = %+v, want %+v", i, resolved[i], want)
+		}
+	}
+}
+
+func TestMaterializeMongoSRVBackendsTooManyRecords(t *testing.T) {
+	lCfg := config.ListenerConfig{
+		Name:   "mongo-prod",
+		Listen: ":27017",
+		MongoDB: &config.MongoDBAdmin{
+			SRV:           "cluster.example.com",
+			SRVMaxMembers: 1,
+		},
+	}
+	backends := lCfg.ExpandedBackends()
+	query := func(_ context.Context, _, _ string) ([]byte, error) {
+		return buildTestSRVDNSResponse(t, "_mongodb._tcp.cluster.example.com",
+			tsdns.SRVRecord{Target: "mongo1.example.com", Port: 27017},
+			tsdns.SRVRecord{Target: "mongo2.example.com", Port: 27017},
+		), nil
+	}
+
+	_, err := materializeMongoSRVBackends(context.Background(), lCfg, backends, query)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+}
+
+func TestBuildMongoTopologyMapWithSRVBackends(t *testing.T) {
+	lCfg := config.ListenerConfig{
+		Name:      "mongo-prod",
+		Advertise: "waypoint-db",
+		MongoDB: &config.MongoDBAdmin{
+			SRV:           "cluster.example.com",
+			SRVMaxMembers: 2,
+		},
+	}
+	backends := []config.BackendPair{
+		{Listen: ":27017", Backend: "mongo1.example.com:27017", Advertise: "waypoint-db"},
+		{Listen: ":27018", Backend: "mongo2.example.com:27017", Advertise: "waypoint-db"},
+	}
+
+	topologyMap, err := buildMongoTopologyMap(lCfg, backends, "waypoint")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if topologyMap["mongo1.example.com:27017"] != "waypoint-db:27017" {
+		t.Fatalf("mongo1 map = %q", topologyMap["mongo1.example.com:27017"])
+	}
+	if topologyMap["mongo2.example.com:27017"] != "waypoint-db:27018" {
+		t.Fatalf("mongo2 map = %q", topologyMap["mongo2.example.com:27017"])
+	}
+}
+
+func buildTestSRVDNSResponse(t *testing.T, name string, records ...tsdns.SRVRecord) []byte {
+	t.Helper()
+
+	dnsName, err := dnsmessage.NewName(name + ".")
+	if err != nil {
+		t.Fatalf("new name: %v", err)
+	}
+	msg := dnsmessage.Message{
+		Header: dnsmessage.Header{Response: true},
+		Questions: []dnsmessage.Question{
+			{Name: dnsName, Type: dnsmessage.TypeSRV, Class: dnsmessage.ClassINET},
+		},
+	}
+	for _, record := range records {
+		target, err := dnsmessage.NewName(record.Target + ".")
+		if err != nil {
+			t.Fatalf("new target: %v", err)
+		}
+		msg.Answers = append(msg.Answers, dnsmessage.Resource{
+			Header: dnsmessage.ResourceHeader{
+				Name:  dnsName,
+				Type:  dnsmessage.TypeSRV,
+				Class: dnsmessage.ClassINET,
+				TTL:   300,
+			},
+			Body: &dnsmessage.SRVResource{
+				Priority: record.Priority,
+				Weight:   record.Weight,
+				Port:     record.Port,
+				Target:   target,
+			},
+		})
+	}
+	packed, err := msg.Pack()
+	if err != nil {
+		t.Fatalf("pack: %v", err)
+	}
+	return packed
 }

@@ -124,6 +124,10 @@ type BackendPair struct {
 // For multi-port listeners (PortMap set), returns one pair per mapping,
 // sorted by listen port for deterministic ordering.
 func (l *ListenerConfig) ExpandedBackends() []BackendPair {
+	if l.MongoDB != nil && l.MongoDB.HasSRV() {
+		return l.expandedMongoSRVBackends()
+	}
+
 	if l.MongoDB != nil && len(l.MongoDB.Members) > 0 {
 		pairs := make([]BackendPair, 0, len(l.MongoDB.Members))
 		for _, member := range l.MongoDB.Members {
@@ -156,6 +160,30 @@ func (l *ListenerConfig) ExpandedBackends() []BackendPair {
 	sort.Slice(pairs, func(i, j int) bool {
 		return pairs[i].Listen < pairs[j].Listen
 	})
+	return pairs
+}
+
+func (l *ListenerConfig) expandedMongoSRVBackends() []BackendPair {
+	if l.MongoDB == nil || l.MongoDB.SRVMaxMembers <= 0 {
+		return []BackendPair{{Listen: l.Listen, Backend: l.Backend, Advertise: l.Advertise}}
+	}
+
+	host, portStr, err := net.SplitHostPort(l.Listen)
+	if err != nil {
+		return []BackendPair{{Listen: l.Listen, Backend: l.Backend, Advertise: l.Advertise}}
+	}
+	basePort, err := strconv.Atoi(portStr)
+	if err != nil {
+		return []BackendPair{{Listen: l.Listen, Backend: l.Backend, Advertise: l.Advertise}}
+	}
+
+	pairs := make([]BackendPair, 0, l.MongoDB.SRVMaxMembers)
+	for i := 0; i < l.MongoDB.SRVMaxMembers; i++ {
+		pairs = append(pairs, BackendPair{
+			Listen:    net.JoinHostPort(host, strconv.Itoa(basePort+i)),
+			Advertise: l.Advertise,
+		})
+	}
 	return pairs
 }
 
@@ -211,6 +239,8 @@ type MongoDBAdmin struct {
 	UserTTL       string          `toml:"user_ttl"`
 	ServiceName   string          `toml:"service_name"` // peer.service override for OTel (default: listener name)
 	ReplicaSet    string          `toml:"replica_set"`  // optional replica set name for admin provisioning
+	SRV           string          `toml:"srv"`          // optional MongoDB SRV name for backend discovery
+	SRVMaxMembers int             `toml:"srv_max_members"`
 	Members       []MongoDBMember `toml:"members"`
 }
 
@@ -227,6 +257,10 @@ func (m *MongoDBAdmin) UserTTLDuration() time.Duration {
 		return 24 * time.Hour
 	}
 	return d
+}
+
+func (m *MongoDBAdmin) HasSRV() bool {
+	return m != nil && strings.TrimSpace(m.SRV) != ""
 }
 
 // Load reads and parses a TOML config file, expanding environment variables
@@ -278,8 +312,12 @@ func validate(cfg *Config) error {
 		if mode != "tcp" && mode != "postgres" && mode != "mongodb" {
 			return fmt.Errorf("listeners[%d].mode must be 'tcp', 'postgres', or 'mongodb', got %q", i, l.Mode)
 		}
+		if l.MongoDB.HasSRV() && mode != "mongodb" {
+			return fmt.Errorf("listeners[%d]: mongodb.srv is only supported for mode %q, got %q", i, "mongodb", l.Mode)
+		}
 		hasMongoMembers := mode == "mongodb" && l.MongoDB != nil && len(l.MongoDB.Members) > 0
-		if l.Backend == "" && !hasMongoMembers {
+		hasMongoSRV := mode == "mongodb" && l.MongoDB.HasSRV()
+		if l.Backend == "" && !hasMongoMembers && !hasMongoSRV {
 			return fmt.Errorf("listeners[%d].backend is required", i)
 		}
 		if hasMongoMembers && l.Backend == "" {
@@ -331,8 +369,35 @@ func validate(cfg *Config) error {
 		}
 
 		if l.Advertise != "" {
-			if _, _, err := net.SplitHostPort(l.Advertise); err != nil {
+			if hasMongoSRV {
+				if err := validateAdvertiseHostOrAddr(l.Advertise); err != nil {
+					return fmt.Errorf("listeners[%d].advertise must be host or host:port, got %q: %w", i, l.Advertise, err)
+				}
+			} else if _, _, err := net.SplitHostPort(l.Advertise); err != nil {
 				return fmt.Errorf("listeners[%d].advertise must be host:port, got %q: %w", i, l.Advertise, err)
+			}
+		}
+
+		if l.MongoDB != nil && l.MongoDB.HasSRV() {
+			if len(l.MongoDB.Members) > 0 {
+				return fmt.Errorf("listeners[%d]: mongodb.srv cannot be combined with mongodb.members", i)
+			}
+			if l.MongoDB.SRVMaxMembers <= 0 {
+				return fmt.Errorf("listeners[%d].mongodb.srv_max_members must be greater than zero when srv is set", i)
+			}
+			if l.Service != "" && l.Advertise == "" {
+				return fmt.Errorf("listeners[%d].advertise is required when service is set with mongodb.srv", i)
+			}
+			if _, portStr, err := net.SplitHostPort(l.Listen); err != nil {
+				return fmt.Errorf("listeners[%d].listen must be host:port when mongodb.srv is set, got %q: %w", i, l.Listen, err)
+			} else {
+				port, err := strconv.ParseUint(portStr, 10, 16)
+				if err != nil {
+					return fmt.Errorf("listeners[%d].listen has invalid port %q: %w", i, portStr, err)
+				}
+				if int(port)+l.MongoDB.SRVMaxMembers-1 > 65535 {
+					return fmt.Errorf("listeners[%d].mongodb.srv_max_members overflows listen port range", i)
+				}
 			}
 		}
 
@@ -406,4 +471,20 @@ func validate(cfg *Config) error {
 
 func supportsClientTLS(mode string) bool {
 	return mode == "postgres" || mode == "mongodb"
+}
+
+func validateAdvertiseHostOrAddr(advertise string) error {
+	if strings.TrimSpace(advertise) == "" {
+		return fmt.Errorf("empty advertise")
+	}
+	if _, _, err := net.SplitHostPort(advertise); err == nil {
+		return nil
+	}
+	if strings.Contains(advertise, ":") {
+		return fmt.Errorf("invalid host:port")
+	}
+	if strings.Contains(advertise, "/") {
+		return fmt.Errorf("invalid host")
+	}
+	return nil
 }

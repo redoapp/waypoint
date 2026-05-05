@@ -95,6 +95,7 @@ backend = "10.0.1.5:3306"
 # to the production member addresses.
 # [[listeners]]
 # name = "mongo-prod"
+# listen = ":27017"          # first listener port when using mongodb.srv
 # mode = "mongodb"
 # backend_via_tailscale = true
 # tls = true                # optional: use TLS to MongoDB backends
@@ -111,7 +112,10 @@ backend = "10.0.1.5:3306"
 # user_prefix = "wp_"
 # user_ttl = "24h"
 # replica_set = "rs0"
+# srv = "cluster.example.com" # resolves _mongodb._tcp.cluster.example.com
+# srv_max_members = 3         # binds :27017, :27018, and :27019
 #
+# Or omit srv/srv_max_members and configure explicit members:
 # [[listeners.mongodb.members]]
 # backend = "mongo1.prod.internal:27017"
 # listen = ":27017"

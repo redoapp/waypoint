@@ -22,6 +22,14 @@ import (
 // QueryFunc matches the signature of local.Client.QueryDNS.
 type QueryFunc func(ctx context.Context, name, queryType string) ([]byte, error)
 
+// SRVRecord is a DNS SRV answer.
+type SRVRecord struct {
+	Target   string
+	Port     uint16
+	Priority uint16
+	Weight   uint16
+}
+
 // LookupHost resolves a hostname to IP addresses using the provided
 // Tailscale DNS query function. The query function should call
 // local.Client.QueryDNS (or equivalent) which goes through the full
@@ -63,6 +71,45 @@ func LookupHost(ctx context.Context, query QueryFunc, host string) ([]string, er
 	return ips, nil
 }
 
+// LookupSRV resolves SRV records using the provided Tailscale DNS query
+// function. The name should be the full SRV owner name, such as
+// _mongodb._tcp.cluster.example.com.
+func LookupSRV(ctx context.Context, query QueryFunc, name string) ([]SRVRecord, error) {
+	tracer := otel.Tracer("waypoint")
+	ctx, span := tracer.Start(ctx, "tailscale.dns.lookup_srv",
+		trace.WithAttributes(
+			attribute.String("peer.service", "tailscale"),
+			attribute.String("dns.question.name", name),
+		),
+	)
+	defer span.End()
+
+	fqdn := name
+	if !strings.HasSuffix(fqdn, ".") {
+		fqdn += "."
+	}
+
+	slog.DebugContext(ctx, "looking up SRV records", "name", name)
+
+	raw, err := query(ctx, fqdn, "SRV")
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "DNS SRV lookup failed")
+		slog.WarnContext(ctx, "DNS SRV lookup failed", "name", name, "error", err)
+		return nil, err
+	}
+
+	records, err := parseSRVRecords(raw, name)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "DNS SRV parse failed")
+		slog.WarnContext(ctx, "DNS SRV parse failed", "name", name, "error", err)
+		return nil, err
+	}
+	slog.DebugContext(ctx, "DNS SRV lookup resolved", "name", name, "records", records)
+	return records, nil
+}
+
 // parseARecords extracts IPv4 addresses from a raw DNS response.
 func parseARecords(raw []byte, host string) ([]string, error) {
 	var parser dnsmessage.Parser
@@ -99,6 +146,49 @@ func parseARecords(raw []byte, host string) ([]string, error) {
 		return nil, fmt.Errorf("no A records for %q", host)
 	}
 	return ips, nil
+}
+
+// parseSRVRecords extracts SRV answers from a raw DNS response.
+func parseSRVRecords(raw []byte, name string) ([]SRVRecord, error) {
+	var parser dnsmessage.Parser
+	if _, err := parser.Start(raw); err != nil {
+		return nil, fmt.Errorf("parse DNS response: %w", err)
+	}
+	if err := parser.SkipAllQuestions(); err != nil {
+		return nil, fmt.Errorf("skip questions: %w", err)
+	}
+
+	var records []SRVRecord
+	for {
+		hdr, err := parser.AnswerHeader()
+		if err == dnsmessage.ErrSectionDone {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("parse answer: %w", err)
+		}
+		if hdr.Type == dnsmessage.TypeSRV {
+			r, err := parser.SRVResource()
+			if err != nil {
+				return nil, fmt.Errorf("parse SRV record: %w", err)
+			}
+			records = append(records, SRVRecord{
+				Target:   strings.TrimSuffix(r.Target.String(), "."),
+				Port:     r.Port,
+				Priority: r.Priority,
+				Weight:   r.Weight,
+			})
+		} else {
+			if err := parser.SkipAnswer(); err != nil {
+				return nil, fmt.Errorf("skip answer: %w", err)
+			}
+		}
+	}
+
+	if len(records) == 0 {
+		return nil, fmt.Errorf("no SRV records for %q", name)
+	}
+	return records, nil
 }
 
 // NewDialer creates a dialer that resolves hostnames through Tailscale's
