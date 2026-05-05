@@ -11,6 +11,7 @@ import (
 	"net/netip"
 	"os"
 	"os/signal"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -279,6 +280,7 @@ func runServer(ctx context.Context, configPath string, logger *slog.Logger, leve
 		// Compute dialer/lookupFunc once per listener config (shared across all ports).
 		var dialer func(ctx context.Context, network, addr string) (net.Conn, error)
 		var lookupFunc func(ctx context.Context, host string) ([]string, error)
+		var queryDNS tsdns.QueryFunc
 		if lCfg.BackendViaTailscale {
 			// Work around tailscale/tailscale#5840: tsnet.Server.Dial does
 			// not use MagicDNS for split DNS domains. Resolve hostnames
@@ -306,7 +308,7 @@ func runServer(ctx context.Context, configPath string, logger *slog.Logger, leve
 			listenPacket := func(network, addr string) (net.PacketConn, error) {
 				return srv.ListenPacket(network, net.JoinHostPort(v4.String(), "0"))
 			}
-			queryDNS := tsdns.NewRoutedQueryFunc(fallbackDNS, listenPacket, dnsRoutes)
+			queryDNS = tsdns.NewRoutedQueryFunc(fallbackDNS, listenPacket, dnsRoutes)
 			lookupFunc = tsdns.NewLookupFunc(queryDNS)
 			dialer = tsdns.NewDialer(srv.Dial, queryDNS)
 		}
@@ -316,9 +318,23 @@ func runServer(ctx context.Context, configPath string, logger *slog.Logger, leve
 
 		var mongoProvisioner *provision.MongoProvisioner
 		var mongoTopologyMap map[string]string
+		var mongoClientTLSMode config.TLSMode
+		var mongoClientTLSConfig *tls.Config
 		if mode == "mongodb" {
 			if lCfg.MongoDB == nil {
 				return fmt.Errorf("mongodb listener %s requires [listeners.mongodb] config", lCfg.Name)
+			}
+
+			backends, err = materializeMongoSRVBackends(ctx, lCfg, backends, queryDNS)
+			if err != nil {
+				return fmt.Errorf("mongodb listener %s SRV resolution: %w", lCfg.Name, err)
+			}
+			if lCfg.MongoDB.HasSRV() {
+				logger.Info("resolved mongodb srv",
+					"listener", lCfg.Name,
+					"srv", lCfg.MongoDB.SRV,
+					"members", len(backends),
+				)
 			}
 
 			mongoPeerService := lCfg.Name
@@ -343,6 +359,11 @@ func runServer(ctx context.Context, configPath string, logger *slog.Logger, leve
 			mongoTopologyMap, err = buildMongoTopologyMap(lCfg, backends, cfg.Tailscale.Hostname)
 			if err != nil {
 				return err
+			}
+
+			mongoClientTLSMode, mongoClientTLSConfig, err = resolveMongoClientTLS(lCfg, srv, lc, logger.With("listener", lCfg.Name))
+			if err != nil {
+				return fmt.Errorf("configure client TLS for listener %s: %w", lCfg.Name, err)
 			}
 		}
 
@@ -457,6 +478,9 @@ func runServer(ctx context.Context, configPath string, logger *slog.Logger, leve
 					Provisioner:   mongoProvisioner,
 					Metrics:       m,
 					MongoConfig:   lCfg.MongoDB,
+					ClientTLSMode: mongoClientTLSMode,
+					ClientTLS:     mongoClientTLSConfig,
+					BackendTLS:    lCfg.BackendTLS,
 					TopologyMap:   mongoTopologyMap,
 					RevalInterval: revalInterval,
 					Logger:        logger.With("listener", lCfg.Name),
@@ -487,8 +511,16 @@ func runServer(ctx context.Context, configPath string, logger *slog.Logger, leve
 }
 
 func resolvePostgresClientTLS(lCfg config.ListenerConfig, srv *tsnet.Server, lc *local.Client, logger *slog.Logger) (config.PostgresTLSMode, *tls.Config, error) {
-	mode := lCfg.EffectivePostgresTLSMode()
-	if mode == config.PostgresTLSOff {
+	return resolveClientTLS(lCfg, srv, lc, logger)
+}
+
+func resolveMongoClientTLS(lCfg config.ListenerConfig, srv *tsnet.Server, lc *local.Client, logger *slog.Logger) (config.TLSMode, *tls.Config, error) {
+	return resolveClientTLS(lCfg, srv, lc, logger)
+}
+
+func resolveClientTLS(lCfg config.ListenerConfig, srv *tsnet.Server, lc *local.Client, logger *slog.Logger) (config.TLSMode, *tls.Config, error) {
+	mode := lCfg.EffectiveTLSMode()
+	if mode == config.TLSOff {
 		return mode, nil, nil
 	}
 
@@ -525,17 +557,17 @@ func resolvePostgresClientTLS(lCfg config.ListenerConfig, srv *tsnet.Server, lc 
 	}
 
 	if adminCert == nil && tailscaleGetCertificate == nil {
-		if mode == config.PostgresTLSRequire {
+		if mode == config.TLSRequire {
 			return "", nil, fmt.Errorf("tls_mode=require but no usable certificate source is available")
 		}
 		logger.Warn("client TLS requested but no certificate source is available; downgrading listener to plaintext",
 			"mode", mode,
 			"listener", lCfg.Name,
 		)
-		return config.PostgresTLSOff, nil, nil
+		return config.TLSOff, nil, nil
 	}
 
-	return mode, buildPostgresClientTLSConfig(adminCert, tailscaleGetCertificate), nil
+	return mode, buildClientTLSConfig(adminCert, tailscaleGetCertificate), nil
 }
 
 func tailscaleCertDomains(srv *tsnet.Server) (domains []string) {
@@ -551,6 +583,10 @@ func tailscaleCertDomains(srv *tsnet.Server) (domains []string) {
 }
 
 func buildPostgresClientTLSConfig(adminCert *tls.Certificate, tailscaleGetCertificate func(*tls.ClientHelloInfo) (*tls.Certificate, error)) *tls.Config {
+	return buildClientTLSConfig(adminCert, tailscaleGetCertificate)
+}
+
+func buildClientTLSConfig(adminCert *tls.Certificate, tailscaleGetCertificate func(*tls.ClientHelloInfo) (*tls.Certificate, error)) *tls.Config {
 	return &tls.Config{
 		MinVersion: tls.VersionTLS12,
 		GetCertificate: func(hi *tls.ClientHelloInfo) (*tls.Certificate, error) {
@@ -597,10 +633,6 @@ func acceptLoop(ctx context.Context, wg *sync.WaitGroup, ln net.Listener, handle
 }
 
 func mongoProvisionBackends(lCfg config.ListenerConfig, backends []config.BackendPair) []string {
-	if lCfg.MongoDB == nil || len(lCfg.MongoDB.Members) == 0 {
-		return []string{lCfg.Backend}
-	}
-
 	seen := make(map[string]bool, len(backends))
 	result := make([]string, 0, len(backends))
 	for _, be := range backends {
@@ -610,11 +642,14 @@ func mongoProvisionBackends(lCfg config.ListenerConfig, backends []config.Backen
 		seen[be.Backend] = true
 		result = append(result, be.Backend)
 	}
+	if len(result) == 0 && lCfg.Backend != "" {
+		result = append(result, lCfg.Backend)
+	}
 	return result
 }
 
 func buildMongoTopologyMap(lCfg config.ListenerConfig, backends []config.BackendPair, tailscaleHostname string) (map[string]string, error) {
-	if lCfg.MongoDB == nil || len(lCfg.MongoDB.Members) == 0 {
+	if lCfg.MongoDB == nil || (!lCfg.MongoDB.HasSRV() && len(lCfg.MongoDB.Members) == 0) {
 		return nil, nil
 	}
 
@@ -631,7 +666,14 @@ func buildMongoTopologyMap(lCfg config.ListenerConfig, backends []config.Backend
 
 func advertisedAddr(lCfg config.ListenerConfig, be config.BackendPair, tailscaleHostname, serviceFQDN string) (string, error) {
 	if be.Advertise != "" {
-		return be.Advertise, nil
+		if _, _, err := net.SplitHostPort(be.Advertise); err == nil {
+			return be.Advertise, nil
+		}
+		_, port, err := net.SplitHostPort(be.Listen)
+		if err != nil {
+			return "", fmt.Errorf("split listen address %q: %w", be.Listen, err)
+		}
+		return net.JoinHostPort(be.Advertise, port), nil
 	}
 
 	_, port, err := net.SplitHostPort(be.Listen)
@@ -674,4 +716,87 @@ func addTopologyMapAddr(topologyMap map[string]string, backend, advertise string
 	}
 	topologyMap[net.JoinHostPort(strings.ToLower(host), port)] = advertise
 	topologyMap[strings.ToLower(host)+":"+port] = advertise
+}
+
+func materializeMongoSRVBackends(ctx context.Context, lCfg config.ListenerConfig, backends []config.BackendPair, queryDNS tsdns.QueryFunc) ([]config.BackendPair, error) {
+	if lCfg.MongoDB == nil || !lCfg.MongoDB.HasSRV() {
+		return backends, nil
+	}
+
+	records, err := lookupMongoSRVRecords(ctx, lCfg.MongoDB.SRV, queryDNS)
+	if err != nil {
+		return nil, err
+	}
+	sortMongoSRVRecords(records)
+
+	if len(records) > len(backends) {
+		return nil, fmt.Errorf("resolved %d SRV members but only %d listener slots are configured by srv_max_members", len(records), len(backends))
+	}
+
+	resolved := make([]config.BackendPair, 0, len(records))
+	for i, record := range records {
+		target := strings.TrimSuffix(record.Target, ".")
+		if target == "" {
+			return nil, fmt.Errorf("SRV record %d has empty target", i)
+		}
+		if record.Port == 0 {
+			return nil, fmt.Errorf("SRV record %d for %q has invalid port 0", i, target)
+		}
+		be := backends[i]
+		be.Backend = net.JoinHostPort(target, strconv.Itoa(int(record.Port)))
+		resolved = append(resolved, be)
+	}
+	return resolved, nil
+}
+
+func lookupMongoSRVRecords(ctx context.Context, srvName string, queryDNS tsdns.QueryFunc) ([]tsdns.SRVRecord, error) {
+	name := normalizeMongoSRVName(srvName)
+	if queryDNS != nil {
+		return tsdns.LookupSRV(ctx, queryDNS, name)
+	}
+
+	domain := strings.TrimSuffix(name, ".")
+	const prefix = "_mongodb._tcp."
+	if strings.HasPrefix(strings.ToLower(domain), prefix) {
+		domain = domain[len(prefix):]
+	}
+	_, records, err := net.DefaultResolver.LookupSRV(ctx, "mongodb", "tcp", domain)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]tsdns.SRVRecord, 0, len(records))
+	for _, record := range records {
+		result = append(result, tsdns.SRVRecord{
+			Target:   strings.TrimSuffix(record.Target, "."),
+			Port:     record.Port,
+			Priority: record.Priority,
+			Weight:   record.Weight,
+		})
+	}
+	if len(result) == 0 {
+		return nil, fmt.Errorf("no SRV records for %q", name)
+	}
+	return result, nil
+}
+
+func normalizeMongoSRVName(srvName string) string {
+	name := strings.TrimSuffix(strings.TrimSpace(srvName), ".")
+	if strings.HasPrefix(strings.ToLower(name), "_mongodb._tcp.") {
+		return name
+	}
+	return "_mongodb._tcp." + name
+}
+
+func sortMongoSRVRecords(records []tsdns.SRVRecord) {
+	sort.Slice(records, func(i, j int) bool {
+		if records[i].Priority != records[j].Priority {
+			return records[i].Priority < records[j].Priority
+		}
+		leftTarget := strings.ToLower(strings.TrimSuffix(records[i].Target, "."))
+		rightTarget := strings.ToLower(strings.TrimSuffix(records[j].Target, "."))
+		if leftTarget != rightTarget {
+			return leftTarget < rightTarget
+		}
+		return records[i].Port < records[j].Port
+	})
 }

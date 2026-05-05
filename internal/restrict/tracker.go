@@ -26,54 +26,29 @@ func NewTracker(store *RedisStore, m *metrics.Metrics, logger *slog.Logger) *Tra
 // enforcing both per-user (global) and per-endpoint limits.
 // Returns a release function that must be called when the connection closes.
 func (t *Tracker) Acquire(ctx context.Context, user string, limits auth.MergedLimits, listenerName string) (func(), error) {
-	// Check per-endpoint limit (leaf key).
-	if limits.Endpoint != nil && limits.Endpoint.MaxConns > 0 {
-		current, err := t.store.GetConns(ctx, user, listenerName)
-		if err != nil {
-			return nil, fmt.Errorf("check endpoint conn count: %w", err)
-		}
-		if current >= int64(limits.Endpoint.MaxConns) {
-			t.metrics.LimitViolations.Add(ctx, 1,
-				t.metrics.Attrs("waypoint.limit.violations", metrics.AttrLimitType.String("endpoint_max_conns")))
-			return nil, fmt.Errorf("endpoint connection limit exceeded (%d/%d)", current, limits.Endpoint.MaxConns)
-		}
+	endpointMaxConns := 0
+	if limits.Endpoint != nil {
+		endpointMaxConns = limits.Endpoint.MaxConns
 	}
 
-	// Check per-user (global) limit (root key).
-	if limits.MaxConns > 0 {
-		current, err := t.store.GetConns(ctx, user, "")
-		if err != nil {
-			return nil, fmt.Errorf("check global conn count: %w", err)
-		}
-		if current >= int64(limits.MaxConns) {
-			t.metrics.LimitViolations.Add(ctx, 1,
-				t.metrics.Attrs("waypoint.limit.violations", metrics.AttrLimitType.String("max_conns")))
-			return nil, fmt.Errorf("connection limit exceeded (%d/%d)", current, limits.MaxConns)
-		}
-	}
-
-	// Hierarchical increment — bumps leaf + root atomically.
-	count, err := t.store.IncrConns(ctx, user, listenerName)
+	leafCount, rootCount, decision, err := t.store.tryAcquireConns(ctx, user, listenerName, endpointMaxConns, limits.MaxConns)
 	if err != nil {
 		return nil, fmt.Errorf("increment conn count: %w", err)
 	}
-	t.logger.DebugContext(ctx, "connection acquired", "user", user, "listener", listenerName, "count", count)
 
-	// Double-check after increment (race window is acceptable per spec).
-	if limits.Endpoint != nil && limits.Endpoint.MaxConns > 0 && count > int64(limits.Endpoint.MaxConns) {
-		t.store.DecrConns(ctx, user, listenerName)
+	switch decision {
+	case connAcquireEndpointLimit:
 		t.metrics.LimitViolations.Add(ctx, 1,
 			t.metrics.Attrs("waypoint.limit.violations", metrics.AttrLimitType.String("endpoint_max_conns")))
-		return nil, fmt.Errorf("endpoint connection limit exceeded (%d/%d)", count, limits.Endpoint.MaxConns)
-	}
-	if limits.MaxConns > 0 {
-		globalCount, err := t.store.GetConns(ctx, user, "")
-		if err == nil && globalCount > int64(limits.MaxConns) {
-			t.store.DecrConns(ctx, user, listenerName)
-			t.metrics.LimitViolations.Add(ctx, 1,
-				t.metrics.Attrs("waypoint.limit.violations", metrics.AttrLimitType.String("max_conns")))
-			return nil, fmt.Errorf("connection limit exceeded (%d/%d)", globalCount, limits.MaxConns)
-		}
+		return nil, fmt.Errorf("endpoint connection limit exceeded (%d/%d)", leafCount, endpointMaxConns)
+	case connAcquireGlobalLimit:
+		t.metrics.LimitViolations.Add(ctx, 1,
+			t.metrics.Attrs("waypoint.limit.violations", metrics.AttrLimitType.String("max_conns")))
+		return nil, fmt.Errorf("connection limit exceeded (%d/%d)", rootCount, limits.MaxConns)
+	case connAcquireOK:
+		t.logger.DebugContext(ctx, "connection acquired", "user", user, "listener", listenerName, "count", leafCount)
+	default:
+		return nil, fmt.Errorf("unexpected connection acquire decision %d", decision)
 	}
 
 	released := false

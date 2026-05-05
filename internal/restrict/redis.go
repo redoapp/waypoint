@@ -104,6 +104,43 @@ for i = 1, #KEYS do
 end
 `)
 
+type connAcquireDecision int64
+
+const (
+	connAcquireOK connAcquireDecision = iota
+	connAcquireEndpointLimit
+	connAcquireGlobalLimit
+)
+
+// limitedAcquireConnsScript checks connection limits and increments counters
+// in a single Redis operation. This avoids a high-contention race where all
+// contenders increment, observe an exceeded global count, and then all fail.
+//
+// KEYS[1..N] = ancestor keys (leaf first, root last)
+// ARGV[1]    = endpoint max connections, or 0 for no limit
+// ARGV[2]    = global max connections, or 0 for no limit
+// Returns: {decision, leaf count, root count}
+var limitedAcquireConnsScript = redis.NewScript(`
+local endpoint_max = tonumber(ARGV[1])
+local global_max = tonumber(ARGV[2])
+local leaf = tonumber(redis.call('GET', KEYS[1]) or '0')
+local root = tonumber(redis.call('GET', KEYS[#KEYS]) or '0')
+
+if endpoint_max > 0 and leaf >= endpoint_max then
+    return {1, leaf, root}
+end
+
+if global_max > 0 and root >= global_max then
+    return {2, leaf, root}
+end
+
+for i = 1, #KEYS do
+    redis.call('INCRBY', KEYS[i], 1)
+end
+
+return {0, leaf + 1, root + 1}
+`)
+
 // hierarchicalSlidingWindowScript runs the sliding window on all ancestor keys.
 // KEYS[1..N] = ancestor hash keys (leaf first, root last)
 // ARGV[1]    = bytes to add
@@ -154,16 +191,38 @@ end
 return tonumber(redis.call('GET', KEYS[1]))
 `)
 
+func (s *RedisStore) connKeys(user, scope string) []string {
+	if scope == "" {
+		return s.ancestorKeys("conns", user)
+	}
+	return s.ancestorKeys("conns", user, scope)
+}
+
 // IncrConns atomically increments the connection count for a user/scope,
 // cascading the increment up to the user-level total.
 // Returns the new leaf (scoped) count.
 func (s *RedisStore) IncrConns(ctx context.Context, user, scope string) (int64, error) {
 	ctx, span := s.startOp(ctx, "incr_conns")
 	start := time.Now()
-	keys := s.ancestorKeys("conns", user, scope)
+	keys := s.connKeys(user, scope)
 	val, err := hierarchicalIncrScript.Run(ctx, s.client, keys, 1).Int64()
 	s.recordOp(ctx, span, "incr_conns", start, err)
 	return val, err
+}
+
+func (s *RedisStore) tryAcquireConns(ctx context.Context, user, scope string, endpointMax, globalMax int) (int64, int64, connAcquireDecision, error) {
+	ctx, span := s.startOp(ctx, "try_acquire_conns")
+	start := time.Now()
+	keys := s.connKeys(user, scope)
+	values, err := limitedAcquireConnsScript.Run(ctx, s.client, keys, endpointMax, globalMax).Int64Slice()
+	if err == nil && len(values) != 3 {
+		err = fmt.Errorf("unexpected acquire result length %d", len(values))
+	}
+	s.recordOp(ctx, span, "try_acquire_conns", start, err)
+	if err != nil {
+		return 0, 0, connAcquireOK, err
+	}
+	return values[1], values[2], connAcquireDecision(values[0]), nil
 }
 
 // DecrConns decrements the connection count for a user/scope,
@@ -171,7 +230,7 @@ func (s *RedisStore) IncrConns(ctx context.Context, user, scope string) (int64, 
 func (s *RedisStore) DecrConns(ctx context.Context, user, scope string) error {
 	ctx, span := s.startOp(ctx, "decr_conns")
 	start := time.Now()
-	keys := s.ancestorKeys("conns", user, scope)
+	keys := s.connKeys(user, scope)
 	err := hierarchicalDecrScript.Run(ctx, s.client, keys, 1).Err()
 	if err == redis.Nil {
 		err = nil // script returns nil when keys don't exist

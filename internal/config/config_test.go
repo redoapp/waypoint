@@ -631,8 +631,8 @@ tls_mode = "require"
 `
 	path := writeTestConfig(t, content)
 	_, err := Load(path)
-	if err == nil || !strings.Contains(err.Error(), "tls_mode is only supported for mode \"postgres\"") {
-		t.Errorf("expected tls_mode postgres-only error, got: %v", err)
+	if err == nil || !strings.Contains(err.Error(), "tls_mode is only supported for mode \"postgres\" or \"mongodb\"") {
+		t.Errorf("expected tls_mode mode error, got: %v", err)
 	}
 }
 
@@ -675,8 +675,8 @@ key_file = "/tmp/server.key"
 `
 	path := writeTestConfig(t, content)
 	_, err := Load(path)
-	if err == nil || !strings.Contains(err.Error(), "cert_file and key_file are only supported for mode \"postgres\"") {
-		t.Errorf("expected postgres-only cert error, got: %v", err)
+	if err == nil || !strings.Contains(err.Error(), "cert_file and key_file are only supported for mode \"postgres\" or \"mongodb\"") {
+		t.Errorf("expected cert mode error, got: %v", err)
 	}
 }
 
@@ -694,8 +694,50 @@ use_tailscale_tls = false
 `
 	path := writeTestConfig(t, content)
 	_, err := Load(path)
-	if err == nil || !strings.Contains(err.Error(), "use_tailscale_tls is only supported for mode \"postgres\"") {
-		t.Errorf("expected postgres-only use_tailscale_tls error, got: %v", err)
+	if err == nil || !strings.Contains(err.Error(), "use_tailscale_tls is only supported for mode \"postgres\" or \"mongodb\"") {
+		t.Errorf("expected use_tailscale_tls mode error, got: %v", err)
+	}
+}
+
+func TestLoad_MongoDBClientTLSConfig(t *testing.T) {
+	content := `
+[tailscale]
+hostname = "waypoint-test"
+
+[[listeners]]
+name = "mongo"
+listen = ":27017"
+mode = "mongodb"
+backend = "mongo.example.com:27017"
+tls = true
+tls_mode = "require"
+use_tailscale_tls = false
+cert_file = "/tmp/server.crt"
+key_file = "/tmp/server.key"
+
+[listeners.mongodb]
+admin_user = "admin"
+admin_password = "pass"
+auth_database = "admin"
+`
+	path := writeTestConfig(t, content)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	l := cfg.Listeners[0]
+	if !l.BackendTLS {
+		t.Fatal("expected backend TLS to be enabled")
+	}
+	if got := l.EffectiveTLSMode(); got != TLSRequire {
+		t.Fatalf("tls mode = %q, want %q", got, TLSRequire)
+	}
+	if l.EffectiveUseTailscaleTLS() {
+		t.Fatal("expected use_tailscale_tls=false")
+	}
+	if l.CertFile != "/tmp/server.crt" || l.KeyFile != "/tmp/server.key" {
+		t.Fatalf("cert/key = %q/%q", l.CertFile, l.KeyFile)
 	}
 }
 
@@ -1014,6 +1056,128 @@ advertise = "waypoint-test:27019"
 		if pairs[i] != want {
 			t.Errorf("pairs[%d] = %+v, want %+v", i, pairs[i], want)
 		}
+	}
+}
+
+func TestLoad_MongoDBSRVWithoutMembers(t *testing.T) {
+	content := `
+[tailscale]
+hostname = "waypoint-test"
+
+[[listeners]]
+name = "mongo-prod"
+listen = ":27017"
+mode = "mongodb"
+advertise = "waypoint-db"
+
+[listeners.mongodb]
+admin_user = "admin"
+admin_password = "pass"
+auth_database = "admin"
+replica_set = "rs0"
+srv = "cluster.example.com"
+srv_max_members = 3
+`
+	path := writeTestConfig(t, content)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	l := cfg.Listeners[0]
+	if l.Backend != "" {
+		t.Errorf("Backend = %q, want empty for srv config", l.Backend)
+	}
+	if !l.MongoDB.HasSRV() {
+		t.Fatal("expected MongoDB SRV config")
+	}
+
+	pairs := l.ExpandedBackends()
+	expected := []BackendPair{
+		{Listen: ":27017", Advertise: "waypoint-db"},
+		{Listen: ":27018", Advertise: "waypoint-db"},
+		{Listen: ":27019", Advertise: "waypoint-db"},
+	}
+	if len(pairs) != len(expected) {
+		t.Fatalf("ExpandedBackends len = %d, want %d", len(pairs), len(expected))
+	}
+	for i, want := range expected {
+		if pairs[i] != want {
+			t.Errorf("pairs[%d] = %+v, want %+v", i, pairs[i], want)
+		}
+	}
+}
+
+func TestValidate_MongoDBSRVWithMembersRejected(t *testing.T) {
+	content := `
+[tailscale]
+hostname = "waypoint-test"
+
+[[listeners]]
+name = "mongo-prod"
+listen = ":27017"
+mode = "mongodb"
+
+[listeners.mongodb]
+admin_user = "admin"
+admin_password = "pass"
+srv = "cluster.example.com"
+srv_max_members = 3
+
+[[listeners.mongodb.members]]
+backend = "mongo1.internal:27017"
+listen = ":27017"
+`
+	path := writeTestConfig(t, content)
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "mongodb.srv cannot be combined with mongodb.members") {
+		t.Errorf("expected srv/members error, got: %v", err)
+	}
+}
+
+func TestValidate_MongoDBSRVRequiresMaxMembers(t *testing.T) {
+	content := `
+[tailscale]
+hostname = "waypoint-test"
+
+[[listeners]]
+name = "mongo-prod"
+listen = ":27017"
+mode = "mongodb"
+
+[listeners.mongodb]
+admin_user = "admin"
+admin_password = "pass"
+srv = "cluster.example.com"
+`
+	path := writeTestConfig(t, content)
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "srv_max_members must be greater than zero") {
+		t.Errorf("expected srv_max_members error, got: %v", err)
+	}
+}
+
+func TestValidate_MongoDBSRVRequiresAdvertiseWithService(t *testing.T) {
+	content := `
+[tailscale]
+hostname = "waypoint-test"
+
+[[listeners]]
+name = "mongo-prod"
+listen = ":27017"
+mode = "mongodb"
+service = "svc:mongo-prod"
+
+[listeners.mongodb]
+admin_user = "admin"
+admin_password = "pass"
+srv = "cluster.example.com"
+srv_max_members = 3
+`
+	path := writeTestConfig(t, content)
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "advertise is required when service is set with mongodb.srv") {
+		t.Errorf("expected advertise/service error, got: %v", err)
 	}
 }
 

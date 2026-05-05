@@ -34,6 +34,35 @@ func buildDNSResponse(name string, ips ...net.IP) []byte {
 	return packed
 }
 
+func buildSRVDNSResponse(name string, records ...SRVRecord) []byte {
+	dnsName, _ := dnsmessage.NewName(name + ".")
+	msg := dnsmessage.Message{
+		Header: dnsmessage.Header{Response: true},
+		Questions: []dnsmessage.Question{
+			{Name: dnsName, Type: dnsmessage.TypeSRV, Class: dnsmessage.ClassINET},
+		},
+	}
+	for _, record := range records {
+		target, _ := dnsmessage.NewName(record.Target + ".")
+		msg.Answers = append(msg.Answers, dnsmessage.Resource{
+			Header: dnsmessage.ResourceHeader{
+				Name:  dnsName,
+				Type:  dnsmessage.TypeSRV,
+				Class: dnsmessage.ClassINET,
+				TTL:   300,
+			},
+			Body: &dnsmessage.SRVResource{
+				Priority: record.Priority,
+				Weight:   record.Weight,
+				Port:     record.Port,
+				Target:   target,
+			},
+		})
+	}
+	packed, _ := msg.Pack()
+	return packed
+}
+
 func TestParseARecords_SingleIP(t *testing.T) {
 	raw := buildDNSResponse("example.com", net.ParseIP("10.77.1.50"))
 	ips, err := parseARecords(raw, "example.com")
@@ -73,6 +102,48 @@ func TestParseARecords_NoRecords(t *testing.T) {
 	_, err := parseARecords(raw, "missing.example.com")
 	if err == nil {
 		t.Fatal("expected error for empty response")
+	}
+}
+
+func TestParseSRVRecords(t *testing.T) {
+	raw := buildSRVDNSResponse("_mongodb._tcp.cluster.example.com",
+		SRVRecord{Target: "mongo1.example.com", Port: 27017, Priority: 10, Weight: 20},
+		SRVRecord{Target: "mongo2.example.com", Port: 27018, Priority: 10, Weight: 30},
+	)
+	records, err := parseSRVRecords(raw, "_mongodb._tcp.cluster.example.com")
+	if err != nil {
+		t.Fatalf("parseSRVRecords: %v", err)
+	}
+	if len(records) != 2 {
+		t.Fatalf("records len = %d, want 2", len(records))
+	}
+	if records[0].Target != "mongo1.example.com" || records[0].Port != 27017 {
+		t.Fatalf("records[0] = %+v", records[0])
+	}
+	if records[1].Target != "mongo2.example.com" || records[1].Port != 27018 {
+		t.Fatalf("records[1] = %+v", records[1])
+	}
+}
+
+func TestLookupSRV_AddsFQDN(t *testing.T) {
+	var queriedName, queriedType string
+	query := func(_ context.Context, name, qtype string) ([]byte, error) {
+		queriedName = name
+		queriedType = qtype
+		return buildSRVDNSResponse("_mongodb._tcp.cluster.example.com",
+			SRVRecord{Target: "mongo1.example.com", Port: 27017},
+		), nil
+	}
+
+	_, err := LookupSRV(context.Background(), query, "_mongodb._tcp.cluster.example.com")
+	if err != nil {
+		t.Fatalf("LookupSRV: %v", err)
+	}
+	if queriedName != "_mongodb._tcp.cluster.example.com." {
+		t.Fatalf("queried name = %q", queriedName)
+	}
+	if queriedType != "SRV" {
+		t.Fatalf("queried type = %q, want SRV", queriedType)
 	}
 }
 

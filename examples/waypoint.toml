@@ -95,8 +95,14 @@ backend = "10.0.1.5:3306"
 # to the production member addresses.
 # [[listeners]]
 # name = "mongo-prod"
+# listen = ":27017"          # first listener port when using mongodb.srv
 # mode = "mongodb"
 # backend_via_tailscale = true
+# tls = true                # optional: use TLS to MongoDB backends
+# tls_mode = "require"      # off | optional | require for clients
+# use_tailscale_tls = true  # set false to use only cert_file/key_file
+# cert_file = "/etc/waypoint/mongo.crt" # optional custom-domain cert
+# key_file = "/etc/waypoint/mongo.key"
 # advertise = "waypoint-db:27017" # optional host override; member ports are preserved
 #
 # [listeners.mongodb]
@@ -106,7 +112,10 @@ backend = "10.0.1.5:3306"
 # user_prefix = "wp_"
 # user_ttl = "24h"
 # replica_set = "rs0"
+# srv = "cluster.example.com" # resolves _mongodb._tcp.cluster.example.com
+# srv_max_members = 3         # binds :27017, :27018, and :27019
 #
+# Or omit srv/srv_max_members and configure explicit members:
 # [[listeners.mongodb.members]]
 # backend = "mongo1.prod.internal:27017"
 # listen = ":27017"
