@@ -114,6 +114,78 @@ func TestRedisStore_IncrDecrConns(t *testing.T) {
 	}
 }
 
+func TestRedisStore_TryAcquireConns_GlobalLimit(t *testing.T) {
+	store, _ := setupRedis(t)
+	ctx := context.Background()
+
+	for i := 1; i <= 2; i++ {
+		leaf, root, decision, err := store.tryAcquireConns(ctx, "alice", "mongodb", 0, 2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if decision != connAcquireOK {
+			t.Fatalf("acquire %d: expected ok, got decision %d", i, decision)
+		}
+		if leaf != int64(i) || root != int64(i) {
+			t.Fatalf("acquire %d: expected leaf/root %d, got %d/%d", i, i, leaf, root)
+		}
+	}
+
+	leaf, root, decision, err := store.tryAcquireConns(ctx, "alice", "mongodb", 0, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision != connAcquireGlobalLimit {
+		t.Fatalf("expected global limit decision, got %d", decision)
+	}
+	if leaf != 2 || root != 2 {
+		t.Fatalf("expected denied counts to remain 2/2, got %d/%d", leaf, root)
+	}
+
+	got, err := store.GetConns(ctx, "alice", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != 2 {
+		t.Fatalf("expected root count to remain 2, got %d", got)
+	}
+}
+
+func TestRedisStore_TryAcquireConns_EndpointLimit(t *testing.T) {
+	store, _ := setupRedis(t)
+	ctx := context.Background()
+
+	leaf, root, decision, err := store.tryAcquireConns(ctx, "alice", "mongodb", 1, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision != connAcquireOK {
+		t.Fatalf("expected ok, got decision %d", decision)
+	}
+	if leaf != 1 || root != 1 {
+		t.Fatalf("expected counts 1/1, got %d/%d", leaf, root)
+	}
+
+	leaf, root, decision, err = store.tryAcquireConns(ctx, "alice", "mongodb", 1, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision != connAcquireEndpointLimit {
+		t.Fatalf("expected endpoint limit decision, got %d", decision)
+	}
+	if leaf != 1 || root != 1 {
+		t.Fatalf("expected denied counts to remain 1/1, got %d/%d", leaf, root)
+	}
+
+	got, err := store.GetConns(ctx, "alice", "mongodb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != 1 {
+		t.Fatalf("expected endpoint count to remain 1, got %d", got)
+	}
+}
+
 func TestRedisStore_IncrConns_Hierarchical(t *testing.T) {
 	store, _ := setupRedis(t)
 	ctx := context.Background()

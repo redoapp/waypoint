@@ -4,6 +4,8 @@ import (
 	"context"
 	"log/slog"
 	"os"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -66,6 +68,52 @@ func TestTracker_AcquireNoLimit(t *testing.T) {
 			t.Fatalf("acquire %d failed: %v", i, err)
 		}
 		defer release()
+	}
+}
+
+func TestTracker_AcquireConcurrentGlobalLimit(t *testing.T) {
+	tracker, _ := setupTracker(t)
+	ctx := context.Background()
+
+	const maxConns = 10
+	const goroutines = 200
+	limits := auth.MergedLimits{MaxConns: maxConns}
+
+	var successes atomic.Int64
+	var releaseFns []func()
+	var mu sync.Mutex
+
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	for i := 0; i < goroutines; i++ {
+		go func() {
+			defer wg.Done()
+			release, err := tracker.Acquire(ctx, "stress-user", limits, "test-listener")
+			if err != nil {
+				return
+			}
+			successes.Add(1)
+			mu.Lock()
+			releaseFns = append(releaseFns, release)
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+
+	if successes.Load() != maxConns {
+		t.Fatalf("expected exactly %d successful acquires, got %d", maxConns, successes.Load())
+	}
+
+	for _, fn := range releaseFns {
+		fn()
+	}
+
+	conns, err := tracker.store.GetConns(ctx, "stress-user", "test-listener")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if conns != 0 {
+		t.Fatalf("expected count to return to zero, got %d", conns)
 	}
 }
 
