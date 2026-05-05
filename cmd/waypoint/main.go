@@ -338,7 +338,7 @@ func runServer(ctx context.Context, configPath string, logger *slog.Logger, leve
 				store,
 				logger.With("component", "mongo-provisioner", "listener", lCfg.Name),
 				dialer,
-			)
+			).WithRedisScope(lCfg.Name)
 
 			mongoTopologyMap, err = buildMongoTopologyMap(lCfg, backends, cfg.Tailscale.Hostname)
 			if err != nil {
@@ -421,7 +421,7 @@ func runServer(ctx context.Context, configPath string, logger *slog.Logger, leve
 					logger.With("component", "provisioner", "listener", lCfg.Name),
 					dialer,
 					lookupFunc,
-				)
+				).WithRedisScope(lCfg.Name)
 
 				p := &proxy.PostgresProxy{
 					Backend:       be.Backend,

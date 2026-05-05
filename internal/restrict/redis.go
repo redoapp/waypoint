@@ -59,6 +59,13 @@ func (s *RedisStore) key(parts ...string) string {
 	return k[:len(k)-1] // trim trailing colon
 }
 
+func (s *RedisStore) scopedKey(prefix, scope, name string) string {
+	if scope == "" {
+		return s.key(prefix, name)
+	}
+	return s.key(prefix, scope, name)
+}
+
 // ancestorKeys builds Redis keys from leaf to root for hierarchical operations.
 // The metric prefix (e.g., "conns") is joined with ":" while path segments
 // (user, scope) are joined with "/". The first segment (user) is wrapped in
@@ -359,18 +366,30 @@ func (s *RedisStore) GetBandwidthBytes(ctx context.Context, user, scope string, 
 
 // TouchLastUsed updates the last-used timestamp for a provisioned user.
 func (s *RedisStore) TouchLastUsed(ctx context.Context, pgUser string) error {
+	return s.TouchLastUsedScoped(ctx, "", pgUser)
+}
+
+// TouchLastUsedScoped updates the last-used timestamp for a provisioned user
+// within a backend/listener scope.
+func (s *RedisStore) TouchLastUsedScoped(ctx context.Context, scope, pgUser string) error {
 	ctx, span := s.startOp(ctx, "touch_last_used")
 	start := time.Now()
-	err := s.client.Set(ctx, s.key("lastused", pgUser), time.Now().Unix(), 0).Err()
+	err := s.client.Set(ctx, s.scopedKey("lastused", scope, pgUser), time.Now().Unix(), 0).Err()
 	s.recordOp(ctx, span, "touch_last_used", start, err)
 	return err
 }
 
 // GetLastUsed returns the last-used time for a provisioned user.
 func (s *RedisStore) GetLastUsed(ctx context.Context, pgUser string) (time.Time, error) {
+	return s.GetLastUsedScoped(ctx, "", pgUser)
+}
+
+// GetLastUsedScoped returns the last-used time for a provisioned user within a
+// backend/listener scope.
+func (s *RedisStore) GetLastUsedScoped(ctx context.Context, scope, pgUser string) (time.Time, error) {
 	ctx, span := s.startOp(ctx, "get_last_used")
 	start := time.Now()
-	val, err := s.client.Get(ctx, s.key("lastused", pgUser)).Int64()
+	val, err := s.client.Get(ctx, s.scopedKey("lastused", scope, pgUser)).Int64()
 	if err == redis.Nil {
 		s.recordOp(ctx, span, "get_last_used", start, nil)
 		return time.Time{}, nil
@@ -394,10 +413,16 @@ return 0
 // AcquireLock attempts to acquire a distributed lock using Redis SET NX EX.
 // Returns a token that must be passed to ReleaseLock, or empty string if not acquired.
 func (s *RedisStore) AcquireLock(ctx context.Context, name string, ttl time.Duration) (string, error) {
+	return s.AcquireScopedLock(ctx, "", name, ttl)
+}
+
+// AcquireScopedLock attempts to acquire a distributed lock within a
+// backend/listener scope.
+func (s *RedisStore) AcquireScopedLock(ctx context.Context, scope, name string, ttl time.Duration) (string, error) {
 	ctx, span := s.startOp(ctx, "acquire_lock")
 	start := time.Now()
 	token := fmt.Sprintf("%d:%d", time.Now().UnixNano(), start.UnixNano())
-	key := s.key("lock", name)
+	key := s.scopedKey("lock", scope, name)
 	result, err := s.client.SetArgs(ctx, key, token, redis.SetArgs{Mode: "NX", TTL: ttl}).Result()
 	if err == redis.Nil {
 		s.recordOp(ctx, span, "acquire_lock", start, nil)
@@ -418,9 +443,15 @@ func (s *RedisStore) AcquireLock(ctx context.Context, name string, ttl time.Dura
 // ReleaseLock releases a distributed lock acquired by AcquireLock.
 // The token must match the one returned by AcquireLock.
 func (s *RedisStore) ReleaseLock(ctx context.Context, name string, token string) error {
+	return s.ReleaseScopedLock(ctx, "", name, token)
+}
+
+// ReleaseScopedLock releases a distributed lock acquired by AcquireScopedLock.
+// The token must match the one returned by AcquireScopedLock.
+func (s *RedisStore) ReleaseScopedLock(ctx context.Context, scope, name string, token string) error {
 	ctx, span := s.startOp(ctx, "release_lock")
 	start := time.Now()
-	key := s.key("lock", name)
+	key := s.scopedKey("lock", scope, name)
 	err := releaseLockScript.Run(ctx, s.client, []string{key}, token).Err()
 	if err == redis.Nil {
 		err = nil // lock already expired or released
