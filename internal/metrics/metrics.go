@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"go.opentelemetry.io/otel"
@@ -72,6 +73,7 @@ type Config struct {
 	Endpoint          string              `toml:"endpoint"`
 	Protocol          string              `toml:"protocol"` // "http" (default) or "grpc"
 	Interval          string              `toml:"interval"`
+	Temporality       string              `toml:"temporality"`         // "delta" (default) or "cumulative"
 	TracingSampleRate float64             `toml:"tracing_sample_rate"` // 0 = disabled, 0.0-1.0 = sample rate
 	Enable            map[string][]string `toml:"enable"`
 }
@@ -103,6 +105,20 @@ func (c Config) TagsForMetric(name string) []string {
 		return nil
 	}
 	return c.Enable[name]
+}
+
+// TemporalitySelector returns the export temporality for OTel metrics.
+// Delta is the default because Datadog handles monotonic sums and histograms
+// most reliably in delta form. UpDownCounters still export cumulative.
+func (c Config) TemporalitySelector() (sdkmetric.TemporalitySelector, error) {
+	switch strings.ToLower(strings.TrimSpace(c.Temporality)) {
+	case "", "delta":
+		return sdkmetric.DeltaTemporalitySelector, nil
+	case "cumulative":
+		return sdkmetric.CumulativeTemporalitySelector, nil
+	default:
+		return nil, fmt.Errorf("unsupported metrics temporality %q (use \"delta\" or \"cumulative\")", c.Temporality)
+	}
 }
 
 // New creates a new Metrics instance. If cfg.Endpoint is empty, all instruments
@@ -151,14 +167,21 @@ func New(ctx context.Context, cfg Config, logger *slog.Logger) (*Metrics, error)
 }
 
 func newExporter(ctx context.Context, cfg Config) (sdkmetric.Exporter, error) {
+	temporalitySelector, err := cfg.TemporalitySelector()
+	if err != nil {
+		return nil, err
+	}
+
 	switch cfg.Protocol {
 	case "", "http":
 		return otlpmetrichttp.New(ctx,
 			otlpmetrichttp.WithEndpointURL(cfg.Endpoint),
+			otlpmetrichttp.WithTemporalitySelector(temporalitySelector),
 		)
 	case "grpc":
 		return otlpmetricgrpc.New(ctx,
 			otlpmetricgrpc.WithEndpointURL(cfg.Endpoint),
+			otlpmetricgrpc.WithTemporalitySelector(temporalitySelector),
 		)
 	default:
 		return nil, fmt.Errorf("unsupported metrics protocol %q (use \"http\" or \"grpc\")", cfg.Protocol)
@@ -257,6 +280,14 @@ type tracerShutdowner interface {
 // Tracer returns the configured OTel tracer. Returns a noop tracer when tracing is disabled.
 func (m *Metrics) Tracer() trace.Tracer {
 	return m.tracer
+}
+
+// MeterProvider returns the provider backing this metrics instance.
+func (m *Metrics) MeterProvider() metric.MeterProvider {
+	if m == nil || m.provider == nil {
+		return noop.NewMeterProvider()
+	}
+	return m.provider
 }
 
 // Shutdown flushes and shuts down providers.

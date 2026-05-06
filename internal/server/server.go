@@ -98,7 +98,7 @@ func RunServer(ctx context.Context, configPath string, logger *slog.Logger, leve
 	); err != nil {
 		return fmt.Errorf("redis otel tracing: %w", err)
 	}
-	if err := redisotel.InstrumentMetrics(rdb); err != nil {
+	if err := redisotel.InstrumentMetrics(rdb, redisotel.WithMeterProvider(m.MeterProvider())); err != nil {
 		return fmt.Errorf("redis otel metrics: %w", err)
 	}
 

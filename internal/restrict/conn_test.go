@@ -10,6 +10,9 @@ import (
 
 	"github.com/alicebob/miniredis/v2"
 	"github.com/redis/go-redis/v9"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
+
 	"github.com/redoapp/waypoint/internal/auth"
 	"github.com/redoapp/waypoint/internal/metrics"
 )
@@ -153,6 +156,79 @@ func TestConnLimits_FlushWritesToRedis(t *testing.T) {
 	if cl.pendingBytes.Load() != 0 {
 		t.Errorf("expected 0 pending after flush, got %d", cl.pendingBytes.Load())
 	}
+}
+
+func TestConnLimits_FlushReportsByteMetricUserAttribute(t *testing.T) {
+	store := setupConnTest(t)
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	t.Cleanup(func() { _ = provider.Shutdown(context.Background()) })
+
+	m, err := metrics.NewWithProvider(provider, metrics.Config{
+		Enable: map[string][]string{
+			"waypoint.bytes.read":    {"listener", "user"},
+			"waypoint.bytes.written": {"listener", "user"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cl := &ConnLimits{
+		store:         store,
+		metrics:       m,
+		user:          "alice@example.com",
+		scope:         "pg-production",
+		logger:        testLogger(),
+		flushInterval: time.Hour,
+		done:          make(chan struct{}),
+		listenerAttr:  metrics.AttrListener.String("pg-production"),
+	}
+
+	if err := cl.ReportRead(123); err != nil {
+		t.Fatal(err)
+	}
+	if err := cl.ReportWrite(456); err != nil {
+		t.Fatal(err)
+	}
+	cl.flush()
+
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatal(err)
+	}
+
+	assertByteMetric := func(name string, want int64) {
+		t.Helper()
+		for _, sm := range rm.ScopeMetrics {
+			for _, met := range sm.Metrics {
+				if met.Name != name {
+					continue
+				}
+				sum, ok := met.Data.(metricdata.Sum[int64])
+				if !ok {
+					t.Fatalf("%s data = %T, want metricdata.Sum[int64]", name, met.Data)
+				}
+				for _, dp := range sum.DataPoints {
+					if dp.Value != want {
+						continue
+					}
+					if val, found := dp.Attributes.Value(metrics.AttrListener); !found || val.AsString() != "pg-production" {
+						t.Fatalf("%s listener attr = %v found=%v, want pg-production", name, val, found)
+					}
+					if val, found := dp.Attributes.Value(metrics.AttrUser); !found || val.AsString() != "alice@example.com" {
+						t.Fatalf("%s user attr = %v found=%v, want alice@example.com", name, val, found)
+					}
+					return
+				}
+				t.Fatalf("%s did not include datapoint value %d", name, want)
+			}
+		}
+		t.Fatalf("%s metric not found", name)
+	}
+
+	assertByteMetric("waypoint.bytes.read", 123)
+	assertByteMetric("waypoint.bytes.written", 456)
 }
 
 func TestConnLimits_FlushZeroPendingIsNoop(t *testing.T) {

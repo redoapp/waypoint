@@ -240,12 +240,15 @@ Waypoint exports OpenTelemetry metrics and traces to any OTLP-compatible collect
 endpoint = "http://otel-collector:4318"
 protocol = "http"                        # "http" (default) or "grpc"
 interval = "30s"
+temporality = "delta"                    # "delta" (default, recommended for Datadog) or "cumulative"
 tracing_sample_rate = 1.0                # 0 = disabled, 1.0 = trace all requests
 
 [metrics.enable]
 "waypoint.conn.active"   = ["listener", "mode"]
 "waypoint.conn.total"    = ["listener", "mode"]
 "waypoint.auth.attempts" = ["listener"]
+"waypoint.bytes.read"    = ["listener", "user"]
+"waypoint.bytes.written" = ["listener", "user"]
 ```
 
 **Metrics** are opt-in per metric name via `[metrics.enable]`. The value array controls which attribute tags are allowed (use `["*"]` for all).

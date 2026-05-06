@@ -39,6 +39,7 @@ max_conns_total = 200
 # endpoint = "http://localhost:4318"   # OTLP endpoint (enables metrics when set)
 # protocol = "http"                     # "http" (default) or "grpc"
 # interval = "30s"                      # export interval
+# temporality = "delta"                 # "delta" (default, recommended for Datadog) or "cumulative"
 # tracing_sample_rate = 0.0            # 0 = disabled, 1.0 = trace all requests
 #
 # [metrics.enable]
@@ -53,8 +54,8 @@ max_conns_total = 200
 # "waypoint.auth.latency"     = ["listener", "backend"]
 # "waypoint.reval.attempts"   = ["listener"]
 # "waypoint.reval.failures"   = ["listener"]
-# "waypoint.bytes.read"       = ["listener"]
-# "waypoint.bytes.written"    = ["listener"]
+# "waypoint.bytes.read"       = ["listener", "user"]
+# "waypoint.bytes.written"    = ["listener", "user"]
 # "waypoint.limit.violations" = ["listener", "limit_type"]
 # "waypoint.provision.total"  = ["listener"]
 # "waypoint.provision.latency" = ["listener"]

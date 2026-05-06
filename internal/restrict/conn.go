@@ -202,9 +202,9 @@ func (cl *ConnLimits) flush() {
 		pr := cl.pendingRead.Swap(0)
 		pw := cl.pendingWritten.Swap(0)
 		cl.metrics.BytesRead.Add(ctx, pr,
-			cl.metrics.Attrs("waypoint.bytes.read", cl.listenerAttr))
+			cl.metrics.Attrs("waypoint.bytes.read", cl.listenerAttr, metrics.AttrUser.String(cl.user)))
 		cl.metrics.BytesWritten.Add(ctx, pw,
-			cl.metrics.Attrs("waypoint.bytes.written", cl.listenerAttr))
+			cl.metrics.Attrs("waypoint.bytes.written", cl.listenerAttr, metrics.AttrUser.String(cl.user)))
 	}
 }
 

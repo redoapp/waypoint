@@ -84,6 +84,60 @@ func TestConfig_IntervalDuration(t *testing.T) {
 	}
 }
 
+func TestConfig_TemporalitySelector(t *testing.T) {
+	tests := []struct {
+		name        string
+		temporality string
+		counterWant metricdata.Temporality
+		upDownWant  metricdata.Temporality
+		wantErr     bool
+	}{
+		{
+			name:        "default delta",
+			counterWant: metricdata.DeltaTemporality,
+			upDownWant:  metricdata.CumulativeTemporality,
+		},
+		{
+			name:        "explicit delta",
+			temporality: "delta",
+			counterWant: metricdata.DeltaTemporality,
+			upDownWant:  metricdata.CumulativeTemporality,
+		},
+		{
+			name:        "explicit cumulative",
+			temporality: "cumulative",
+			counterWant: metricdata.CumulativeTemporality,
+			upDownWant:  metricdata.CumulativeTemporality,
+		},
+		{
+			name:        "invalid",
+			temporality: "rate",
+			wantErr:     true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			selector, err := (Config{Temporality: tt.temporality}).TemporalitySelector()
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("expected error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := selector(sdkmetric.InstrumentKindCounter); got != tt.counterWant {
+				t.Errorf("counter temporality = %v, want %v", got, tt.counterWant)
+			}
+			if got := selector(sdkmetric.InstrumentKindUpDownCounter); got != tt.upDownWant {
+				t.Errorf("updown temporality = %v, want %v", got, tt.upDownWant)
+			}
+		})
+	}
+}
+
 func TestNonEnabledMetrics_UseNoop(t *testing.T) {
 	// Only enable conn.total — conn.active should be noop.
 	cfg := Config{
