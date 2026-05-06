@@ -241,7 +241,36 @@ type MongoDBAdmin struct {
 	ReplicaSet    string          `toml:"replica_set"`  // optional replica set name for admin provisioning
 	SRV           string          `toml:"srv"`          // optional MongoDB SRV name for backend discovery
 	SRVMaxMembers int             `toml:"srv_max_members"`
+	Provision     *MongoProvision `toml:"provision"`
 	Members       []MongoDBMember `toml:"members"`
+}
+
+const (
+	MongoProvisionDatabase = "database"
+	MongoProvisionStatic   = "static"
+)
+
+// MongoProvision selects how a MongoDB listener obtains backend credentials.
+type MongoProvision struct {
+	Mode        string            `toml:"mode"`
+	StaticUsers []MongoStaticUser `toml:"static_users"`
+}
+
+// MongoStaticUser maps an ACL role set to an existing MongoDB/Atlas user.
+type MongoStaticUser struct {
+	Name         string            `toml:"name"`
+	Username     string            `toml:"username"`
+	Password     string            `toml:"password"`
+	AuthDatabase string            `toml:"auth_database"`
+	Database     string            `toml:"database"`
+	Permissions  []string          `toml:"permissions"`
+	Roles        []MongoStaticRole `toml:"roles"`
+}
+
+// MongoStaticRole describes one backend role assignment for static user matching.
+type MongoStaticRole struct {
+	Role string `toml:"role"`
+	DB   string `toml:"db"`
 }
 
 // MongoDBMember maps one replica set member to a Waypoint listener.
@@ -261,6 +290,27 @@ func (m *MongoDBAdmin) UserTTLDuration() time.Duration {
 
 func (m *MongoDBAdmin) HasSRV() bool {
 	return m != nil && strings.TrimSpace(m.SRV) != ""
+}
+
+func (m *MongoDBAdmin) EffectiveProvisionMode() string {
+	if m == nil || m.Provision == nil {
+		return MongoProvisionDatabase
+	}
+	mode := strings.ToLower(strings.TrimSpace(m.Provision.Mode))
+	if mode == "" {
+		if len(m.Provision.StaticUsers) > 0 {
+			return MongoProvisionStatic
+		}
+		return MongoProvisionDatabase
+	}
+	return mode
+}
+
+func (m *MongoDBAdmin) EffectiveAuthDatabase() string {
+	if m == nil || strings.TrimSpace(m.AuthDatabase) == "" {
+		return "admin"
+	}
+	return m.AuthDatabase
 }
 
 // Load reads and parses a TOML config file, expanding environment variables
@@ -432,6 +482,12 @@ func validate(cfg *Config) error {
 			}
 		}
 
+		if l.MongoDB != nil {
+			if err := validateMongoProvision(i, l.MongoDB); err != nil {
+				return err
+			}
+		}
+
 		// Check for listen address collisions across all listeners.
 		for _, be := range l.ExpandedBackends() {
 			if existing, ok := listenAddrs[be.Listen]; ok {
@@ -467,6 +523,65 @@ func validate(cfg *Config) error {
 		}
 	}
 	return nil
+}
+
+func validateMongoProvision(listenerIndex int, m *MongoDBAdmin) error {
+	mode := m.EffectiveProvisionMode()
+	switch mode {
+	case MongoProvisionDatabase, MongoProvisionStatic:
+	default:
+		return fmt.Errorf("listeners[%d].mongodb.provision.mode must be one of %q or %q, got %q",
+			listenerIndex, MongoProvisionDatabase, MongoProvisionStatic, m.Provision.Mode)
+	}
+
+	if mode != MongoProvisionStatic {
+		return nil
+	}
+	if m.Provision == nil || len(m.Provision.StaticUsers) == 0 {
+		return fmt.Errorf("listeners[%d].mongodb.provision.static_users is required when mode is %q", listenerIndex, MongoProvisionStatic)
+	}
+
+	for i, user := range m.Provision.StaticUsers {
+		prefix := fmt.Sprintf("listeners[%d].mongodb.provision.static_users[%d]", listenerIndex, i)
+		if strings.TrimSpace(user.Username) == "" {
+			return fmt.Errorf("%s.username is required", prefix)
+		}
+		if user.Password == "" {
+			return fmt.Errorf("%s.password is required", prefix)
+		}
+		if len(user.Roles) > 0 {
+			if len(user.Permissions) > 0 || strings.TrimSpace(user.Database) != "" {
+				return fmt.Errorf("%s.roles cannot be combined with database or permissions", prefix)
+			}
+			for j, role := range user.Roles {
+				if strings.TrimSpace(role.Role) == "" {
+					return fmt.Errorf("%s.roles[%d].role is required", prefix, j)
+				}
+				if strings.TrimSpace(role.DB) == "" {
+					return fmt.Errorf("%s.roles[%d].db is required", prefix, j)
+				}
+			}
+			continue
+		}
+		if len(user.Permissions) == 0 {
+			return fmt.Errorf("%s.permissions or roles is required", prefix)
+		}
+		for _, perm := range user.Permissions {
+			if !validMongoPreset(perm) {
+				return fmt.Errorf("%s.permissions contains unknown preset %q; valid presets: readonly, readwrite, admin", prefix, perm)
+			}
+		}
+	}
+	return nil
+}
+
+func validMongoPreset(preset string) bool {
+	switch strings.ToLower(strings.TrimSpace(preset)) {
+	case "readonly", "readwrite", "admin":
+		return true
+	default:
+		return false
+	}
 }
 
 func supportsClientTLS(mode string) bool {

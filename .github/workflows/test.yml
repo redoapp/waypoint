@@ -79,7 +79,7 @@ jobs:
       - name: Run e2e tests with coverage
         run: |
           mkdir -p coverage
-          go test -tags integration -run 'TestE2E' -coverprofile=coverage/e2e.raw -covermode=atomic -race -timeout 120s ./...
+          go test -tags integration -run 'TestE2E' -coverpkg=./internal/... -coverprofile=coverage/e2e.raw -covermode=atomic -race -timeout 120s ./test/e2e
 
       - name: Filter coverage profile
         run: |

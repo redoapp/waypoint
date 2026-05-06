@@ -115,6 +115,29 @@ backend = "10.0.1.5:3306"
 # srv = "cluster.example.com" # resolves _mongodb._tcp.cluster.example.com
 # srv_max_members = 3         # binds :27017, :27018, and :27019
 #
+# [listeners.mongodb.provision]
+# mode = "database" # default: create/update scoped MongoDB users
+#
+# For Atlas or clusters where MongoDB user-management commands are unavailable,
+# use pre-created static backend users instead:
+# [listeners.mongodb.provision]
+# mode = "static"
+#
+# [[listeners.mongodb.provision.static_users]]
+# name = "app-readwrite"
+# username = "atlas_app_rw"
+# password = "${MONGO_APP_RW_PASSWORD}"
+# auth_database = "admin"
+# database = "app"
+# permissions = ["readwrite"]
+#
+# [[listeners.mongodb.provision.static_users]]
+# name = "readonly"
+# username = "atlas_readonly"
+# password = "${MONGO_READONLY_PASSWORD}"
+# auth_database = "admin"
+# permissions = ["readonly"]
+#
 # Or omit srv/srv_max_members and configure explicit members:
 # [[listeners.mongodb.members]]
 # backend = "mongo1.prod.internal:27017"

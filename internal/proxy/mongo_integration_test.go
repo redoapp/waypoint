@@ -78,6 +78,93 @@ func setupMongoProxy(t *testing.T, authResult *auth.AuthResult, authErr error) s
 	return ln.Addr().String()
 }
 
+func setupMongoStaticProxy(t *testing.T, backend string, authResult *auth.AuthResult, staticUsers []config.MongoStaticUser) string {
+	t.Helper()
+
+	rdb := testutil.RedisClient(t)
+	m := metrics.Noop()
+	store := restrict.NewRedisStore(rdb, "mongostaticproxytest:", m)
+	tracker := restrict.NewTracker(store, m, slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})))
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { ln.Close() })
+
+	p := &proxy.MongoDBProxy{
+		Backend:    backend,
+		Name:       "test-listener",
+		ListenAddr: ln.Addr().String(),
+		Auth:       &mockAuthorizer{result: authResult},
+		Tracker:    tracker,
+		Metrics:    m,
+		MongoConfig: &config.MongoDBAdmin{
+			AuthDatabase: "admin",
+			Provision: &config.MongoProvision{
+				Mode:        config.MongoProvisionStatic,
+				StaticUsers: staticUsers,
+			},
+		},
+		Logger:       logger,
+		BytesRead:    &atomic.Int64{},
+		BytesWritten: &atomic.Int64{},
+	}
+
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go p.HandleConn(context.Background(), conn)
+		}
+	}()
+
+	return ln.Addr().String()
+}
+
+func mongoIntegrationAdminClient(t *testing.T, connStr string) *mongo.Client {
+	t.Helper()
+	opts := options.Client().ApplyURI(connStr).SetServerSelectionTimeout(5 * time.Second)
+	client, err := mongo.Connect(opts)
+	if err != nil {
+		t.Fatalf("mongo admin connect: %v", err)
+	}
+	t.Cleanup(func() { client.Disconnect(context.Background()) })
+	return client
+}
+
+func createMongoStaticUser(t *testing.T, client *mongo.Client, username, password string, roles []config.MongoStaticRole) {
+	t.Helper()
+	ctx := context.Background()
+
+	// Static users are intentionally not wp_-prefixed, so remove any leftover
+	// user from a previous interrupted integration run before creating it.
+	client.Database("admin").RunCommand(ctx, bson.D{{Key: "dropUser", Value: username}})
+
+	roleDocs := make(bson.A, 0, len(roles))
+	for _, role := range roles {
+		roleDocs = append(roleDocs, bson.D{
+			{Key: "role", Value: role.Role},
+			{Key: "db", Value: role.DB},
+		})
+	}
+	err := client.Database("admin").RunCommand(ctx, bson.D{
+		{Key: "createUser", Value: username},
+		{Key: "pwd", Value: password},
+		{Key: "roles", Value: roleDocs},
+		{Key: "mechanisms", Value: bson.A{"SCRAM-SHA-256"}},
+	}).Err()
+	if err != nil {
+		t.Fatalf("create static user %q: %v", username, err)
+	}
+	t.Cleanup(func() {
+		client.Database("admin").RunCommand(context.Background(), bson.D{{Key: "dropUser", Value: username}})
+	})
+}
+
 // makeMongoAuthResult builds an AuthResult with MongoDB capabilities.
 func makeMongoAuthResult(databases map[string]auth.MongoDBPermissions, limits *auth.LimitsCap) *auth.AuthResult {
 	result := &auth.AuthResult{
@@ -179,6 +266,83 @@ func TestIntegration_MongoProxy_WithDummyPassword(t *testing.T) {
 	err = coll.FindOne(ctx, bson.D{{Key: "via", Value: "scram"}}).Decode(&doc)
 	if err != nil {
 		t.Fatalf("find via SCRAM: %v", err)
+	}
+}
+
+func TestIntegration_MongoProxy_StaticUserReadWriteAllowed(t *testing.T) {
+	connStr, backend := testutil.MongoDBBackend(t)
+	adminClient := mongoIntegrationAdminClient(t, connStr)
+
+	const (
+		dbName   = "static_rw_db"
+		username = "static_rw_user"
+		password = "static-rw-pass"
+	)
+	roles := []config.MongoStaticRole{{Role: "readWrite", DB: dbName}}
+	createMongoStaticUser(t, adminClient, username, password, roles)
+
+	result := makeMongoAuthResult(map[string]auth.MongoDBPermissions{
+		dbName: {Permissions: []string{"readwrite"}},
+	}, nil)
+	addr := setupMongoStaticProxy(t, backend, result, []config.MongoStaticUser{
+		{
+			Name:         "static-readwrite",
+			Username:     username,
+			Password:     password,
+			AuthDatabase: "admin",
+			Database:     dbName,
+			Permissions:  []string{"readwrite"},
+		},
+	})
+
+	client := mongoProxyConnect(t, addr, dbName)
+	ctx := context.Background()
+	coll := client.Database(dbName).Collection("items")
+
+	_, err := coll.InsertOne(ctx, bson.D{{Key: "source", Value: "static-user"}})
+	if err != nil {
+		t.Fatalf("insert through static user proxy: %v", err)
+	}
+
+	var doc bson.M
+	err = coll.FindOne(ctx, bson.D{{Key: "source", Value: "static-user"}}).Decode(&doc)
+	if err != nil {
+		t.Fatalf("find through static user proxy: %v", err)
+	}
+}
+
+func TestIntegration_MongoProxy_StaticUserMissingReturnsClientMessage(t *testing.T) {
+	_, backend := testutil.MongoDBBackend(t)
+	result := makeMongoAuthResult(map[string]auth.MongoDBPermissions{
+		"static_missing_db": {Permissions: []string{"readwrite"}},
+	}, nil)
+
+	addr := setupMongoStaticProxy(t, backend, result, []config.MongoStaticUser{
+		{
+			Name:         "static-readonly",
+			Username:     "static_ro_user",
+			Password:     "static-ro-pass",
+			AuthDatabase: "admin",
+			Permissions:  []string{"readonly"},
+		},
+	})
+
+	conn, doc := openMongoProxyHello(t, addr)
+	t.Cleanup(func() { conn.Close() })
+
+	var resp struct {
+		OK     float64 `bson:"ok"`
+		Errmsg string  `bson:"errmsg"`
+		Code   int32   `bson:"code"`
+	}
+	if err := bson.Unmarshal(doc, &resp); err != nil {
+		t.Fatalf("unmarshal hello response: %v", err)
+	}
+	if resp.OK != 0 || resp.Code != 18 {
+		t.Fatalf("expected auth error, got ok=%v code=%d errmsg=%q", resp.OK, resp.Code, resp.Errmsg)
+	}
+	if !strings.Contains(resp.Errmsg, "no static MongoDB user configured for requested permissions") {
+		t.Fatalf("expected static user message, got %q", resp.Errmsg)
 	}
 }
 

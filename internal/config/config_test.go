@@ -741,6 +741,87 @@ auth_database = "admin"
 	}
 }
 
+func TestLoad_MongoDBStaticProvisionConfig(t *testing.T) {
+	content := `
+[tailscale]
+hostname = "waypoint-test"
+
+[[listeners]]
+name = "mongo"
+listen = ":27017"
+mode = "mongodb"
+backend = "mongo.example.com:27017"
+
+[listeners.mongodb]
+auth_database = "admin"
+
+[listeners.mongodb.provision]
+mode = "static"
+
+[[listeners.mongodb.provision.static_users]]
+name = "app-readwrite"
+username = "atlas_app_rw"
+password = "secret"
+auth_database = "admin"
+database = "app"
+permissions = ["readwrite"]
+
+[[listeners.mongodb.provision.static_users]]
+name = "readonly"
+username = "atlas_ro"
+password = "secret"
+permissions = ["readonly"]
+
+[[listeners.mongodb.provision.static_users]]
+name = "custom"
+username = "atlas_custom"
+password = "secret"
+roles = [{ role = "read", db = "reporting" }]
+`
+	path := writeTestConfig(t, content)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mongo := cfg.Listeners[0].MongoDB
+	if got := mongo.EffectiveProvisionMode(); got != MongoProvisionStatic {
+		t.Fatalf("provision mode = %q, want %q", got, MongoProvisionStatic)
+	}
+	if len(mongo.Provision.StaticUsers) != 3 {
+		t.Fatalf("static users = %d, want 3", len(mongo.Provision.StaticUsers))
+	}
+	if got := mongo.Provision.StaticUsers[0].Permissions[0]; got != "readwrite" {
+		t.Fatalf("first static user permission = %q", got)
+	}
+	if got := mongo.Provision.StaticUsers[2].Roles[0].DB; got != "reporting" {
+		t.Fatalf("custom role db = %q", got)
+	}
+}
+
+func TestValidate_MongoDBStaticProvisionRequiresUsers(t *testing.T) {
+	content := `
+[tailscale]
+hostname = "waypoint-test"
+
+[[listeners]]
+name = "mongo"
+listen = ":27017"
+mode = "mongodb"
+backend = "mongo.example.com:27017"
+
+[listeners.mongodb]
+
+[listeners.mongodb.provision]
+mode = "static"
+`
+	path := writeTestConfig(t, content)
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "static_users is required") {
+		t.Errorf("expected static_users error, got: %v", err)
+	}
+}
+
 // --- PortMap parsing tests ---
 
 func TestLoad_PortMap(t *testing.T) {

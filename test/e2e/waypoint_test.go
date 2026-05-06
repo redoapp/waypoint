@@ -1,6 +1,6 @@
 //go:build integration
 
-package main
+package e2e
 
 import (
 	"context"
@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/redoapp/waypoint/internal/auth"
+	"github.com/redoapp/waypoint/internal/server"
 	"github.com/redoapp/waypoint/internal/testutil"
 	"github.com/redoapp/waypoint/internal/tsdns"
 	"golang.org/x/net/dns/dnsmessage"
@@ -35,7 +36,7 @@ import (
 )
 
 // TestE2E_ServiceListener_ProxyProto is a full end-to-end test that calls the
-// real run() function (the production code path in main.go). It verifies that
+// real server runner used by cmd/waypoint. It verifies that
 // service listeners with PROXY protocol correctly pass the peer's real
 // Tailscale IP to WhoIs for authentication, rather than 127.0.0.1.
 //
@@ -128,7 +129,7 @@ backend = "%s"
 		t.Fatalf("write config: %v", err)
 	}
 
-	// --- Start waypoint via the real run() code path ---
+	// --- Start waypoint via the real server path ---
 
 	const serviceName = tailcfg.ServiceName("svc:echo-e2e")
 	const serviceVIP = "100.11.22.33"
@@ -145,7 +146,7 @@ backend = "%s"
 			return fmt.Errorf("local client: %w", err)
 		}
 
-		// runServer uses srv.Start() (not Up), so the node may still be
+		// RunServer uses srv.Start() (not Up), so the node may still be
 		// logging in and registering with the control plane. Poll until
 		// the local status shows a Tailscale IP (meaning login completed)
 		// and the node appears in the control server.
@@ -225,13 +226,13 @@ backend = "%s"
 	lgr := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: &testLevelVar}))
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- runServer(runCtx, configPath, lgr, &testLevelVar, afterTSStart)
+		errCh <- server.RunServer(runCtx, configPath, lgr, &testLevelVar, afterTSStart)
 	}()
 
 	// Check for early startup failure.
 	select {
 	case err := <-errCh:
-		t.Fatalf("runServer exited early: %v", err)
+		t.Fatalf("RunServer exited early: %v", err)
 	case <-time.After(2 * time.Second):
 		// Give it a moment — if it hasn't failed, it's likely starting up.
 	}
@@ -293,7 +294,7 @@ backend = "%s"
 	// --- Verify: dial the service and echo data ---
 
 	// Dial the service by its FQDN (the VIP), not the node's Tailscale IP.
-	// Retry because runServer may still be setting up the listener.
+	// Retry because RunServer may still be setting up the listener.
 	serviceFQDN := string(serviceName.WithoutPrefix()) + "." + control.MagicDNSDomain
 	var conn net.Conn
 	dialDeadline := time.Now().Add(30 * time.Second)
@@ -332,7 +333,7 @@ backend = "%s"
 	select {
 	case err := <-errCh:
 		if err != nil {
-			t.Fatalf("runServer: %v", err)
+			t.Fatalf("RunServer: %v", err)
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("timed out waiting for shutdown")
@@ -340,7 +341,7 @@ backend = "%s"
 }
 
 // TestE2E_TCPProxy_PortMap verifies that port_map listeners work end-to-end
-// through the real runServer() code path. It starts two echo backends, writes
+// through the real server path. It starts two echo backends, writes
 // a TOML config with port_map mapping two listen ports to those backends, and
 // verifies that data flows through both mapped ports. This is a regression
 // test for the TOML integer-key bug where port_map silently produced an empty
@@ -443,7 +444,7 @@ port_map = { "7780" = %s, "7781" = %s }
 		t.Fatalf("write config: %v", err)
 	}
 
-	// --- Start waypoint via the real run() code path ---
+	// --- Start waypoint via the real server path ---
 
 	runCtx, runCancel := context.WithCancel(ctx)
 	defer runCancel()
@@ -453,13 +454,13 @@ port_map = { "7780" = %s, "7781" = %s }
 	lgr := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: &testLevelVar}))
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- runServer(runCtx, configPath, lgr, &testLevelVar, nil)
+		errCh <- server.RunServer(runCtx, configPath, lgr, &testLevelVar, nil)
 	}()
 
 	// Check for early startup failure.
 	select {
 	case err := <-errCh:
-		t.Fatalf("runServer exited early: %v", err)
+		t.Fatalf("RunServer exited early: %v", err)
 	case <-time.After(2 * time.Second):
 	}
 
@@ -549,7 +550,7 @@ port_map = { "7780" = %s, "7781" = %s }
 	select {
 	case err := <-errCh:
 		if err != nil {
-			t.Fatalf("runServer: %v", err)
+			t.Fatalf("RunServer: %v", err)
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("timed out waiting for shutdown")

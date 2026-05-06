@@ -4,9 +4,12 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
+	"sort"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -152,8 +155,8 @@ func (p *MongoDBProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 	}()
 
 	// Step 4: Collect all permitted databases and expand into MongoDB roles.
-	roles, grantedDBs := p.collectRoles(result)
-	if len(roles) == 0 {
+	access := p.collectAccess(result)
+	if len(access.Roles) == 0 {
 		setupSpan.SetStatus(codes.Error, "no MongoDB permissions")
 		setupSpan.End()
 		log.WarnContext(ctx, "no MongoDB permissions for any database",
@@ -164,32 +167,35 @@ func (p *MongoDBProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 	}
 
 	log.DebugContext(ctx, "roles collected",
-		"granted_databases", grantedDBs,
-		"role_count", len(roles),
+		"granted_databases", access.GrantedDBs,
+		"role_count", len(access.Roles),
 	)
 
-	// Step 5: Provision dynamic MongoDB user with all permitted roles.
-	provStart := time.Now()
-	m.ProvisionTotal.Add(ctx, 1, m.Attrs("waypoint.provision.total", listenerAttr))
-	ctx, provSpan := tracer.Start(ctx, "waypoint.provision")
-	mongoUser, mongoPass, err := p.Provisioner.EnsureUser(ctx, result.LoginName, result.NodeName, roles)
-	provSpan.End()
-	m.ProvisionLatency.Record(ctx, time.Since(provStart).Seconds(),
-		m.Attrs("waypoint.provision.latency", listenerAttr))
+	// Step 5: Resolve backend MongoDB credentials.
+	mongoUser, mongoPass, backendAuthDB, err := p.resolveBackendCredentials(ctx, result, access)
 	if err != nil {
-		m.ProvisionErrors.Add(ctx, 1, m.Attrs("waypoint.provision.errors", listenerAttr))
+		var missingStatic *missingStaticCredentialError
+		if errors.As(err, &missingStatic) {
+			setupSpan.RecordError(err)
+			setupSpan.SetStatus(codes.Error, "static credential missing")
+			setupSpan.End()
+			log.WarnContext(ctx, "static MongoDB user missing",
+				"user", result.LoginName,
+				"roles", missingStatic.roles,
+			)
+			mongowire.SendErrorAsHelloReply(clientConn, clientHello, 18, missingStatic.ClientMessage())
+			return
+		}
 		setupSpan.RecordError(err)
-		setupSpan.SetStatus(codes.Error, "provision failed")
+		setupSpan.SetStatus(codes.Error, "credential resolution failed")
 		setupSpan.End()
-		log.ErrorContext(ctx, "provision failed",
+		log.ErrorContext(ctx, "credential resolution failed",
 			"user", result.LoginName,
 			"error", err,
 		)
 		mongowire.SendErrorAsHelloReply(clientConn, clientHello, 18, "internal error")
 		return
 	}
-
-	log.DebugContext(ctx, "user provisioned", "mongo_user", mongoUser)
 
 	// Step 6: Connect to upstream MongoDB.
 	ctx, dialSpan := tracer.Start(ctx, "waypoint.dial_backend")
@@ -236,7 +242,7 @@ func (p *MongoDBProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 	log.DebugContext(ctx, "backend connected")
 
 	// Step 7: Send hello to backend and read its real hello response.
-	helloCmd, err := mongowire.BuildHelloCommand(p.MongoConfig.AuthDatabase)
+	helloCmd, err := mongowire.BuildHelloCommand(backendAuthDB)
 	if err != nil {
 		setupSpan.RecordError(err)
 		setupSpan.SetStatus(codes.Error, "build hello failed")
@@ -299,7 +305,7 @@ func (p *MongoDBProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 	)
 
 	// Step 9: Authenticate with backend using provisioned credentials.
-	if err := mongowire.AuthenticateBackend(backendConn, mongoUser, mongoPass, p.MongoConfig.AuthDatabase); err != nil {
+	if err := mongowire.AuthenticateBackend(backendConn, mongoUser, mongoPass, backendAuthDB); err != nil {
 		setupSpan.RecordError(err)
 		setupSpan.SetStatus(codes.Error, "backend auth failed")
 		setupSpan.End()
@@ -414,13 +420,84 @@ func (p *MongoDBProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 	)
 }
 
-// collectRoles gathers all MongoDB roles from matched ACL rules across all
-// permitted databases. Returns the expanded roles and the list of granted
-// database names (for logging).
-func (p *MongoDBProxy) collectRoles(result *auth.AuthResult) ([]provision.MongoRole, []string) {
-	var allRoles []provision.MongoRole
-	var grantedDBs []string
-	seen := make(map[string]bool)
+type mongoAccess struct {
+	Roles      []provision.MongoRole
+	GrantedDBs []string
+	Grants     []mongoDatabaseGrant
+}
+
+type mongoDatabaseGrant struct {
+	Database    string
+	Permissions []string
+}
+
+type mongoStaticCredential struct {
+	Name         string
+	Username     string
+	Password     string
+	AuthDatabase string
+}
+
+type missingStaticCredentialError struct {
+	roles string
+}
+
+func (e *missingStaticCredentialError) Error() string {
+	return "no static MongoDB user matches roles " + e.roles
+}
+
+func (e *missingStaticCredentialError) ClientMessage() string {
+	return "not authorized: no static MongoDB user configured for requested permissions"
+}
+
+func (p *MongoDBProxy) resolveBackendCredentials(ctx context.Context, result *auth.AuthResult, access mongoAccess) (string, string, string, error) {
+	authDB := p.MongoConfig.EffectiveAuthDatabase()
+	switch p.MongoConfig.EffectiveProvisionMode() {
+	case config.MongoProvisionStatic:
+		cred, err := p.selectStaticCredential(access)
+		if err != nil {
+			return "", "", "", err
+		}
+		if cred.AuthDatabase != "" {
+			authDB = cred.AuthDatabase
+		}
+		p.Logger.DebugContext(ctx, "static MongoDB user selected",
+			"static_user", cred.Name,
+			"mongo_user", cred.Username,
+			"auth_database", authDB,
+		)
+		return cred.Username, cred.Password, authDB, nil
+	case config.MongoProvisionDatabase:
+		if p.Provisioner == nil {
+			return "", "", "", fmt.Errorf("mongodb provisioner is not configured")
+		}
+		m := p.Metrics
+		listenerAttr := metrics.AttrListener.String(p.Name)
+		tracer := m.Tracer()
+
+		provStart := time.Now()
+		m.ProvisionTotal.Add(ctx, 1, m.Attrs("waypoint.provision.total", listenerAttr))
+		ctx, provSpan := tracer.Start(ctx, "waypoint.provision")
+		mongoUser, mongoPass, err := p.Provisioner.EnsureUser(ctx, result.LoginName, result.NodeName, access.Roles)
+		provSpan.End()
+		m.ProvisionLatency.Record(ctx, time.Since(provStart).Seconds(),
+			m.Attrs("waypoint.provision.latency", listenerAttr))
+		if err != nil {
+			m.ProvisionErrors.Add(ctx, 1, m.Attrs("waypoint.provision.errors", listenerAttr))
+			return "", "", "", fmt.Errorf("provision user: %w", err)
+		}
+		p.Logger.DebugContext(ctx, "user provisioned", "mongo_user", mongoUser)
+		return mongoUser, mongoPass, authDB, nil
+	default:
+		return "", "", "", fmt.Errorf("unsupported mongodb provision mode %q", p.MongoConfig.EffectiveProvisionMode())
+	}
+}
+
+// collectAccess gathers all MongoDB roles from matched ACL rules across all
+// concrete permitted databases. Wildcard grants are not expanded because the
+// provisioner needs concrete MongoDB role assignments.
+func (p *MongoDBProxy) collectAccess(result *auth.AuthResult) mongoAccess {
+	permsByDB := make(map[string][]string)
 
 	for _, r := range result.MatchedRules {
 		bc, ok := r.Backends[p.Name]
@@ -429,22 +506,168 @@ func (p *MongoDBProxy) collectRoles(result *auth.AuthResult) ([]provision.MongoR
 		}
 		for dbName, dbPerms := range bc.Mongo.Databases {
 			if dbName == "*" {
-				continue // wildcards don't expand to concrete roles here
-			}
-			if !seen[dbName] {
-				seen[dbName] = true
-				grantedDBs = append(grantedDBs, dbName)
-			}
-			roles, err := provision.ExpandMongoPresets(dbPerms.Permissions, dbName)
-			if err != nil {
-				p.Logger.Warn("invalid permissions", "database", dbName, "error", err)
 				continue
 			}
-			allRoles = append(allRoles, roles...)
+			permsByDB[dbName] = append(permsByDB[dbName], dbPerms.Permissions...)
 		}
 	}
 
-	return allRoles, grantedDBs
+	grantedDBs := make([]string, 0, len(permsByDB))
+	for dbName := range permsByDB {
+		grantedDBs = append(grantedDBs, dbName)
+	}
+	sort.Strings(grantedDBs)
+
+	var access mongoAccess
+	access.GrantedDBs = grantedDBs
+	seenRoles := make(map[string]bool)
+	for _, dbName := range grantedDBs {
+		perms := normalizeMongoPermissions(permsByDB[dbName])
+		roles, err := provision.ExpandMongoPresets(perms, dbName)
+		if err != nil {
+			p.Logger.Warn("invalid permissions", "database", dbName, "error", err)
+			continue
+		}
+		access.Grants = append(access.Grants, mongoDatabaseGrant{
+			Database:    dbName,
+			Permissions: perms,
+		})
+		for _, role := range roles {
+			key := mongoRoleKey(role)
+			if seenRoles[key] {
+				continue
+			}
+			seenRoles[key] = true
+			access.Roles = append(access.Roles, role)
+		}
+	}
+
+	return access
+}
+
+func (p *MongoDBProxy) selectStaticCredential(access mongoAccess) (mongoStaticCredential, error) {
+	if p.MongoConfig == nil || p.MongoConfig.Provision == nil {
+		return mongoStaticCredential{}, fmt.Errorf("mongodb static provisioning is not configured")
+	}
+	wantRoles := mongoRoleSignature(access.Roles)
+
+	for _, user := range p.MongoConfig.Provision.StaticUsers {
+		if staticUserMatchesPermissions(user, access.Grants) {
+			return p.staticCredential(user), nil
+		}
+
+		roles, ok, err := staticUserRoles(user)
+		if err != nil {
+			return mongoStaticCredential{}, fmt.Errorf("static user %q roles: %w", staticUserName(user), err)
+		}
+		if !ok {
+			continue
+		}
+		if mongoRoleSignature(roles) == wantRoles {
+			return p.staticCredential(user), nil
+		}
+	}
+
+	return mongoStaticCredential{}, &missingStaticCredentialError{roles: wantRoles}
+}
+
+func (p *MongoDBProxy) staticCredential(user config.MongoStaticUser) mongoStaticCredential {
+	authDB := strings.TrimSpace(user.AuthDatabase)
+	if authDB == "" {
+		authDB = p.MongoConfig.EffectiveAuthDatabase()
+	}
+	return mongoStaticCredential{
+		Name:         staticUserName(user),
+		Username:     user.Username,
+		Password:     user.Password,
+		AuthDatabase: authDB,
+	}
+}
+
+func staticUserName(user config.MongoStaticUser) string {
+	if strings.TrimSpace(user.Name) != "" {
+		return user.Name
+	}
+	return user.Username
+}
+
+func staticUserMatchesPermissions(user config.MongoStaticUser, grants []mongoDatabaseGrant) bool {
+	if len(user.Roles) > 0 || strings.TrimSpace(user.Database) != "" || len(user.Permissions) == 0 || len(grants) == 0 {
+		return false
+	}
+	want := mongoPermissionSignature(user.Permissions)
+	if want == "" {
+		return false
+	}
+	for _, grant := range grants {
+		if mongoPermissionSignature(grant.Permissions) != want {
+			return false
+		}
+	}
+	return true
+}
+
+func staticUserRoles(user config.MongoStaticUser) ([]provision.MongoRole, bool, error) {
+	if len(user.Roles) > 0 {
+		roles := make([]provision.MongoRole, 0, len(user.Roles))
+		for _, role := range user.Roles {
+			roles = append(roles, provision.MongoRole{Role: strings.TrimSpace(role.Role), DB: strings.TrimSpace(role.DB)})
+		}
+		return roles, true, nil
+	}
+	if strings.TrimSpace(user.Database) == "" {
+		return nil, false, nil
+	}
+	roles, err := provision.ExpandMongoPresets(user.Permissions, strings.TrimSpace(user.Database))
+	return roles, true, err
+}
+
+func normalizeMongoPermissions(perms []string) []string {
+	seen := make(map[string]bool)
+	for _, perm := range perms {
+		perm = strings.ToLower(strings.TrimSpace(perm))
+		if perm == "" || seen[perm] {
+			continue
+		}
+		seen[perm] = true
+	}
+
+	if seen["admin"] {
+		delete(seen, "readwrite")
+		delete(seen, "readonly")
+	} else if seen["readwrite"] {
+		delete(seen, "readonly")
+	}
+
+	normalized := make([]string, 0, len(seen))
+	for perm := range seen {
+		normalized = append(normalized, perm)
+	}
+	sort.Strings(normalized)
+	return normalized
+}
+
+func mongoPermissionSignature(perms []string) string {
+	return strings.Join(normalizeMongoPermissions(perms), ",")
+}
+
+func mongoRoleSignature(roles []provision.MongoRole) string {
+	keys := make([]string, 0, len(roles))
+	seen := make(map[string]bool)
+	for _, role := range roles {
+		key := mongoRoleKey(role)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return strings.Join(keys, ",")
+}
+
+func mongoRoleKey(role provision.MongoRole) string {
+	return strings.TrimSpace(role.DB) + "." + strings.TrimSpace(role.Role)
 }
 
 func (p *MongoDBProxy) acceptClientTLS(conn net.Conn) (net.Conn, string, error) {
@@ -589,8 +812,8 @@ func (p *MongoDBProxy) revalidateLoop(ctx context.Context, setupSpanCtx trace.Sp
 			}
 
 			// Check that at least one MongoDB permission still exists.
-			roles, _ := p.collectRoles(revalResult)
-			if len(roles) == 0 {
+			access := p.collectAccess(revalResult)
+			if len(access.Roles) == 0 {
 				revalSpan.SetStatus(codes.Error, "permissions revoked")
 				revalSpan.End()
 				m.RevalFailures.Add(ctx, 1, m.Attrs("waypoint.reval.failures", listenerAttr))

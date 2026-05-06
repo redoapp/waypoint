@@ -36,7 +36,7 @@ go test ./internal/auth/ -run TestAuthorize
 go test -tags integration -run 'TestIntegration' -race ./...
 
 # E2E tests (use mock Tailscale control plane)
-go test -tags integration -run 'TestE2E' -race -timeout 120s ./...
+go test -tags integration -run 'TestE2E' -race -timeout 120s ./test/e2e
 
 # Coverage (devenv scripts)
 coverage          # full (unit + integration + e2e)
@@ -82,7 +82,8 @@ Requires `TS_AUTHKEY` environment variable for initial Tailscale authentication.
 
 ### Key Packages
 
-- **`cmd/waypoint`** — main server; listener accept loop, graceful shutdown, heartbeat publishing
+- **`cmd/waypoint`** — CLI entrypoint for the main server
+- **`internal/server`** — main server; listener accept loop, graceful shutdown, heartbeat publishing
 - **`cmd/waypoint-monitor`** — TUI dashboard that discovers instances via Redis
 - **`internal/auth`** — Tailscale identity verification and ACL capability parsing
 - **`internal/proxy`** — Postgres and TCP proxy implementations (`postgres.go`, `tcp.go`)
@@ -98,7 +99,7 @@ Requires `TS_AUTHKEY` environment variable for initial Tailscale authentication.
 
 - Unit tests: standard `*_test.go` files
 - Integration tests: `//go:build integration` tag, `TestIntegration` prefix, use testcontainers for Postgres/Redis
-- E2E tests: `TestE2E` prefix in `cmd/waypoint/e2e_test.go`, mock Tailscale control plane with DERP server
+- E2E tests: `TestE2E` prefix in `test/e2e/waypoint_test.go`, mock Tailscale control plane with DERP server
 - Test utilities: `internal/testutil/` (container helpers, Redis test client)
 - Coverage exclusions in `.coverignore`: `cmd/`, `internal/admin/`, `internal/testutil/`
 

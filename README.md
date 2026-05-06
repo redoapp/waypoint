@@ -6,7 +6,7 @@ Waypoint is a Tailscale-aware database proxy that authenticates connections usin
 
 - **Tailscale-native auth** — identifies callers via `tsnet` + `WhoIs`, checks `redo.com/cap/waypoint` capability grants from your ACL policy
 - **Postgres mode** — intercepts the PG wire protocol, dynamically provisions per-user database roles with scoped `GRANT` permissions, and cleans up expired users
-- **MongoDB mode** — provisions scoped MongoDB users and rewrites replica-set topology so clients stay on the proxy, including TLS-terminated clients
+- **MongoDB mode** — provisions scoped MongoDB users or uses static backend users, and rewrites replica-set topology so clients stay on the proxy, including TLS-terminated clients
 - **TCP mode** — transparent L4 proxy for any TCP backend (MySQL, Redis, etc.)
 - **Connection tracking** — per-user limits on concurrent connections, bytes transferred, connection duration, and bandwidth budgets, all stored in Redis/Valkey
 - **Mid-session revalidation** — periodically re-checks Tailscale identity during long-lived connections
@@ -90,6 +90,9 @@ auth_database = "admin"
 replica_set = "rs0"
 srv = "cluster.example.com"             # resolves _mongodb._tcp.cluster.example.com
 srv_max_members = 3                     # binds :27017, :27018, and :27019
+
+[listeners.mongodb.provision]
+mode = "database"                       # default: create/update MongoDB users
 ```
 
 When combining MongoDB SRV discovery with a Tailscale Service, set `advertise`
@@ -131,6 +134,39 @@ member. `tls_mode` controls client-facing TLS using the same values as
 Postgres: `off`, `optional`, or `require`. When MongoDB clients connect over
 TLS with SNI, Waypoint rewrites replica-set topology hosts to that SNI hostname
 while preserving the advertised listener/member ports.
+
+MongoDB provisioning supports two modes. `mode = "database"` is the default and
+uses `admin_user`/`admin_password` to create or update backend MongoDB users.
+For MongoDB Atlas or other environments where user-management commands are not
+available, `mode = "static"` selects from pre-created backend users:
+
+```toml
+[listeners.mongodb.provision]
+mode = "static"
+
+[[listeners.mongodb.provision.static_users]]
+name = "app-readwrite"
+username = "atlas_app_rw"
+password = "${MONGO_APP_RW_PASSWORD}"
+auth_database = "admin"
+database = "app"
+permissions = ["readwrite"]
+
+[[listeners.mongodb.provision.static_users]]
+name = "readonly"
+username = "atlas_readonly"
+password = "${MONGO_READONLY_PASSWORD}"
+auth_database = "admin"
+permissions = ["readonly"]              # matches any all-readonly grant set
+```
+
+Static users must already have the matching roles in MongoDB or Atlas. When
+`database` is set, Waypoint matches the exact expanded database role set; when
+only `permissions` is set, it matches grants where every database has that same
+preset. You only need to configure the static users you want to allow. If an
+authorized client requests a grant set with no matching static user, Waypoint
+returns a MongoDB authentication error to that client and does not connect to
+the backend.
 
 ### Tailscale ACL grants
 
