@@ -121,6 +121,19 @@ func proxyConnect(t *testing.T, addr, database string) *pgx.Conn {
 	return conn
 }
 
+func proxyConnectWithQuery(t *testing.T, addr, database, query string) *pgx.Conn {
+	t.Helper()
+	connStr := fmt.Sprintf("postgres://ignored:ignored@%s/%s?sslmode=disable&%s", addr, database, query)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	conn, err := pgx.Connect(ctx, connStr)
+	if err != nil {
+		t.Fatalf("proxy connect with query %q: %v", query, err)
+	}
+	t.Cleanup(func() { conn.Close(context.Background()) })
+	return conn
+}
+
 func proxyConnectSSLRequire(t *testing.T, addr, database string) *pgx.Conn {
 	t.Helper()
 	connStr := fmt.Sprintf("postgres://ignored:ignored@%s/%s?sslmode=require", addr, database)
@@ -458,6 +471,47 @@ func TestIntegration_Proxy_SelectAllowedInsertDenied(t *testing.T) {
 	}
 }
 
+func TestIntegration_Proxy_PresetQueryParamLimitsReadwriteGrant(t *testing.T) {
+	cleanupRole(t, "testuser@example.com", "test-node", "waypoint_test")
+	t.Cleanup(func() { cleanupRole(t, "testuser@example.com", "test-node", "waypoint_test") })
+
+	aconn := adminConn(t)
+	ctx := context.Background()
+	_, err := aconn.Exec(ctx, "CREATE TABLE IF NOT EXISTS public.acl_preset_limit (id int)")
+	if err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+	t.Cleanup(func() {
+		c := adminConn(t)
+		c.Exec(context.Background(), "DROP TABLE IF EXISTS public.acl_preset_limit")
+	})
+
+	result := makeAuthResult("waypoint_test", auth.DBPermissions{
+		Permissions: []string{"readwrite"},
+	}, nil)
+
+	addr := setupProxy(t, result, nil)
+
+	readwriteConn := proxyConnect(t, addr, "waypoint_test")
+	if _, err := readwriteConn.Exec(ctx, "INSERT INTO public.acl_preset_limit VALUES (1)"); err != nil {
+		t.Fatalf("readwrite insert should succeed: %v", err)
+	}
+	readwriteConn.Close(ctx)
+
+	readonlyConn := proxyConnectWithQuery(t, addr, "waypoint_test", "waypoint_presets=readonly")
+	if _, err := readonlyConn.Exec(ctx, "SELECT * FROM public.acl_preset_limit"); err != nil {
+		t.Fatalf("readonly select should succeed: %v", err)
+	}
+
+	_, err = readonlyConn.Exec(ctx, "INSERT INTO public.acl_preset_limit VALUES (2)")
+	if err == nil {
+		t.Fatal("readonly preset limit should deny insert")
+	}
+	if !strings.Contains(err.Error(), "permission denied") {
+		t.Fatalf("expected permission denied error, got: %v", err)
+	}
+}
+
 func TestIntegration_Proxy_ConnectionLimitEnforced(t *testing.T) {
 	result := makeAuthResult("waypoint_test", auth.DBPermissions{
 		Permissions: []string{"readonly"},
@@ -644,9 +698,20 @@ func TestIntegration_Proxy_WildcardDatabaseAccess(t *testing.T) {
 }
 
 func TestIntegration_Proxy_RevalidationPermissionRevoked(t *testing.T) {
+	aconn := adminConn(t)
+	ctx := context.Background()
+	_, err := aconn.Exec(ctx, "CREATE TABLE IF NOT EXISTS public.reval_revoked_test (id int)")
+	if err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+	t.Cleanup(func() {
+		c := adminConn(t)
+		c.Exec(context.Background(), "DROP TABLE IF EXISTS public.reval_revoked_test")
+	})
+
 	// Start with access to waypoint_test.
 	initialResult := makeAuthResult("waypoint_test", auth.DBPermissions{
-		Permissions: []string{"readonly"},
+		Permissions: []string{"readwrite"},
 	}, nil)
 
 	dynAuth := &dynamicMockAuthorizer{result: initialResult}
@@ -657,12 +722,9 @@ func TestIntegration_Proxy_RevalidationPermissionRevoked(t *testing.T) {
 	t.Cleanup(func() { cleanupRole(t, "testuser@example.com", "test-node", "waypoint_test") })
 
 	conn := proxyConnect(t, addr, "waypoint_test")
-	ctx := context.Background()
 
-	// Connection should work initially.
-	var val int
-	if err := conn.QueryRow(ctx, "SELECT 1").Scan(&val); err != nil {
-		t.Fatalf("initial SELECT 1 failed: %v", err)
+	if _, err := conn.Exec(ctx, "INSERT INTO public.reval_revoked_test VALUES (1)"); err != nil {
+		t.Fatalf("initial insert failed: %v", err)
 	}
 
 	// Switch auth to return a result that grants access to a different database only.
@@ -672,13 +734,67 @@ func TestIntegration_Proxy_RevalidationPermissionRevoked(t *testing.T) {
 	}, nil)
 	dynAuth.SetResult(revokedResult, nil)
 
-	// Wait for revalidation to fire and close the connection.
+	// Wait for revalidation to fire and reconcile permissions.
 	time.Sleep(2 * time.Second)
 
-	// Next query should fail because permissions were revoked.
-	err := conn.QueryRow(ctx, "SELECT 1").Scan(&val)
+	// The connection should remain open, but the active role should have no
+	// object grants for the revoked database.
+	var val int
+	if err := conn.QueryRow(ctx, "SELECT 1").Scan(&val); err != nil {
+		t.Fatalf("connection should remain open after permission reconciliation: %v", err)
+	}
+	_, err = conn.Exec(ctx, "INSERT INTO public.reval_revoked_test VALUES (2)")
 	if err == nil {
-		t.Fatal("expected connection to be closed after database permissions revoked")
+		t.Fatal("insert should be denied after database permissions were revoked")
+	}
+	if !strings.Contains(err.Error(), "permission denied") {
+		t.Fatalf("expected permission denied error, got: %v", err)
+	}
+}
+
+func TestIntegration_Proxy_RevalidationReconcilesPermissionDowngrade(t *testing.T) {
+	aconn := adminConn(t)
+	ctx := context.Background()
+	_, err := aconn.Exec(ctx, "CREATE TABLE IF NOT EXISTS public.reval_downgrade_test (id int)")
+	if err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+	t.Cleanup(func() {
+		c := adminConn(t)
+		c.Exec(context.Background(), "DROP TABLE IF EXISTS public.reval_downgrade_test")
+	})
+
+	initialResult := makeAuthResult("waypoint_test", auth.DBPermissions{
+		Permissions: []string{"readwrite"},
+	}, nil)
+	dynAuth := &dynamicMockAuthorizer{result: initialResult}
+
+	addr := setupProxyWithAuth(t, dynAuth, func(p *proxy.PostgresProxy) {
+		p.RevalInterval = 500 * time.Millisecond
+	})
+	t.Cleanup(func() { cleanupRole(t, "testuser@example.com", "test-node", "waypoint_test") })
+
+	conn := proxyConnect(t, addr, "waypoint_test")
+	if _, err := conn.Exec(ctx, "INSERT INTO public.reval_downgrade_test VALUES (1)"); err != nil {
+		t.Fatalf("initial insert failed: %v", err)
+	}
+
+	downgradedResult := makeAuthResult("waypoint_test", auth.DBPermissions{
+		Permissions: []string{"readonly"},
+	}, nil)
+	dynAuth.SetResult(downgradedResult, nil)
+
+	time.Sleep(2 * time.Second)
+
+	if _, err := conn.Exec(ctx, "SELECT * FROM public.reval_downgrade_test"); err != nil {
+		t.Fatalf("select should still succeed after downgrade: %v", err)
+	}
+	_, err = conn.Exec(ctx, "INSERT INTO public.reval_downgrade_test VALUES (2)")
+	if err == nil {
+		t.Fatal("insert should be denied after downgrade to readonly")
+	}
+	if !strings.Contains(err.Error(), "permission denied") {
+		t.Fatalf("expected permission denied error, got: %v", err)
 	}
 }
 

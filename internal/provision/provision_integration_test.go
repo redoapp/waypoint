@@ -325,6 +325,172 @@ func TestIntegration_EnsureUser_ReadonlyPreset(t *testing.T) {
 	}
 }
 
+func TestIntegration_EnsureUser_ReconcilesPresetDowngrade(t *testing.T) {
+	for _, db := range testBackends(t) {
+		t.Run(db.name, func(t *testing.T) {
+			p := setupProvisionerFor(t, db)
+			ctx := context.Background()
+
+			conn := adminConnFor(t, db)
+			_, err := conn.Exec(ctx, "CREATE TABLE IF NOT EXISTS public.reconcile_preset_test (id int)")
+			if err != nil {
+				t.Fatalf("create test table: %v", err)
+			}
+			t.Cleanup(func() {
+				c := adminConnFor(t, db)
+				c.Exec(context.Background(), "DROP TABLE IF EXISTS public.reconcile_preset_test")
+			})
+
+			readwrite := &auth.DBPermissions{Permissions: []string{"readwrite"}}
+			pgUser, password, err := p.EnsureUser(ctx, "reconcile@example.com", "reconcile-node", "waypoint_test", readwrite)
+			if err != nil {
+				t.Fatalf("EnsureUser readwrite: %v", err)
+			}
+			t.Cleanup(func() { cleanupRoleFor(t, db, pgUser) })
+
+			userConnStr := fmt.Sprintf("postgres://%s:%s@%s/waypoint_test?sslmode=disable", pgUser, password, db.backend)
+			userConn, err := pgx.Connect(ctx, userConnStr)
+			if err != nil {
+				t.Fatalf("connect as readwrite user: %v", err)
+			}
+			if _, err := userConn.Exec(ctx, "INSERT INTO public.reconcile_preset_test VALUES (1)"); err != nil {
+				t.Fatalf("insert should succeed with readwrite grant: %v", err)
+			}
+			userConn.Close(ctx)
+
+			readonly := &auth.DBPermissions{Permissions: []string{"readonly"}}
+			pgUser2, password2, err := p.EnsureUser(ctx, "reconcile@example.com", "reconcile-node", "waypoint_test", readonly)
+			if err != nil {
+				t.Fatalf("EnsureUser readonly: %v", err)
+			}
+			if pgUser2 != pgUser {
+				t.Fatalf("expected same role to be reconciled, got %q then %q", pgUser, pgUser2)
+			}
+
+			readonlyConnStr := fmt.Sprintf("postgres://%s:%s@%s/waypoint_test?sslmode=disable", pgUser2, password2, db.backend)
+			readonlyConn, err := pgx.Connect(ctx, readonlyConnStr)
+			if err != nil {
+				t.Fatalf("connect as readonly user: %v", err)
+			}
+			defer readonlyConn.Close(ctx)
+
+			if _, err := readonlyConn.Exec(ctx, "SELECT * FROM public.reconcile_preset_test"); err != nil {
+				t.Fatalf("select should succeed after downgrade: %v", err)
+			}
+			if _, err := readonlyConn.Exec(ctx, "INSERT INTO public.reconcile_preset_test VALUES (2)"); err == nil {
+				t.Fatal("insert should be denied after downgrade to readonly")
+			}
+		})
+	}
+}
+
+func TestIntegration_EnsureUser_ReconcilesOwnedObjectsOnDowngrade(t *testing.T) {
+	for _, db := range testBackends(t) {
+		t.Run(db.name, func(t *testing.T) {
+			p := setupProvisionerFor(t, db)
+			ctx := context.Background()
+
+			admin := &auth.DBPermissions{Permissions: []string{"admin"}}
+			pgUser, password, err := p.EnsureUser(ctx, "owner-reconcile@example.com", "owner-node", "waypoint_test", admin)
+			if err != nil {
+				t.Fatalf("EnsureUser admin: %v", err)
+			}
+			t.Cleanup(func() { cleanupRoleFor(t, db, pgUser) })
+			t.Cleanup(func() {
+				c := adminConnFor(t, db)
+				c.Exec(context.Background(), "DROP TABLE IF EXISTS public.reconcile_owned_test")
+			})
+
+			userConnStr := fmt.Sprintf("postgres://%s:%s@%s/waypoint_test?sslmode=disable", pgUser, password, db.backend)
+			userConn, err := pgx.Connect(ctx, userConnStr)
+			if err != nil {
+				t.Fatalf("connect as admin user: %v", err)
+			}
+			if _, err := userConn.Exec(ctx, "CREATE TABLE public.reconcile_owned_test (id int)"); err != nil {
+				t.Fatalf("create owned table should succeed with admin grant: %v", err)
+			}
+			if _, err := userConn.Exec(ctx, "INSERT INTO public.reconcile_owned_test VALUES (1)"); err != nil {
+				t.Fatalf("insert into owned table should succeed with admin grant: %v", err)
+			}
+			userConn.Close(ctx)
+
+			readonly := &auth.DBPermissions{Permissions: []string{"readonly"}}
+			pgUser2, password2, err := p.EnsureUser(ctx, "owner-reconcile@example.com", "owner-node", "waypoint_test", readonly)
+			if err != nil {
+				t.Fatalf("EnsureUser readonly: %v", err)
+			}
+			if pgUser2 != pgUser {
+				t.Fatalf("expected same role to be reconciled, got %q then %q", pgUser, pgUser2)
+			}
+
+			readonlyConnStr := fmt.Sprintf("postgres://%s:%s@%s/waypoint_test?sslmode=disable", pgUser2, password2, db.backend)
+			readonlyConn, err := pgx.Connect(ctx, readonlyConnStr)
+			if err != nil {
+				t.Fatalf("connect as readonly user: %v", err)
+			}
+			defer readonlyConn.Close(ctx)
+
+			if _, err := readonlyConn.Exec(ctx, "SELECT * FROM public.reconcile_owned_test"); err != nil {
+				t.Fatalf("select from formerly owned table should succeed after downgrade: %v", err)
+			}
+			if _, err := readonlyConn.Exec(ctx, "INSERT INTO public.reconcile_owned_test VALUES (2)"); err == nil {
+				t.Fatal("insert into formerly owned table should be denied after downgrade")
+			}
+		})
+	}
+}
+
+func TestIntegration_EnsureUser_RollbackPreservesPreviousPermissions(t *testing.T) {
+	for _, db := range testBackends(t) {
+		t.Run(db.name, func(t *testing.T) {
+			p := setupProvisionerFor(t, db)
+			ctx := context.Background()
+
+			conn := adminConnFor(t, db)
+			_, err := conn.Exec(ctx, "CREATE TABLE IF NOT EXISTS public.rollback_preserve_test (id int)")
+			if err != nil {
+				t.Fatalf("create test table: %v", err)
+			}
+			t.Cleanup(func() {
+				c := adminConnFor(t, db)
+				c.Exec(context.Background(), "DROP TABLE IF EXISTS public.rollback_preserve_test")
+			})
+
+			readwrite := &auth.DBPermissions{Permissions: []string{"readwrite"}}
+			pgUser, password, err := p.EnsureUser(ctx, "rollback@example.com", "rollback-node", "waypoint_test", readwrite)
+			if err != nil {
+				t.Fatalf("EnsureUser readwrite: %v", err)
+			}
+			t.Cleanup(func() { cleanupRoleFor(t, db, pgUser) })
+
+			userConnStr := fmt.Sprintf("postgres://%s:%s@%s/waypoint_test?sslmode=disable", pgUser, password, db.backend)
+			userConn, err := pgx.Connect(ctx, userConnStr)
+			if err != nil {
+				t.Fatalf("connect before failed reconcile: %v", err)
+			}
+			if _, err := userConn.Exec(ctx, "INSERT INTO public.rollback_preserve_test VALUES (1)"); err != nil {
+				t.Fatalf("initial insert should succeed: %v", err)
+			}
+			userConn.Close(ctx)
+
+			badPerms := &auth.DBPermissions{Permissions: []string{"invalid"}}
+			if _, _, err := p.EnsureUser(ctx, "rollback@example.com", "rollback-node", "waypoint_test", badPerms); err == nil {
+				t.Fatal("expected failed reconcile with invalid preset")
+			}
+
+			afterRollbackConn, err := pgx.Connect(ctx, userConnStr)
+			if err != nil {
+				t.Fatalf("old password should still work after rollback: %v", err)
+			}
+			defer afterRollbackConn.Close(ctx)
+
+			if _, err := afterRollbackConn.Exec(ctx, "INSERT INTO public.rollback_preserve_test VALUES (2)"); err != nil {
+				t.Fatalf("old readwrite grants should still work after rollback: %v", err)
+			}
+		})
+	}
+}
+
 func TestIntegration_EnsureUser_SQLStatements(t *testing.T) {
 	for _, db := range testBackends(t) {
 		t.Run(db.name, func(t *testing.T) {

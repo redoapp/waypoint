@@ -66,17 +66,31 @@ func NewProvisioner(adminUser, adminPassword, adminDatabase, backend, userPrefix
 // EnsureUser creates or updates a dynamic PG role for the given identity,
 // node, and database. Returns the PG username and password.
 func (p *Provisioner) EnsureUser(ctx context.Context, loginName, nodeName, database string, perms *auth.DBPermissions) (string, string, error) {
+	return p.ensureUser(ctx, loginName, nodeName, database, "", perms)
+}
+
+// EnsureUserWithRoleScope creates or updates a dynamic PG role with an
+// additional role-name scope. The database used for grants is unchanged.
+func (p *Provisioner) EnsureUserWithRoleScope(ctx context.Context, loginName, nodeName, database, roleScope string, perms *auth.DBPermissions) (string, string, error) {
+	return p.ensureUser(ctx, loginName, nodeName, database, roleScope, perms)
+}
+
+func (p *Provisioner) ensureUser(ctx context.Context, loginName, nodeName, database, roleScope string, perms *auth.DBPermissions) (string, string, error) {
 	tracer := otel.Tracer("waypoint")
+	spanAttrs := []attribute.KeyValue{
+		attribute.String("waypoint.user", loginName),
+		attribute.String("waypoint.database", database),
+	}
+	if roleScope != "" {
+		spanAttrs = append(spanAttrs, attribute.String("waypoint.role_scope", roleScope))
+	}
 	ctx, span := tracer.Start(ctx, "waypoint.provision.ensure_user",
-		trace.WithAttributes(
-			attribute.String("waypoint.user", loginName),
-			attribute.String("waypoint.database", database),
-		),
+		trace.WithAttributes(spanAttrs...),
 	)
 	defer span.End()
 
-	pgUser := p.formatUsername(loginName, nodeName, database)
-	p.logger.DebugContext(ctx, "ensuring user", "login", loginName, "database", database)
+	pgUser := p.formatUsernameWithScope(loginName, nodeName, database, roleScope)
+	p.logger.DebugContext(ctx, "ensuring user", "login", loginName, "database", database, "role_scope", roleScope)
 
 	// Acquire a distributed lock via Redis to serialize concurrent EnsureUser
 	// calls for the same role. This works with both PostgreSQL and CockroachDB.
@@ -163,12 +177,30 @@ func (p *Provisioner) EnsureUser(ctx context.Context, loginName, nodeName, datab
 	dialect := detectDialect(ctx, conn, p.adminConnStr)
 	p.logger.DebugContext(ctx, "detected dialect", "dialect", dialect)
 
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		span.RecordError(err)
+		return "", "", fmt.Errorf("begin transaction: %w", err)
+	}
+	txCommitted := false
+	defer func() {
+		if !txCommitted {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+
 	// Check if user exists.
 	var exists bool
-	err = conn.QueryRow(ctx, roleExistsQuery(dialect), pgUser).Scan(&exists)
+	err = tx.QueryRow(ctx, roleExistsQuery(dialect), pgUser).Scan(&exists)
 	if err != nil {
 		span.RecordError(err)
 		return "", "", fmt.Errorf("check role: %w", err)
+	}
+
+	targetDatabaseExists, err := databaseExists(ctx, tx, database)
+	if err != nil {
+		span.RecordError(err)
+		return "", "", fmt.Errorf("check database: %w", err)
 	}
 
 	password := generatePassword()
@@ -179,7 +211,7 @@ func (p *Provisioner) EnsureUser(ctx context.Context, loginName, nodeName, datab
 	if !exists {
 		// CREATE ROLE with LOGIN.
 		// Note: role names and passwords can't be parameterized, using QuoteIdentifier.
-		_, err = conn.Exec(ctx, fmt.Sprintf(
+		_, err = tx.Exec(ctx, fmt.Sprintf(
 			"CREATE ROLE %s WITH LOGIN PASSWORD %s",
 			pgx.Identifier{pgUser}.Sanitize(),
 			quoteLiteral(password),
@@ -194,7 +226,7 @@ func (p *Provisioner) EnsureUser(ctx context.Context, loginName, nodeName, datab
 		p.logger.InfoContext(ctx, "created PG role", "role", pgUser)
 	} else {
 		// Update password on every connection.
-		_, err = conn.Exec(ctx, fmt.Sprintf(
+		_, err = tx.Exec(ctx, fmt.Sprintf(
 			"ALTER ROLE %s WITH PASSWORD %s",
 			pgx.Identifier{pgUser}.Sanitize(),
 			quoteLiteral(password),
@@ -209,15 +241,29 @@ func (p *Provisioner) EnsureUser(ctx context.Context, loginName, nodeName, datab
 	}
 	roleSpan.End()
 
-	// Reconcile grants: GRANT CONNECT on the database, then apply permissions.
+	// Reconcile grants: reset privileges first, then apply the current grants.
 	_, grantSpan := tracer.Start(ctx, "waypoint.provision.grant")
-	_, err = conn.Exec(ctx, fmt.Sprintf(
-		"GRANT CONNECT ON DATABASE %s TO %s",
-		pgx.Identifier{database}.Sanitize(),
-		pgx.Identifier{pgUser}.Sanitize(),
-	))
-	if err != nil {
-		p.logger.WarnContext(ctx, "grant connect failed", "role", pgUser, "database", database, "error", err)
+	if err := p.resetRolePrivileges(ctx, tx, dialect, database, pgUser, targetDatabaseExists); err != nil {
+		grantSpan.End()
+		span.RecordError(err)
+		return "", "", fmt.Errorf("reset privileges: %w", err)
+	}
+	if targetDatabaseExists {
+		_, err = tx.Exec(ctx, fmt.Sprintf(
+			"GRANT CONNECT ON DATABASE %s TO %s",
+			pgx.Identifier{database}.Sanitize(),
+			pgx.Identifier{pgUser}.Sanitize(),
+		))
+		if err != nil {
+			grantSpan.End()
+			span.RecordError(err)
+			return "", "", fmt.Errorf("grant connect: %w", err)
+		}
+	} else {
+		p.logger.WarnContext(ctx, "grant connect skipped because database does not exist",
+			"role", pgUser,
+			"database", database,
+		)
 	}
 
 	// Apply permission presets and raw SQL statements.
@@ -233,8 +279,10 @@ func (p *Provisioner) EnsureUser(ctx context.Context, loginName, nodeName, datab
 			}
 			for _, frag := range fragments {
 				stmt := fmt.Sprintf("GRANT %s TO %s", frag, sanitizedRole)
-				if _, err := conn.Exec(ctx, stmt); err != nil {
-					p.logger.WarnContext(ctx, "grant failed", "role", pgUser, "grant", frag, "error", err)
+				if _, err := tx.Exec(ctx, stmt); err != nil {
+					grantSpan.End()
+					span.RecordError(err)
+					return "", "", fmt.Errorf("grant %q: %w", frag, err)
 				}
 			}
 		}
@@ -255,8 +303,10 @@ func (p *Provisioner) EnsureUser(ctx context.Context, loginName, nodeName, datab
 					grantSpan.End()
 					return "", "", fmt.Errorf("invalid sql template %q: %w", raw, err)
 				}
-				if _, err := conn.Exec(ctx, resolved); err != nil {
-					p.logger.WarnContext(ctx, "sql statement failed", "role", pgUser, "sql", raw, "error", err)
+				if _, err := tx.Exec(ctx, resolved); err != nil {
+					grantSpan.End()
+					span.RecordError(err)
+					return "", "", fmt.Errorf("sql statement %q: %w", raw, err)
 				}
 			}
 		}
@@ -264,21 +314,314 @@ func (p *Provisioner) EnsureUser(ctx context.Context, loginName, nodeName, datab
 
 	grantSpan.End()
 
+	if err := tx.Commit(ctx); err != nil {
+		span.RecordError(err)
+		return "", "", fmt.Errorf("commit transaction: %w", err)
+	}
+	txCommitted = true
+
 	// Touch last-used timestamp.
 	p.store.TouchLastUsed(ctx, pgUser)
 
 	return pgUser, password, nil
 }
 
+// ReconcileRole updates privileges for an existing backend role without
+// rotating its password. It is used by active sessions during revalidation.
+func (p *Provisioner) ReconcileRole(ctx context.Context, pgUser, database string, perms *auth.DBPermissions) error {
+	tracer := otel.Tracer("waypoint")
+	ctx, span := tracer.Start(ctx, "waypoint.provision.reconcile_role",
+		trace.WithAttributes(
+			attribute.String("waypoint.pg_user", pgUser),
+			attribute.String("waypoint.database", database),
+		),
+	)
+	defer span.End()
+
+	const lockTTL = 30 * time.Second
+	const maxRetries = 10
+	const retryDelay = 100 * time.Millisecond
+
+	ctx, lockSpan := tracer.Start(ctx, "waypoint.provision.acquire_lock")
+	var lockToken string
+	for i := 0; i < maxRetries; i++ {
+		token, err := p.store.AcquireLock(ctx, "role:"+pgUser, lockTTL)
+		if err != nil {
+			lockSpan.RecordError(err)
+			lockSpan.SetStatus(codes.Error, "acquire lock failed")
+			lockSpan.End()
+			span.RecordError(err)
+			return fmt.Errorf("acquire lock: %w", err)
+		}
+		if token != "" {
+			lockToken = token
+			break
+		}
+		select {
+		case <-ctx.Done():
+			lockSpan.End()
+			return ctx.Err()
+		case <-time.After(retryDelay):
+		}
+	}
+	if lockToken == "" {
+		err := fmt.Errorf("could not acquire lock for role %q", pgUser)
+		lockSpan.RecordError(err)
+		lockSpan.SetStatus(codes.Error, "lock timeout")
+		lockSpan.End()
+		span.RecordError(err)
+		return err
+	}
+	lockSpan.End()
+	defer p.store.ReleaseLock(ctx, "role:"+pgUser, lockToken)
+
+	connCfg, err := pgx.ParseConfig(p.adminConnStr)
+	if err != nil {
+		span.RecordError(err)
+		return fmt.Errorf("parse admin conn config: %w", err)
+	}
+	if p.dialFunc != nil {
+		connCfg.DialFunc = p.dialFunc
+	}
+	if p.lookupFunc != nil {
+		connCfg.LookupFunc = p.lookupFunc
+	}
+
+	tracerOpts := []otelpgx.Option{
+		otelpgx.WithTrimSQLInSpanName(),
+	}
+	if p.peerService != "" {
+		tracerOpts = append(tracerOpts, otelpgx.WithTracerAttributes(
+			attribute.String("peer.service", p.peerService),
+		))
+	}
+	connCfg.Tracer = otelpgx.NewTracer(tracerOpts...)
+
+	const provisionTimeout = 90 * time.Second
+	connCtx, connCancel := context.WithTimeout(ctx, provisionTimeout)
+	defer connCancel()
+
+	conn, err := pgx.ConnectConfig(connCtx, connCfg)
+	if err != nil {
+		span.RecordError(err)
+		return fmt.Errorf("admin connect: %w", err)
+	}
+	defer conn.Close(ctx)
+
+	dialect := detectDialect(ctx, conn, p.adminConnStr)
+
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		span.RecordError(err)
+		return fmt.Errorf("begin transaction: %w", err)
+	}
+	txCommitted := false
+	defer func() {
+		if !txCommitted {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+
+	var exists bool
+	if err := tx.QueryRow(ctx, roleExistsQuery(dialect), pgUser).Scan(&exists); err != nil {
+		span.RecordError(err)
+		return fmt.Errorf("check role: %w", err)
+	}
+	if !exists {
+		err := fmt.Errorf("role %q does not exist", pgUser)
+		span.RecordError(err)
+		return err
+	}
+
+	targetDatabaseExists, err := databaseExists(ctx, tx, database)
+	if err != nil {
+		span.RecordError(err)
+		return fmt.Errorf("check database: %w", err)
+	}
+
+	if err := p.resetRolePrivileges(ctx, tx, dialect, database, pgUser, targetDatabaseExists); err != nil {
+		span.RecordError(err)
+		return fmt.Errorf("reset privileges: %w", err)
+	}
+
+	if perms != nil && targetDatabaseExists {
+		if _, err := tx.Exec(ctx, fmt.Sprintf(
+			"GRANT CONNECT ON DATABASE %s TO %s",
+			pgx.Identifier{database}.Sanitize(),
+			pgx.Identifier{pgUser}.Sanitize(),
+		)); err != nil {
+			span.RecordError(err)
+			return fmt.Errorf("grant connect: %w", err)
+		}
+	} else if perms != nil {
+		p.logger.WarnContext(ctx, "grant connect skipped because database does not exist",
+			"role", pgUser,
+			"database", database,
+		)
+	}
+
+	if perms != nil {
+		if err := p.applyRolePermissions(ctx, tx, pgUser, perms); err != nil {
+			span.RecordError(err)
+			return err
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		span.RecordError(err)
+		return fmt.Errorf("commit transaction: %w", err)
+	}
+	txCommitted = true
+
+	p.store.TouchLastUsed(ctx, pgUser)
+	return nil
+}
+
+func (p *Provisioner) applyRolePermissions(ctx context.Context, tx pgx.Tx, pgUser string, perms *auth.DBPermissions) error {
+	if perms == nil {
+		return nil
+	}
+	sanitizedRole := pgx.Identifier{pgUser}.Sanitize()
+
+	if len(perms.Permissions) > 0 {
+		fragments, err := ExpandPresets(perms.Permissions, perms.Schemas)
+		if err != nil {
+			return fmt.Errorf("invalid permissions: %w", err)
+		}
+		for _, frag := range fragments {
+			stmt := fmt.Sprintf("GRANT %s TO %s", frag, sanitizedRole)
+			if _, err := tx.Exec(ctx, stmt); err != nil {
+				return fmt.Errorf("grant %q: %w", frag, err)
+			}
+		}
+	}
+
+	if len(perms.SQL) > 0 {
+		if !p.allowRawSQL {
+			return fmt.Errorf("raw SQL statements are disabled by server configuration; use presets instead")
+		}
+		if err := validateSQL(perms.SQL); err != nil {
+			return fmt.Errorf("invalid sql in permissions: %w", err)
+		}
+		for _, raw := range perms.SQL {
+			resolved, err := renderSQL(raw, SQLTemplateData{Role: sanitizedRole})
+			if err != nil {
+				return fmt.Errorf("invalid sql template %q: %w", raw, err)
+			}
+			if _, err := tx.Exec(ctx, resolved); err != nil {
+				return fmt.Errorf("sql statement %q: %w", raw, err)
+			}
+		}
+	}
+
+	return nil
+}
+
+func (p *Provisioner) resetRolePrivileges(ctx context.Context, tx pgx.Tx, dialect Dialect, database, role string, targetDatabaseExists bool) error {
+	sanitizedRole := pgx.Identifier{role}.Sanitize()
+
+	if _, err := tx.Exec(ctx, fmt.Sprintf("REASSIGN OWNED BY %s TO CURRENT_USER", sanitizedRole)); err != nil {
+		return fmt.Errorf("reassign owned objects: %w", err)
+	}
+
+	if targetDatabaseExists {
+		if _, err := tx.Exec(ctx, fmt.Sprintf(
+			"REVOKE ALL PRIVILEGES ON DATABASE %s FROM %s",
+			pgx.Identifier{database}.Sanitize(),
+			sanitizedRole,
+		)); err != nil {
+			return fmt.Errorf("revoke database privileges: %w", err)
+		}
+	} else {
+		p.logger.WarnContext(ctx, "revoke database privileges skipped because database does not exist",
+			"role", role,
+			"database", database,
+		)
+	}
+
+	schemas, err := grantSchemas(ctx, tx)
+	if err != nil {
+		return err
+	}
+	for _, schema := range schemas {
+		sanitizedSchema := pgx.Identifier{schema}.Sanitize()
+		statements := []string{
+			fmt.Sprintf("REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA %s FROM %s", sanitizedSchema, sanitizedRole),
+			fmt.Sprintf("REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA %s FROM %s", sanitizedSchema, sanitizedRole),
+		}
+		if dialect == DialectPostgres {
+			statements = append(statements,
+				fmt.Sprintf("REVOKE ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA %s FROM %s", sanitizedSchema, sanitizedRole),
+				fmt.Sprintf("REVOKE ALL PRIVILEGES ON ALL PROCEDURES IN SCHEMA %s FROM %s", sanitizedSchema, sanitizedRole),
+			)
+		}
+		statements = append(statements,
+			fmt.Sprintf("REVOKE ALL PRIVILEGES ON SCHEMA %s FROM %s", sanitizedSchema, sanitizedRole),
+		)
+
+		for _, stmt := range statements {
+			if _, err := tx.Exec(ctx, stmt); err != nil {
+				return fmt.Errorf("%s: %w", stmt, err)
+			}
+		}
+	}
+
+	return nil
+}
+
+func grantSchemas(ctx context.Context, tx pgx.Tx) ([]string, error) {
+	rows, err := tx.Query(ctx, `
+SELECT schema_name
+FROM information_schema.schemata
+WHERE schema_name <> 'information_schema'
+  AND schema_name <> 'crdb_internal'
+  AND schema_name NOT LIKE 'pg_%'
+ORDER BY schema_name`)
+	if err != nil {
+		return nil, fmt.Errorf("list schemas: %w", err)
+	}
+	defer rows.Close()
+
+	var schemas []string
+	for rows.Next() {
+		var schema string
+		if err := rows.Scan(&schema); err != nil {
+			return nil, fmt.Errorf("scan schema: %w", err)
+		}
+		schemas = append(schemas, schema)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list schemas: %w", err)
+	}
+	return schemas, nil
+}
+
+func databaseExists(ctx context.Context, tx pgx.Tx, database string) (bool, error) {
+	var exists bool
+	err := tx.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)", database).Scan(&exists)
+	return exists, err
+}
+
 // formatUsername builds: {prefix}{login_sanitized}_{node}_{database}
 // Truncated to 63 chars (PG limit) with hash suffix if needed.
 func (p *Provisioner) formatUsername(loginName, nodeName, database string) string {
+	return p.formatUsernameWithScope(loginName, nodeName, database, "")
+}
+
+// formatUsernameWithScope builds:
+// {prefix}{login_sanitized}_{node}_{database}_{scope}
+// The scope is optional and keeps intentionally different grant sets isolated.
+func (p *Provisioner) formatUsernameWithScope(loginName, nodeName, database, roleScope string) string {
 	sanitized := sanitize(loginName)
 	node := strings.Split(nodeName, ".")[0]
 	node = sanitize(node)
 	db := sanitize(database)
+	scope := sanitize(roleScope)
 
 	name := fmt.Sprintf("%s%s_%s_%s", p.userPrefix, sanitized, node, db)
+	if scope != "" {
+		name += "_" + scope
+	}
 
 	if len(name) <= 63 {
 		return name

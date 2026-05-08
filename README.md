@@ -180,6 +180,20 @@ Access is controlled by Tailscale ACL capability grants. The `permissions` field
 
 By default, presets apply to the `public` schema. Use `schemas` to target other schemas.
 
+Postgres clients can lower the effective preset for one connection with the
+`waypoint_presets` query parameter:
+
+```text
+postgres://ignored:ignored@waypoint-db/myapp?sslmode=require&waypoint_presets=readonly
+```
+
+The value can be `readonly`, `readwrite`, or `admin`. Comma-separated values are
+accepted, with the strongest listed preset treated as the maximum. This cannot
+elevate beyond the ACL grant; for example, a `readonly` ACL grant remains
+readonly even if the connection asks for `admin`. When the parameter is set,
+Waypoint provisions a scoped backend role for that effective preset and skips
+raw SQL grants for that connection.
+
 Example policy snippet:
 
 ```json

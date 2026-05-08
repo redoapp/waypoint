@@ -154,6 +154,16 @@ func (p *PostgresProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 	log.DebugContext(ctx, "startup message received", "database", requestedDB)
 	setupSpan.SetAttributes(attribute.String("waypoint.database", requestedDB))
 
+	presetLimit, err := postgresPresetLimitFromStartup(startup.Parameters)
+	if err != nil {
+		setupSpan.RecordError(err)
+		setupSpan.SetStatus(codes.Error, "invalid preset limit")
+		setupSpan.End()
+		log.WarnContext(ctx, "invalid preset limit", "error", err)
+		pgwire.SendErrorResponse(clientConn, "FATAL", "22023", err.Error())
+		return
+	}
+
 	// Step 4: Check per-database permissions from cap rules.
 	dbPerms := auth.DatabasePermissions(result, p.Name, requestedDB)
 	if dbPerms == nil {
@@ -183,6 +193,36 @@ func (p *PostgresProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 		return
 	}
 
+	roleScope := ""
+	if presetLimit != nil {
+		var effectivePreset string
+		dbPerms, effectivePreset, err = limitDBPermissionsToPostgresPreset(dbPerms, presetLimit)
+		if err != nil {
+			setupSpan.RecordError(err)
+			setupSpan.SetStatus(codes.Error, "preset limit denied")
+			setupSpan.End()
+			log.WarnContext(ctx, "preset limit denied",
+				"user", result.LoginName,
+				"database", requestedDB,
+				"preset_limit", presetLimit.Raw,
+				"error", err,
+			)
+			pgwire.SendErrorResponse(clientConn, "FATAL", "42501",
+				"not authorized for requested preset limit: "+err.Error())
+			return
+		}
+		roleScope = "preset_" + effectivePreset
+		setupSpan.SetAttributes(
+			attribute.String("waypoint.preset_limit", presetLimit.Raw),
+			attribute.String("waypoint.effective_preset", effectivePreset),
+		)
+		log.DebugContext(ctx, "preset limit applied",
+			"database", requestedDB,
+			"preset_limit", presetLimit.Raw,
+			"effective_preset", effectivePreset,
+		)
+	}
+
 	log.DebugContext(ctx, "database permissions resolved",
 		"database", requestedDB,
 		"permissions", dbPerms.Permissions,
@@ -193,7 +233,12 @@ func (p *PostgresProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 	provStart := time.Now()
 	m.ProvisionTotal.Add(ctx, 1, m.Attrs("waypoint.provision.total", listenerAttr))
 	ctx, provSpan := tracer.Start(ctx, "waypoint.provision")
-	pgUser, pgPass, err := p.Provisioner.EnsureUser(ctx, result.LoginName, result.NodeName, requestedDB, dbPerms)
+	var pgUser, pgPass string
+	if roleScope != "" {
+		pgUser, pgPass, err = p.Provisioner.EnsureUserWithRoleScope(ctx, result.LoginName, result.NodeName, requestedDB, roleScope, dbPerms)
+	} else {
+		pgUser, pgPass, err = p.Provisioner.EnsureUser(ctx, result.LoginName, result.NodeName, requestedDB, dbPerms)
+	}
 	provSpan.End()
 	m.ProvisionLatency.Record(ctx, time.Since(provStart).Seconds(),
 		m.Attrs("waypoint.provision.latency", listenerAttr))
@@ -305,7 +350,7 @@ func (p *PostgresProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 	revalCtx, revalCancel := context.WithCancel(ctx)
 	defer revalCancel()
 	if p.RevalInterval > 0 {
-		go p.revalidateLoop(revalCtx, setupSpanCtx, connID, clientConn, backendConn, result.LoginName, requestedDB, log)
+		go p.revalidateLoop(revalCtx, setupSpanCtx, connID, clientConn, backendConn, result.LoginName, requestedDB, pgUser, presetLimit, log)
 	}
 
 	log.DebugContext(ctx, "relay started")
@@ -363,9 +408,9 @@ func (p *PostgresProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 	)
 }
 
-// revalidateLoop periodically re-checks WhoIs + caps. Closes connections
-// if the user's grant is revoked.
-func (p *PostgresProxy) revalidateLoop(ctx context.Context, setupSpanCtx trace.SpanContext, connID string, clientConn, backendConn net.Conn, loginName, database string, log *slog.Logger) {
+// revalidateLoop periodically re-checks WhoIs + caps and reconciles the active
+// backend role to match current permissions.
+func (p *PostgresProxy) revalidateLoop(ctx context.Context, setupSpanCtx trace.SpanContext, connID string, clientConn, backendConn net.Conn, loginName, database, pgUser string, presetLimit *postgresPresetLimit, log *slog.Logger) {
 	ticker := time.NewTicker(p.RevalInterval)
 	defer ticker.Stop()
 
@@ -405,18 +450,64 @@ func (p *PostgresProxy) revalidateLoop(ctx context.Context, setupSpanCtx trace.S
 				return
 			}
 
-			dbPerms := auth.DatabasePermissions(result, p.Name, database)
-			if dbPerms == nil {
-				revalSpan.SetStatus(codes.Error, "permissions revoked")
+			var dbPerms *auth.DBPermissions
+			if currentPerms := auth.DatabasePermissions(result, p.Name, database); currentPerms != nil {
+				dbPerms = currentPerms
+				if presetLimit != nil {
+					var effectivePreset string
+					var err error
+					dbPerms, effectivePreset, err = limitDBPermissionsToPostgresPreset(dbPerms, presetLimit)
+					if err != nil {
+						revalSpan.RecordError(err)
+						log.WarnContext(ctx, "preset limit no longer satisfied; reconciling active role with no grants",
+							"user", loginName,
+							"database", database,
+							"preset_limit", presetLimit.Raw,
+							"error", err,
+						)
+						dbPerms = nil
+					} else {
+						revalSpan.SetAttributes(attribute.String("waypoint.effective_preset", effectivePreset))
+					}
+				}
+			}
+
+			provStart := time.Now()
+			m.ProvisionTotal.Add(ctx, 1, m.Attrs("waypoint.provision.total", listenerAttr))
+			if err := p.Provisioner.ReconcileRole(ctx, pgUser, database, dbPerms); err != nil {
+				m.ProvisionLatency.Record(ctx, time.Since(provStart).Seconds(),
+					m.Attrs("waypoint.provision.latency", listenerAttr))
+				m.ProvisionErrors.Add(ctx, 1, m.Attrs("waypoint.provision.errors", listenerAttr))
+				revalSpan.RecordError(err)
+				revalSpan.SetStatus(codes.Error, "reconcile permissions failed")
 				revalSpan.End()
 				m.RevalFailures.Add(ctx, 1, m.Attrs("waypoint.reval.failures", listenerAttr))
-				log.WarnContext(ctx, "permissions revoked, closing connection",
+				log.WarnContext(ctx, "permission reconciliation failed, closing connection",
 					"user", loginName,
 					"database", database,
+					"pg_user", pgUser,
+					"error", err,
 				)
 				clientConn.Close()
 				backendConn.Close()
 				return
+			}
+			m.ProvisionLatency.Record(ctx, time.Since(provStart).Seconds(),
+				m.Attrs("waypoint.provision.latency", listenerAttr))
+
+			if dbPerms == nil {
+				log.WarnContext(ctx, "permissions revoked; active role reconciled with no grants",
+					"user", loginName,
+					"database", database,
+					"pg_user", pgUser,
+				)
+			} else {
+				log.DebugContext(ctx, "permissions reconciled",
+					"user", loginName,
+					"database", database,
+					"pg_user", pgUser,
+					"permissions", dbPerms.Permissions,
+				)
 			}
 
 			revalSpan.End()

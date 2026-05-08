@@ -136,6 +136,15 @@ func TestFormatUsername_CustomPrefix(t *testing.T) {
 	}
 }
 
+func TestFormatUsernameWithScope(t *testing.T) {
+	p := &Provisioner{userPrefix: "wp_"}
+	got := p.formatUsernameWithScope("user@example.com", "laptop", "mydb", "preset_readonly")
+	want := "wp_user_example_com_laptop_mydb_preset_readonly"
+	if got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
 func TestNewProvisioner_DefaultPrefix(t *testing.T) {
 	p := NewProvisioner("admin", "pass", "postgres", "localhost:5432", "", false, true, "", nil, nil, nil, nil)
 	if p.userPrefix != "wp_" {
