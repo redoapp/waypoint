@@ -131,6 +131,70 @@ func TestMongoStaticCredentialRejectsMixedPermissionOnlyUser(t *testing.T) {
 	}
 }
 
+func TestMongoStaticCredentialReadWriteWinsOverReadonlyGrant(t *testing.T) {
+	p := &MongoDBProxy{
+		Name: "mongo",
+		MongoConfig: &config.MongoDBAdmin{
+			AuthDatabase: "admin",
+			Provision: &config.MongoProvision{
+				Mode: config.MongoProvisionStatic,
+				StaticUsers: []config.MongoStaticUser{
+					{
+						Name:        "readonly",
+						Username:    "atlas_ro",
+						Password:    "ro-secret",
+						Permissions: []string{"readonly"},
+					},
+					{
+						Name:        "readwrite",
+						Username:    "atlas_rw",
+						Password:    "rw-secret",
+						Permissions: []string{"readwrite"},
+					},
+				},
+			},
+		},
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+
+	result := &auth.AuthResult{
+		LoginName: "testuser@example.com",
+		NodeName:  "test-node",
+		MatchedRules: []auth.CapRule{
+			{
+				Backends: map[string]auth.BackendCap{
+					"mongo": {
+						Mongo: &auth.MongoCap{
+							Databases: map[string]auth.MongoDBPermissions{
+								"app": {Permissions: []string{"readonly"}},
+							},
+						},
+					},
+				},
+			},
+			{
+				Backends: map[string]auth.BackendCap{
+					"mongo": {
+						Mongo: &auth.MongoCap{
+							Databases: map[string]auth.MongoDBPermissions{
+								"app": {Permissions: []string{"readwrite"}},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	cred, err := p.selectStaticCredential(p.collectAccess(result))
+	if err != nil {
+		t.Fatalf("selectStaticCredential: %v", err)
+	}
+	if cred.Username != "atlas_rw" {
+		t.Fatalf("username = %q, want atlas_rw", cred.Username)
+	}
+}
+
 func TestMongoStaticMissingCredentialReturnsClientMessage(t *testing.T) {
 	mr := miniredis.RunT(t)
 	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})

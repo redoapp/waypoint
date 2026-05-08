@@ -311,6 +311,77 @@ func TestIntegration_MongoProxy_StaticUserReadWriteAllowed(t *testing.T) {
 	}
 }
 
+func TestIntegration_MongoProxy_StaticReadWriteWinsOverReadonlyGrant(t *testing.T) {
+	connStr, backend := testutil.MongoDBBackend(t)
+	adminClient := mongoIntegrationAdminClient(t, connStr)
+
+	const (
+		dbName     = "static_mixed_grants_db"
+		roUsername = "static_mixed_ro_user"
+		roPassword = "static-mixed-ro-pass"
+		rwUsername = "static_mixed_rw_user"
+		rwPassword = "static-mixed-rw-pass"
+	)
+	createMongoStaticUser(t, adminClient, roUsername, roPassword, []config.MongoStaticRole{
+		{Role: "read", DB: dbName},
+	})
+	createMongoStaticUser(t, adminClient, rwUsername, rwPassword, []config.MongoStaticRole{
+		{Role: "readWrite", DB: dbName},
+	})
+
+	result := &auth.AuthResult{
+		LoginName: "testuser@example.com",
+		NodeName:  "test-node",
+		MatchedRules: []auth.CapRule{
+			{
+				Backends: map[string]auth.BackendCap{
+					"test-listener": {
+						Mongo: &auth.MongoCap{
+							Databases: map[string]auth.MongoDBPermissions{
+								dbName: {Permissions: []string{"readonly"}},
+							},
+						},
+					},
+				},
+			},
+			{
+				Backends: map[string]auth.BackendCap{
+					"test-listener": {
+						Mongo: &auth.MongoCap{
+							Databases: map[string]auth.MongoDBPermissions{
+								dbName: {Permissions: []string{"readwrite"}},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	addr := setupMongoStaticProxy(t, backend, result, []config.MongoStaticUser{
+		{
+			Name:         "static-readonly",
+			Username:     roUsername,
+			Password:     roPassword,
+			AuthDatabase: "admin",
+			Permissions:  []string{"readonly"},
+		},
+		{
+			Name:         "static-readwrite",
+			Username:     rwUsername,
+			Password:     rwPassword,
+			AuthDatabase: "admin",
+			Permissions:  []string{"readwrite"},
+		},
+	})
+
+	client := mongoProxyConnect(t, addr, dbName)
+	_, err := client.Database(dbName).Collection("items").InsertOne(context.Background(), bson.D{{Key: "source", Value: "mixed-grants"}})
+	if err != nil {
+		t.Fatalf("insert through selected static readwrite user: %v", err)
+	}
+}
+
 func TestIntegration_MongoProxy_StaticUserMissingReturnsClientMessage(t *testing.T) {
 	_, backend := testutil.MongoDBBackend(t)
 	result := makeMongoAuthResult(map[string]auth.MongoDBPermissions{
