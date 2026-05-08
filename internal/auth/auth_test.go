@@ -106,6 +106,79 @@ func TestMergeRules_NoPG(t *testing.T) {
 	}
 }
 
+func TestMergeRules_OpenSearchPermissions(t *testing.T) {
+	rules := []CapRule{{
+		Backends: map[string]BackendCap{
+			"search": {
+				OpenSearch: &OpenSearchCap{
+					ClusterPermissions: []string{"cluster:monitor/main"},
+					Indices: map[string]OpenSearchIndexPermissions{
+						"logs-*": {Permissions: []string{"readonly"}, AllowedActions: []string{"indices:data/read/search"}},
+					},
+				},
+			},
+		},
+	}}
+
+	perms, _ := mergeRules(rules, "search")
+	for _, want := range []string{"cluster:monitor/main", "readonly", "indices:data/read/search"} {
+		if !testContainsString(perms, want) {
+			t.Fatalf("perms = %v, missing %q", perms, want)
+		}
+	}
+}
+
+func TestOpenSearchPermissions_MergesRules(t *testing.T) {
+	result := &AuthResult{
+		MatchedRules: []CapRule{
+			{
+				Backends: map[string]BackendCap{
+					"search": {
+						OpenSearch: &OpenSearchCap{
+							ClusterPermissions: []string{"cluster:monitor/main"},
+							Indices: map[string]OpenSearchIndexPermissions{
+								"logs-*": {Permissions: []string{"readonly"}},
+							},
+						},
+					},
+				},
+			},
+			{
+				Backends: map[string]BackendCap{
+					"search": {
+						OpenSearch: &OpenSearchCap{
+							Indices: map[string]OpenSearchIndexPermissions{
+								"logs-*": {AllowedActions: []string{"indices:data/read/search"}, FLS: []string{"message"}},
+							},
+							Tenants: map[string]OpenSearchTenantPermissions{
+								"global_tenant": {AllowedActions: []string{"kibana_all_read"}},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	perms := OpenSearchPermissions(result, "search")
+	if perms == nil {
+		t.Fatal("expected permissions")
+	}
+	if !testContainsString(perms.ClusterPermissions, "cluster:monitor/main") {
+		t.Fatalf("cluster permissions = %v", perms.ClusterPermissions)
+	}
+	logs := perms.Indices["logs-*"]
+	if !testContainsString(logs.Permissions, "readonly") || !testContainsString(logs.AllowedActions, "indices:data/read/search") {
+		t.Fatalf("logs permissions = %+v", logs)
+	}
+	if !testContainsString(logs.FLS, "message") {
+		t.Fatalf("logs fls = %v", logs.FLS)
+	}
+	if !testContainsString(perms.Tenants["global_tenant"].AllowedActions, "kibana_all_read") {
+		t.Fatalf("tenant permissions = %+v", perms.Tenants)
+	}
+}
+
 func TestMergeLimits_MostRestrictiveWins(t *testing.T) {
 	var m MergedLimits
 
@@ -539,4 +612,13 @@ func TestMergeRules_MultipleDBs(t *testing.T) {
 	if len(perms) != 3 {
 		t.Errorf("expected 3 total perms across all DBs, got %d: %v", len(perms), perms)
 	}
+}
+
+func testContainsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
