@@ -155,6 +155,57 @@ backend = "10.0.1.5:3306"
 # listen = ":27019"
 # advertise = "waypoint-db:27019"
 
+# Example: OpenSearch REST/HTTP proxy with dynamic Security plugin provisioning.
+# Waypoint strips client Authorization, injects backend Basic auth, and rewrites
+# /_nodes HTTP publish addresses to the advertised Waypoint endpoint.
+# [[listeners]]
+# name = "search-prod"
+# listen = ":9200"
+# mode = "opensearch"
+# backend = "opensearch.internal:9200"
+# backend_via_tailscale = true
+# tls = true                 # use HTTPS to OpenSearch backends
+# tls_mode = "require"       # off | optional | require for clients
+# use_tailscale_tls = true   # set false to use only cert_file/key_file
+# cert_file = "/etc/waypoint/search.crt" # optional custom-domain cert
+# key_file = "/etc/waypoint/search.key"
+# advertise = "waypoint-search:9200"
+#
+# [listeners.opensearch]
+# admin_user = "waypoint_admin"
+# admin_password = "${OPENSEARCH_ADMIN_PASSWORD}"
+# user_prefix = "wp_os_"
+# user_ttl = "24h"
+# service_name = "opensearch-prod"
+#
+# [listeners.opensearch.provision]
+# mode = "database" # default: create/update Security plugin roles and users
+#
+# For managed clusters or locked-down Security API deployments, pre-create
+# backend users and select them by normalized expanded OpenSearch grant set:
+# [listeners.opensearch.provision]
+# mode = "static"
+#
+# [[listeners.opensearch.provision.static_users]]
+# name = "logs-readonly"
+# username = "os_logs_ro"
+# password = "${OPENSEARCH_LOGS_RO_PASSWORD}"
+# cluster_permissions = ["cluster_composite_ops_ro"]
+#
+# [[listeners.opensearch.provision.static_users.index_permissions]]
+# index_patterns = ["logs-*"]
+# allowed_actions = ["read"]
+#
+# [[listeners.opensearch.provision.static_users]]
+# name = "logs-readwrite"
+# username = "os_logs_rw"
+# password = "${OPENSEARCH_LOGS_RW_PASSWORD}"
+# cluster_permissions = ["cluster_composite_ops"]
+#
+# [[listeners.opensearch.provision.static_users.index_permissions]]
+# index_patterns = ["logs-*"]
+# allowed_actions = ["create_index", "read", "write"]
+
 # Example: backend reachable only via Tailscale (MagicDNS name or 100.x.y.z IP).
 # [[listeners]]
 # name = "ts-backend"

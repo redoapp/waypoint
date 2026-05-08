@@ -260,6 +260,50 @@ func MongoDatabasePermissions(result *AuthResult, backend string, database strin
 	}
 }
 
+// OpenSearchPermissions returns the merged OpenSearch permissions from the
+// matched rules for the given backend. Returns nil if no rules grant
+// OpenSearch access.
+func OpenSearchPermissions(result *AuthResult, backend string) *OpenSearchCap {
+	var cluster []string
+	indices := make(map[string]OpenSearchIndexPermissions)
+	tenants := make(map[string]OpenSearchTenantPermissions)
+	found := false
+
+	for _, r := range result.MatchedRules {
+		bc, ok := r.Backends[backend]
+		if !ok || bc.OpenSearch == nil {
+			continue
+		}
+		found = true
+		cluster = append(cluster, bc.OpenSearch.ClusterPermissions...)
+		for pattern, perms := range bc.OpenSearch.Indices {
+			existing := indices[pattern]
+			existing.Permissions = append(existing.Permissions, perms.Permissions...)
+			existing.AllowedActions = append(existing.AllowedActions, perms.AllowedActions...)
+			if existing.DLS == "" {
+				existing.DLS = perms.DLS
+			}
+			existing.FLS = append(existing.FLS, perms.FLS...)
+			existing.MaskedFields = append(existing.MaskedFields, perms.MaskedFields...)
+			indices[pattern] = existing
+		}
+		for pattern, perms := range bc.OpenSearch.Tenants {
+			existing := tenants[pattern]
+			existing.AllowedActions = append(existing.AllowedActions, perms.AllowedActions...)
+			tenants[pattern] = existing
+		}
+	}
+
+	if !found {
+		return nil
+	}
+	return &OpenSearchCap{
+		ClusterPermissions: cluster,
+		Indices:            indices,
+		Tenants:            tenants,
+	}
+}
+
 // mergeRules collects all permissions and picks the most restrictive limits.
 // backend is used to look up the BackendCap entry in each rule.
 func mergeRules(rules []CapRule, backend string) ([]string, MergedLimits) {
@@ -279,6 +323,16 @@ func mergeRules(rules []CapRule, backend string) ([]string, MergedLimits) {
 		if bc.Mongo != nil {
 			for _, db := range bc.Mongo.Databases {
 				perms = append(perms, db.Permissions...)
+			}
+		}
+		if bc.OpenSearch != nil {
+			perms = append(perms, bc.OpenSearch.ClusterPermissions...)
+			for _, index := range bc.OpenSearch.Indices {
+				perms = append(perms, index.Permissions...)
+				perms = append(perms, index.AllowedActions...)
+			}
+			for _, tenant := range bc.OpenSearch.Tenants {
+				perms = append(perms, tenant.AllowedActions...)
 			}
 		}
 		if r.Limits != nil {
