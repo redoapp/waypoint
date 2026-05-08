@@ -302,6 +302,9 @@ func RunServer(ctx context.Context, configPath string, logger *slog.Logger, leve
 		var mongoTopologyMap map[string]string
 		var mongoClientTLSMode config.TLSMode
 		var mongoClientTLSConfig *tls.Config
+		var openSearchProvisioner *provision.OpenSearchProvisioner
+		var openSearchClientTLSMode config.TLSMode
+		var openSearchClientTLSConfig *tls.Config
 		if mode == "mongodb" {
 			if lCfg.MongoDB == nil {
 				return fmt.Errorf("mongodb listener %s requires [listeners.mongodb] config", lCfg.Name)
@@ -361,6 +364,35 @@ func RunServer(ctx context.Context, configPath string, logger *slog.Logger, leve
 			}
 
 			mongoClientTLSMode, mongoClientTLSConfig, err = resolveMongoClientTLS(lCfg, srv, lc, logger.With("listener", lCfg.Name))
+			if err != nil {
+				return fmt.Errorf("configure client TLS for listener %s: %w", lCfg.Name, err)
+			}
+		}
+		if mode == "opensearch" {
+			if lCfg.OpenSearch == nil {
+				return fmt.Errorf("opensearch listener %s requires [listeners.opensearch] config", lCfg.Name)
+			}
+
+			openSearchPeerService := lCfg.Name
+			if lCfg.OpenSearch.ServiceName != "" {
+				openSearchPeerService = lCfg.OpenSearch.ServiceName
+			}
+
+			if lCfg.OpenSearch.EffectiveProvisionMode() == config.OpenSearchProvisionDatabase {
+				openSearchProvisioner = provision.NewOpenSearchProvisioner(
+					lCfg.OpenSearch.AdminUser,
+					lCfg.OpenSearch.AdminPassword,
+					lCfg.Backend,
+					lCfg.OpenSearch.UserPrefix,
+					openSearchPeerService,
+					lCfg.BackendTLS,
+					store,
+					logger.With("component", "opensearch-provisioner", "listener", lCfg.Name),
+					dialer,
+				)
+			}
+
+			openSearchClientTLSMode, openSearchClientTLSConfig, err = resolveOpenSearchClientTLS(lCfg, srv, lc, logger.With("listener", lCfg.Name))
 			if err != nil {
 				return fmt.Errorf("configure client TLS for listener %s: %w", lCfg.Name, err)
 			}
@@ -488,6 +520,32 @@ func RunServer(ctx context.Context, configPath string, logger *slog.Logger, leve
 					BytesWritten:  &bytesWritten,
 				}
 				go acceptLoop(ctx, &wg, ln, mp.HandleConn, logger.With("listener", lCfg.Name))
+
+			case "opensearch":
+				proxyAddr, err := advertisedAddr(lCfg, be, cfg.Tailscale.Hostname, serviceFQDN)
+				if err != nil {
+					return fmt.Errorf("opensearch listener %s advertise address: %w", lCfg.Name, err)
+				}
+
+				osp := &proxy.OpenSearchProxy{
+					Backend:          be.Backend,
+					Name:             lCfg.Name,
+					AdvertiseAddr:    proxyAddr,
+					Auth:             &proxy.TailscaleAuthorizer{LC: lc, Logger: logger.With("listener", lCfg.Name)},
+					Tracker:          tracker,
+					Provisioner:      openSearchProvisioner,
+					Metrics:          m,
+					OpenSearchConfig: lCfg.OpenSearch,
+					ClientTLSMode:    openSearchClientTLSMode,
+					ClientTLS:        openSearchClientTLSConfig,
+					BackendTLS:       lCfg.BackendTLS,
+					RevalInterval:    revalInterval,
+					Logger:           logger.With("listener", lCfg.Name),
+					Dialer:           dialer,
+					BytesRead:        &bytesRead,
+					BytesWritten:     &bytesWritten,
+				}
+				go acceptLoop(ctx, &wg, ln, osp.HandleConn, logger.With("listener", lCfg.Name))
 			}
 
 			m.SystemListeners.Add(ctx, 1, m.Attrs("waypoint.system.listeners"))
@@ -514,6 +572,10 @@ func resolvePostgresClientTLS(lCfg config.ListenerConfig, srv *tsnet.Server, lc 
 }
 
 func resolveMongoClientTLS(lCfg config.ListenerConfig, srv *tsnet.Server, lc *local.Client, logger *slog.Logger) (config.TLSMode, *tls.Config, error) {
+	return resolveClientTLS(lCfg, srv, lc, logger)
+}
+
+func resolveOpenSearchClientTLS(lCfg config.ListenerConfig, srv *tsnet.Server, lc *local.Client, logger *slog.Logger) (config.TLSMode, *tls.Config, error) {
 	return resolveClientTLS(lCfg, srv, lc, logger)
 }
 

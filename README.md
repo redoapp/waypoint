@@ -9,6 +9,7 @@ Waypoint is a Tailscale-aware database proxy that authenticates connections usin
 - **Tailscale-native auth** — identifies callers via `tsnet` + `WhoIs`, checks `redo.com/cap/waypoint` capability grants from your ACL policy
 - **Postgres mode** — intercepts the PG wire protocol, dynamically provisions per-user database roles with scoped `GRANT` permissions, and cleans up expired users
 - **MongoDB mode** — provisions scoped MongoDB users or uses static backend users, and rewrites replica-set topology so clients stay on the proxy, including TLS-terminated clients
+- **OpenSearch mode** — proxies HTTP(S) keep-alive sessions, provisions Security plugin internal users/roles or selects static backend users, and rewrites node discovery responses so sniffing clients stay on Waypoint
 - **TCP mode** — transparent L4 proxy for any TCP backend (MySQL, Redis, etc.)
 - **Connection tracking** — per-user limits on concurrent connections, bytes transferred, connection duration, and bandwidth budgets, all stored in Redis/Valkey
 - **Mid-session revalidation** — periodically re-checks Tailscale identity during long-lived connections
@@ -170,6 +171,73 @@ authorized client requests a grant set with no matching static user, Waypoint
 returns a MongoDB authentication error to that client and does not connect to
 the backend.
 
+OpenSearch listeners proxy the REST/HTTP(S) API. Waypoint authorizes the
+Tailscale identity once per client TCP/TLS connection, acquires one Redis
+connection slot, resolves one backend credential, and then forwards all
+keep-alive HTTP requests on that connection with backend Basic auth injected.
+Client `Authorization` headers are stripped before forwarding.
+
+```toml
+[[listeners]]
+name = "search-prod"
+listen = ":9200"
+mode = "opensearch"
+backend = "opensearch.internal:9200"
+backend_via_tailscale = true
+tls = true                              # use HTTPS to the OpenSearch backend
+tls_mode = "require"                    # off | optional | require for clients
+use_tailscale_tls = true
+# cert_file = "/etc/waypoint/search.crt"
+# key_file = "/etc/waypoint/search.key"
+advertise = "waypoint-search:9200"      # used in /_nodes response rewrites
+
+[listeners.opensearch]
+admin_user = "waypoint_admin"
+admin_password = "${OPENSEARCH_ADMIN_PASSWORD}"
+user_prefix = "wp_os_"
+user_ttl = "24h"
+
+[listeners.opensearch.provision]
+mode = "database"                       # default: create/update Security users
+```
+
+Dynamic OpenSearch provisioning requires the Security plugin REST API to be
+enabled and the admin credential to be allowed to `PUT` roles and internal
+users under `/_plugins/_security/api/roles/{role}` and
+`/_plugins/_security/api/internalusers/{user}`.
+
+For managed clusters or locked-down Security API deployments, use pre-created
+static backend users. Static matching uses the normalized expanded grant set:
+
+```toml
+[listeners.opensearch.provision]
+mode = "static"
+
+[[listeners.opensearch.provision.static_users]]
+name = "logs-readonly"
+username = "os_logs_ro"
+password = "${OPENSEARCH_LOGS_RO_PASSWORD}"
+cluster_permissions = ["cluster_composite_ops_ro"]
+
+[[listeners.opensearch.provision.static_users.index_permissions]]
+index_patterns = ["logs-*"]
+allowed_actions = ["read"]
+
+[[listeners.opensearch.provision.static_users]]
+name = "logs-readwrite"
+username = "os_logs_rw"
+password = "${OPENSEARCH_LOGS_RW_PASSWORD}"
+cluster_permissions = ["cluster_composite_ops"]
+
+[[listeners.opensearch.provision.static_users.index_permissions]]
+index_patterns = ["logs-*"]
+allowed_actions = ["create_index", "read", "write"]
+```
+
+Waypoint rewrites `http.publish_address` in OpenSearch node-info responses
+such as `/_nodes` and `/_nodes/http` to the advertised Waypoint endpoint. This
+keeps sniffing clients from bypassing the proxy.
+
 ### Tailscale ACL grants
 
 Access is controlled by Tailscale ACL capability grants. The `permissions` field accepts named presets:
@@ -246,6 +314,49 @@ For advanced use cases (specific tables, `REVOKE`, `ALTER DEFAULT PRIVILEGES`), 
 ```
 
 The `sql` field can be disabled server-side with `allow_raw_sql = false` in the `[provisioning]` config section.
+
+OpenSearch ACL grants are by index pattern, with optional cluster and tenant
+permissions. Presets expand to OpenSearch Security action groups:
+
+| Preset | Cluster permissions | Index allowed actions |
+|--------|---------------------|-----------------------|
+| `readonly` | `cluster_composite_ops_ro` | `read` |
+| `readwrite` | `cluster_composite_ops` | `read`, `write`, `create_index` |
+| `admin` | `cluster_all` | `indices_all` |
+
+```json
+{
+  "grants": [{
+    "src": ["group:search-users"],
+    "dst": ["tag:waypoint"],
+    "cap": {
+      "redo.com/cap/waypoint": [{
+        "backends": {
+          "search-prod": {
+            "opensearch": {
+              "cluster_permissions": ["cluster:monitor/main"],
+              "indices": {
+                "logs-*": { "permissions": ["readonly"] },
+                "scratch-*": {
+                  "permissions": ["readwrite"],
+                  "allowed_actions": ["indices:admin/aliases/get"],
+                  "fls": ["timestamp", "message"],
+                  "masked_fields": ["secret"]
+                }
+              },
+              "tenants": {
+                "global_tenant": {
+                  "allowed_actions": ["kibana_all_read"]
+                }
+              }
+            }
+          }
+        }
+      }]
+    }
+  }]
+}
+```
 
 ## Observability
 
