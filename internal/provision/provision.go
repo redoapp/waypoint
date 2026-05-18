@@ -241,77 +241,12 @@ func (p *Provisioner) ensureUser(ctx context.Context, loginName, nodeName, datab
 	}
 	roleSpan.End()
 
-	// Reconcile grants: reset privileges first, then apply the current grants.
 	_, grantSpan := tracer.Start(ctx, "waypoint.provision.grant")
-	if err := p.resetRolePrivileges(ctx, tx, dialect, database, pgUser, targetDatabaseExists); err != nil {
+	if err := p.reconcileUserGroups(ctx, tx, dialect, pgUser, database, targetDatabaseExists, perms); err != nil {
 		grantSpan.End()
 		span.RecordError(err)
-		return "", "", fmt.Errorf("reset privileges: %w", err)
+		return "", "", err
 	}
-	if targetDatabaseExists {
-		_, err = tx.Exec(ctx, fmt.Sprintf(
-			"GRANT CONNECT ON DATABASE %s TO %s",
-			pgx.Identifier{database}.Sanitize(),
-			pgx.Identifier{pgUser}.Sanitize(),
-		))
-		if err != nil {
-			grantSpan.End()
-			span.RecordError(err)
-			return "", "", fmt.Errorf("grant connect: %w", err)
-		}
-	} else {
-		p.logger.WarnContext(ctx, "grant connect skipped because database does not exist",
-			"role", pgUser,
-			"database", database,
-		)
-	}
-
-	// Apply permission presets and raw SQL statements.
-	if perms != nil {
-		sanitizedRole := pgx.Identifier{pgUser}.Sanitize()
-
-		// Expand preset names into GRANT fragments.
-		if len(perms.Permissions) > 0 {
-			fragments, err := ExpandPresets(perms.Permissions, perms.Schemas)
-			if err != nil {
-				grantSpan.End()
-				return "", "", fmt.Errorf("invalid permissions: %w", err)
-			}
-			for _, frag := range fragments {
-				stmt := fmt.Sprintf("GRANT %s TO %s", frag, sanitizedRole)
-				if _, err := tx.Exec(ctx, stmt); err != nil {
-					grantSpan.End()
-					span.RecordError(err)
-					return "", "", fmt.Errorf("grant %q: %w", frag, err)
-				}
-			}
-		}
-
-		// Apply raw SQL statements (if allowed by config).
-		if len(perms.SQL) > 0 {
-			if !p.allowRawSQL {
-				grantSpan.End()
-				return "", "", fmt.Errorf("raw SQL statements are disabled by server configuration; use presets instead")
-			}
-			if err := validateSQL(perms.SQL); err != nil {
-				grantSpan.End()
-				return "", "", fmt.Errorf("invalid sql in permissions: %w", err)
-			}
-			for _, raw := range perms.SQL {
-				resolved, err := renderSQL(raw, SQLTemplateData{Role: sanitizedRole})
-				if err != nil {
-					grantSpan.End()
-					return "", "", fmt.Errorf("invalid sql template %q: %w", raw, err)
-				}
-				if _, err := tx.Exec(ctx, resolved); err != nil {
-					grantSpan.End()
-					span.RecordError(err)
-					return "", "", fmt.Errorf("sql statement %q: %w", raw, err)
-				}
-			}
-		}
-	}
-
 	grantSpan.End()
 
 	if err := tx.Commit(ctx); err != nil {
@@ -439,32 +374,9 @@ func (p *Provisioner) ReconcileRole(ctx context.Context, pgUser, database string
 		return fmt.Errorf("check database: %w", err)
 	}
 
-	if err := p.resetRolePrivileges(ctx, tx, dialect, database, pgUser, targetDatabaseExists); err != nil {
+	if err := p.reconcileUserGroups(ctx, tx, dialect, pgUser, database, targetDatabaseExists, perms); err != nil {
 		span.RecordError(err)
-		return fmt.Errorf("reset privileges: %w", err)
-	}
-
-	if perms != nil && targetDatabaseExists {
-		if _, err := tx.Exec(ctx, fmt.Sprintf(
-			"GRANT CONNECT ON DATABASE %s TO %s",
-			pgx.Identifier{database}.Sanitize(),
-			pgx.Identifier{pgUser}.Sanitize(),
-		)); err != nil {
-			span.RecordError(err)
-			return fmt.Errorf("grant connect: %w", err)
-		}
-	} else if perms != nil {
-		p.logger.WarnContext(ctx, "grant connect skipped because database does not exist",
-			"role", pgUser,
-			"database", database,
-		)
-	}
-
-	if perms != nil {
-		if err := p.applyRolePermissions(ctx, tx, pgUser, perms); err != nil {
-			span.RecordError(err)
-			return err
-		}
+		return err
 	}
 
 	if err := tx.Commit(ctx); err != nil {
@@ -477,123 +389,128 @@ func (p *Provisioner) ReconcileRole(ctx context.Context, pgUser, database string
 	return nil
 }
 
-func (p *Provisioner) applyRolePermissions(ctx context.Context, tx pgx.Tx, pgUser string, perms *auth.DBPermissions) error {
-	if perms == nil {
-		return nil
-	}
-	sanitizedRole := pgx.Identifier{pgUser}.Sanitize()
+// reconcileUserGroups ensures the user role's group memberships match
+// what the permission set requires. The expensive object-level GRANTs
+// live on shared group roles (bootstrapped lazily); per-user changes
+// are restricted to cheap membership writes that don't lock any
+// schema descriptor.
+func (p *Provisioner) reconcileUserGroups(ctx context.Context, tx pgx.Tx, dialect Dialect, pgUser, database string, targetDatabaseExists bool, perms *auth.DBPermissions) error {
+	sanitizedUser := pgx.Identifier{pgUser}.Sanitize()
 
-	if len(perms.Permissions) > 0 {
-		fragments, err := ExpandPresets(perms.Permissions, perms.Schemas)
-		if err != nil {
-			return fmt.Errorf("invalid permissions: %w", err)
-		}
-		for _, frag := range fragments {
-			stmt := fmt.Sprintf("GRANT %s TO %s", frag, sanitizedRole)
-			if _, err := tx.Exec(ctx, stmt); err != nil {
-				return fmt.Errorf("grant %q: %w", frag, err)
+	if perms != nil {
+		if targetDatabaseExists {
+			if _, err := tx.Exec(ctx, fmt.Sprintf(
+				"GRANT CONNECT ON DATABASE %s TO %s",
+				pgx.Identifier{database}.Sanitize(),
+				sanitizedUser,
+			)); err != nil {
+				return fmt.Errorf("grant connect: %w", err)
 			}
+		} else {
+			p.logger.WarnContext(ctx, "grant connect skipped because database does not exist",
+				"role", pgUser,
+				"database", database,
+			)
 		}
 	}
 
-	if len(perms.SQL) > 0 {
-		if !p.allowRawSQL {
-			return fmt.Errorf("raw SQL statements are disabled by server configuration; use presets instead")
-		}
-		if err := validateSQL(perms.SQL); err != nil {
-			return fmt.Errorf("invalid sql in permissions: %w", err)
-		}
-		for _, raw := range perms.SQL {
-			resolved, err := renderSQL(raw, SQLTemplateData{Role: sanitizedRole})
-			if err != nil {
-				return fmt.Errorf("invalid sql template %q: %w", raw, err)
-			}
-			if _, err := tx.Exec(ctx, resolved); err != nil {
-				return fmt.Errorf("sql statement %q: %w", raw, err)
-			}
-		}
-	}
-
-	return nil
-}
-
-func (p *Provisioner) resetRolePrivileges(ctx context.Context, tx pgx.Tx, dialect Dialect, database, role string, targetDatabaseExists bool) error {
-	sanitizedRole := pgx.Identifier{role}.Sanitize()
-
-	if _, err := tx.Exec(ctx, fmt.Sprintf("REASSIGN OWNED BY %s TO CURRENT_USER", sanitizedRole)); err != nil {
-		return fmt.Errorf("reassign owned objects: %w", err)
-	}
-
-	if targetDatabaseExists {
-		if _, err := tx.Exec(ctx, fmt.Sprintf(
-			"REVOKE ALL PRIVILEGES ON DATABASE %s FROM %s",
-			pgx.Identifier{database}.Sanitize(),
-			sanitizedRole,
-		)); err != nil {
-			return fmt.Errorf("revoke database privileges: %w", err)
-		}
-	} else {
-		p.logger.WarnContext(ctx, "revoke database privileges skipped because database does not exist",
-			"role", role,
-			"database", database,
-		)
-	}
-
-	schemas, err := grantSchemas(ctx, tx)
+	desired, err := p.bootstrapGroupsForPerms(ctx, tx, dialect, perms, database)
 	if err != nil {
 		return err
 	}
-	for _, schema := range schemas {
-		sanitizedSchema := pgx.Identifier{schema}.Sanitize()
-		statements := []string{
-			fmt.Sprintf("REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA %s FROM %s", sanitizedSchema, sanitizedRole),
-			fmt.Sprintf("REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA %s FROM %s", sanitizedSchema, sanitizedRole),
-		}
-		if dialect == DialectPostgres {
-			statements = append(statements,
-				fmt.Sprintf("REVOKE ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA %s FROM %s", sanitizedSchema, sanitizedRole),
-				fmt.Sprintf("REVOKE ALL PRIVILEGES ON ALL PROCEDURES IN SCHEMA %s FROM %s", sanitizedSchema, sanitizedRole),
-			)
-		}
-		statements = append(statements,
-			fmt.Sprintf("REVOKE ALL PRIVILEGES ON SCHEMA %s FROM %s", sanitizedSchema, sanitizedRole),
-		)
 
-		for _, stmt := range statements {
-			if _, err := tx.Exec(ctx, stmt); err != nil {
-				return fmt.Errorf("%s: %w", stmt, err)
-			}
+	current, err := currentGroupMemberships(ctx, tx, pgUser)
+	if err != nil {
+		return err
+	}
+
+	desiredSet := make(map[string]struct{}, len(desired))
+	for _, g := range desired {
+		desiredSet[g] = struct{}{}
+	}
+	currentSet := make(map[string]struct{}, len(current))
+	for _, g := range current {
+		currentSet[g] = struct{}{}
+	}
+
+	// When any membership is being revoked the user is effectively
+	// being downgraded, so reassign any objects they currently own
+	// back to the admin role. Without this, ownership-derived
+	// privileges (e.g. INSERT into an object the user created while
+	// holding a higher preset) would survive the downgrade. REASSIGN
+	// is the only descriptor-touching operation kept in the hot path
+	// and runs only on actual downgrades, not on steady-state
+	// reconnects.
+	revoking := false
+	for _, g := range current {
+		if _, ok := desiredSet[g]; !ok {
+			revoking = true
+			break
+		}
+	}
+	if revoking {
+		if _, err := tx.Exec(ctx, fmt.Sprintf("REASSIGN OWNED BY %s TO CURRENT_USER", sanitizedUser)); err != nil {
+			return fmt.Errorf("reassign owned objects: %w", err)
 		}
 	}
 
+	for _, g := range desired {
+		if _, ok := currentSet[g]; ok {
+			continue
+		}
+		if _, err := tx.Exec(ctx, fmt.Sprintf("GRANT %s TO %s", pgx.Identifier{g}.Sanitize(), sanitizedUser)); err != nil {
+			return fmt.Errorf("grant group %q to %q: %w", g, pgUser, err)
+		}
+	}
+	for _, g := range current {
+		if _, ok := desiredSet[g]; ok {
+			continue
+		}
+		if _, err := tx.Exec(ctx, fmt.Sprintf("REVOKE %s FROM %s", pgx.Identifier{g}.Sanitize(), sanitizedUser)); err != nil {
+			return fmt.Errorf("revoke group %q from %q: %w", g, pgUser, err)
+		}
+	}
 	return nil
 }
 
-func grantSchemas(ctx context.Context, tx pgx.Tx) ([]string, error) {
-	rows, err := tx.Query(ctx, `
-SELECT schema_name
-FROM information_schema.schemata
-WHERE schema_name <> 'information_schema'
-  AND schema_name <> 'crdb_internal'
-  AND schema_name NOT LIKE 'pg_%'
-ORDER BY schema_name`)
-	if err != nil {
-		return nil, fmt.Errorf("list schemas: %w", err)
+// bootstrapGroupsForPerms ensures every group role the permission set
+// references exists and has its preset / SQL fragments applied,
+// returning the deterministic group names so the caller can diff
+// against current memberships.
+func (p *Provisioner) bootstrapGroupsForPerms(ctx context.Context, tx pgx.Tx, dialect Dialect, perms *auth.DBPermissions, database string) ([]string, error) {
+	if perms == nil {
+		return nil, nil
 	}
-	defer rows.Close()
-
-	var schemas []string
-	for rows.Next() {
-		var schema string
-		if err := rows.Scan(&schema); err != nil {
-			return nil, fmt.Errorf("scan schema: %w", err)
+	if usesCompositePath(perms) {
+		name, err := p.ensureCompositeGroup(ctx, tx, dialect, perms, database)
+		if err != nil {
+			return nil, err
 		}
-		schemas = append(schemas, schema)
+		return []string{name}, nil
 	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("list schemas: %w", err)
+	if len(perms.Permissions) == 0 {
+		return nil, nil
 	}
-	return schemas, nil
+	schemas := perms.Schemas
+	if len(schemas) == 0 {
+		schemas = []string{"public"}
+	}
+	seen := make(map[string]struct{})
+	var names []string
+	for _, preset := range perms.Permissions {
+		for _, schema := range schemas {
+			name, err := p.ensurePresetGroup(ctx, tx, dialect, preset, schema, database)
+			if err != nil {
+				return nil, err
+			}
+			if _, ok := seen[name]; ok {
+				continue
+			}
+			seen[name] = struct{}{}
+			names = append(names, name)
+		}
+	}
+	return names, nil
 }
 
 func databaseExists(ctx context.Context, tx pgx.Tx, database string) (bool, error) {

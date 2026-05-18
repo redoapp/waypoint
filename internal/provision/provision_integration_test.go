@@ -533,5 +533,347 @@ func TestIntegration_EnsureUser_SQLStatements(t *testing.T) {
 	}
 }
 
+// memberOfPresetGroups returns the wp_grp_ memberships of pgUser, used by
+// integration tests that assert on group-membership reconciliation.
+func memberOfPresetGroups(t *testing.T, db dbBackend, pgUser string) []string {
+	t.Helper()
+	conn := adminConnFor(t, db)
+	rows, err := conn.Query(context.Background(), `
+SELECT r.rolname
+FROM pg_catalog.pg_auth_members m
+JOIN pg_catalog.pg_roles r ON r.oid = m.roleid
+JOIN pg_catalog.pg_roles u ON u.oid = m.member
+WHERE u.rolname = $1
+ORDER BY r.rolname`, pgUser)
+	if err != nil {
+		t.Fatalf("query memberships: %v", err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		if strings.HasPrefix(name, "wp_grp_") {
+			out = append(out, name)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows err: %v", err)
+	}
+	return out
+}
+
+func TestIntegration_EnsureUser_GroupMembershipsForPureReadonly(t *testing.T) {
+	for _, db := range testBackends(t) {
+		t.Run(db.name, func(t *testing.T) {
+			p := setupProvisionerFor(t, db)
+			ctx := context.Background()
+
+			perms := &auth.DBPermissions{Permissions: []string{"readonly"}}
+			pgUser, _, err := p.EnsureUser(ctx, "groups-ro@example.com", "ro-node", "waypoint_test", perms)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { cleanupRoleFor(t, db, pgUser) })
+
+			got := memberOfPresetGroups(t, db, pgUser)
+			if len(got) != 1 || got[0] != "wp_grp_readonly_public_waypoint_test" {
+				t.Fatalf("expected single membership wp_grp_readonly_public_waypoint_test, got %v", got)
+			}
+		})
+	}
+}
+
+func TestIntegration_EnsureUser_GroupMembershipsAreStableAcrossReconnects(t *testing.T) {
+	for _, db := range testBackends(t) {
+		t.Run(db.name, func(t *testing.T) {
+			p := setupProvisionerFor(t, db)
+			ctx := context.Background()
+
+			perms := &auth.DBPermissions{Permissions: []string{"readwrite"}}
+			pgUser, _, err := p.EnsureUser(ctx, "stable@example.com", "stable-node", "waypoint_test", perms)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { cleanupRoleFor(t, db, pgUser) })
+
+			before := memberOfPresetGroups(t, db, pgUser)
+
+			// Second EnsureUser with identical perms should be a no-op for
+			// membership state — the steady-state path that needs to be cheap.
+			if _, _, err := p.EnsureUser(ctx, "stable@example.com", "stable-node", "waypoint_test", perms); err != nil {
+				t.Fatalf("second EnsureUser: %v", err)
+			}
+
+			after := memberOfPresetGroups(t, db, pgUser)
+			if len(before) != len(after) {
+				t.Fatalf("membership count changed: before=%v after=%v", before, after)
+			}
+			for i := range before {
+				if before[i] != after[i] {
+					t.Fatalf("membership changed: before=%v after=%v", before, after)
+				}
+			}
+		})
+	}
+}
+
+func TestIntegration_EnsureUser_GroupMembershipsTrackPresetChange(t *testing.T) {
+	for _, db := range testBackends(t) {
+		t.Run(db.name, func(t *testing.T) {
+			p := setupProvisionerFor(t, db)
+			ctx := context.Background()
+
+			pgUser, _, err := p.EnsureUser(ctx, "diff@example.com", "diff-node", "waypoint_test",
+				&auth.DBPermissions{Permissions: []string{"readwrite"}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { cleanupRoleFor(t, db, pgUser) })
+
+			before := memberOfPresetGroups(t, db, pgUser)
+			if len(before) != 1 || before[0] != "wp_grp_readwrite_public_waypoint_test" {
+				t.Fatalf("expected wp_grp_readwrite_public_waypoint_test, got %v", before)
+			}
+
+			if _, _, err := p.EnsureUser(ctx, "diff@example.com", "diff-node", "waypoint_test",
+				&auth.DBPermissions{Permissions: []string{"readonly"}}); err != nil {
+				t.Fatal(err)
+			}
+
+			after := memberOfPresetGroups(t, db, pgUser)
+			if len(after) != 1 || after[0] != "wp_grp_readonly_public_waypoint_test" {
+				t.Fatalf("expected single readonly membership, got %v", after)
+			}
+		})
+	}
+}
+
+func TestIntegration_EnsureUser_SQLFragmentUsesCompositeGroup(t *testing.T) {
+	for _, db := range testBackends(t) {
+		t.Run(db.name, func(t *testing.T) {
+			p := setupProvisionerFor(t, db)
+			ctx := context.Background()
+
+			conn := adminConnFor(t, db)
+			if _, err := conn.Exec(ctx, "CREATE TABLE IF NOT EXISTS public.composite_target (id int)"); err != nil {
+				t.Fatalf("create test table: %v", err)
+			}
+			t.Cleanup(func() {
+				c := adminConnFor(t, db)
+				c.Exec(context.Background(), "DROP TABLE IF EXISTS public.composite_target")
+			})
+
+			perms := &auth.DBPermissions{
+				SQL: []string{"GRANT SELECT ON public.composite_target TO {{.Role}}"},
+			}
+			pgUser, _, err := p.EnsureUser(ctx, "composite@example.com", "composite-node", "waypoint_test", perms)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { cleanupRoleFor(t, db, pgUser) })
+
+			groups := memberOfPresetGroups(t, db, pgUser)
+			if len(groups) != 1 {
+				t.Fatalf("expected exactly 1 group membership, got %v", groups)
+			}
+			if !strings.HasPrefix(groups[0], "wp_grp_perms_") {
+				t.Fatalf("expected composite group prefix, got %q", groups[0])
+			}
+		})
+	}
+}
+
+func TestIntegration_EnsureUser_SwitchPurePresetToComposite(t *testing.T) {
+	for _, db := range testBackends(t) {
+		t.Run(db.name, func(t *testing.T) {
+			p := setupProvisionerFor(t, db)
+			ctx := context.Background()
+
+			conn := adminConnFor(t, db)
+			if _, err := conn.Exec(ctx, "CREATE TABLE IF NOT EXISTS public.switch_target (id int)"); err != nil {
+				t.Fatalf("create test table: %v", err)
+			}
+			t.Cleanup(func() {
+				c := adminConnFor(t, db)
+				c.Exec(context.Background(), "DROP TABLE IF EXISTS public.switch_target")
+			})
+
+			pgUser, _, err := p.EnsureUser(ctx, "switch@example.com", "switch-node", "waypoint_test",
+				&auth.DBPermissions{Permissions: []string{"readonly"}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { cleanupRoleFor(t, db, pgUser) })
+
+			before := memberOfPresetGroups(t, db, pgUser)
+			if len(before) != 1 || !strings.HasPrefix(before[0], "wp_grp_readonly_") {
+				t.Fatalf("expected initial readonly group, got %v", before)
+			}
+
+			if _, _, err := p.EnsureUser(ctx, "switch@example.com", "switch-node", "waypoint_test",
+				&auth.DBPermissions{
+					Permissions: []string{"readonly"},
+					SQL:         []string{"GRANT SELECT ON public.switch_target TO {{.Role}}"},
+				}); err != nil {
+				t.Fatal(err)
+			}
+
+			after := memberOfPresetGroups(t, db, pgUser)
+			if len(after) != 1 || !strings.HasPrefix(after[0], "wp_grp_perms_") {
+				t.Fatalf("expected composite group after switch, got %v", after)
+			}
+		})
+	}
+}
+
+func TestIntegration_EnsureUser_AdditivePresetChangePreservesOwnership(t *testing.T) {
+	for _, db := range testBackends(t) {
+		t.Run(db.name, func(t *testing.T) {
+			p := setupProvisionerFor(t, db)
+			ctx := context.Background()
+
+			pgUser, _, err := p.EnsureUser(ctx, "additive@example.com", "additive-node", "waypoint_test",
+				&auth.DBPermissions{Permissions: []string{"readonly"}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { cleanupRoleFor(t, db, pgUser) })
+
+			// Make the user own a table without going through any waypoint
+			// codepath, so the ownership can't be attributed to whatever
+			// presets are active.
+			conn := adminConnFor(t, db)
+			sanitized := pgx.Identifier{pgUser}.Sanitize()
+			if _, err := conn.Exec(ctx, "CREATE TABLE public.additive_owned_test (id int)"); err != nil {
+				t.Fatalf("create table: %v", err)
+			}
+			t.Cleanup(func() {
+				c := adminConnFor(t, db)
+				c.Exec(context.Background(), "DROP TABLE IF EXISTS public.additive_owned_test")
+			})
+			if _, err := conn.Exec(ctx, fmt.Sprintf("ALTER TABLE public.additive_owned_test OWNER TO %s", sanitized)); err != nil {
+				t.Fatalf("alter owner: %v", err)
+			}
+
+			// Additive change: readonly → readonly + readwrite. No
+			// memberships are being revoked, so REASSIGN OWNED BY must
+			// not fire — the user must still own the table afterwards.
+			if _, _, err := p.EnsureUser(ctx, "additive@example.com", "additive-node", "waypoint_test",
+				&auth.DBPermissions{Permissions: []string{"readonly", "readwrite"}}); err != nil {
+				t.Fatalf("additive reconcile: %v", err)
+			}
+
+			var owner string
+			if err := adminConnFor(t, db).QueryRow(ctx, `
+SELECT r.rolname
+FROM pg_catalog.pg_class c
+JOIN pg_catalog.pg_roles r ON r.oid = c.relowner
+WHERE c.relname = 'additive_owned_test'`).Scan(&owner); err != nil {
+				t.Fatalf("read owner: %v", err)
+			}
+			if owner != pgUser {
+				t.Fatalf("ownership must survive an additive perm change; got owner=%q want %q", owner, pgUser)
+			}
+		})
+	}
+}
+
+func TestIntegration_EnsureUser_CompositeRevokeCarvesHole(t *testing.T) {
+	for _, db := range testBackends(t) {
+		t.Run(db.name, func(t *testing.T) {
+			p := setupProvisionerFor(t, db)
+			ctx := context.Background()
+
+			conn := adminConnFor(t, db)
+			for _, stmt := range []string{
+				"CREATE TABLE IF NOT EXISTS public.composite_open (id int)",
+				"CREATE TABLE IF NOT EXISTS public.composite_locked (id int)",
+			} {
+				if _, err := conn.Exec(ctx, stmt); err != nil {
+					t.Fatalf("setup: %v", err)
+				}
+			}
+			t.Cleanup(func() {
+				c := adminConnFor(t, db)
+				c.Exec(context.Background(), "DROP TABLE IF EXISTS public.composite_open")
+				c.Exec(context.Background(), "DROP TABLE IF EXISTS public.composite_locked")
+			})
+
+			perms := &auth.DBPermissions{
+				Permissions: []string{"readwrite"},
+				SQL: []string{
+					"REVOKE INSERT ON public.composite_locked FROM {{.Role}}",
+				},
+			}
+			pgUser, password, err := p.EnsureUser(ctx, "hole@example.com", "hole-node", "waypoint_test", perms)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { cleanupRoleFor(t, db, pgUser) })
+
+			userConn, err := pgx.Connect(ctx, fmt.Sprintf("postgres://%s:%s@%s/waypoint_test?sslmode=disable", pgUser, password, db.backend))
+			if err != nil {
+				t.Fatalf("user connect: %v", err)
+			}
+			defer userConn.Close(ctx)
+
+			if _, err := userConn.Exec(ctx, "INSERT INTO public.composite_open VALUES (1)"); err != nil {
+				t.Fatalf("INSERT into composite_open should succeed (readwrite preset is intact): %v", err)
+			}
+			if _, err := userConn.Exec(ctx, "INSERT INTO public.composite_locked VALUES (1)"); err == nil {
+				t.Fatal("INSERT into composite_locked should be denied (SQL REVOKE carved the hole)")
+			}
+			if _, err := userConn.Exec(ctx, "SELECT * FROM public.composite_locked"); err != nil {
+				t.Fatalf("SELECT on composite_locked should still succeed (only INSERT was revoked): %v", err)
+			}
+		})
+	}
+}
+
+func TestIntegration_EnsureUser_MultiSchemaGroupMemberships(t *testing.T) {
+	for _, db := range testBackends(t) {
+		t.Run(db.name, func(t *testing.T) {
+			p := setupProvisionerFor(t, db)
+			ctx := context.Background()
+
+			conn := adminConnFor(t, db)
+			if _, err := conn.Exec(ctx, "CREATE SCHEMA IF NOT EXISTS multi_audit"); err != nil {
+				t.Fatalf("create schema: %v", err)
+			}
+			t.Cleanup(func() {
+				c := adminConnFor(t, db)
+				c.Exec(context.Background(), "DROP SCHEMA IF EXISTS multi_audit CASCADE")
+			})
+
+			perms := &auth.DBPermissions{
+				Permissions: []string{"readonly"},
+				Schemas:     []string{"public", "multi_audit"},
+			}
+			pgUser, _, err := p.EnsureUser(ctx, "multi@example.com", "multi-node", "waypoint_test", perms)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { cleanupRoleFor(t, db, pgUser) })
+
+			groups := memberOfPresetGroups(t, db, pgUser)
+			want := map[string]bool{
+				"wp_grp_readonly_public_waypoint_test":      true,
+				"wp_grp_readonly_multi_audit_waypoint_test": true,
+			}
+			if len(groups) != len(want) {
+				t.Fatalf("expected %d memberships, got %v", len(want), groups)
+			}
+			for _, g := range groups {
+				if !want[g] {
+					t.Errorf("unexpected group membership %q", g)
+				}
+			}
+		})
+	}
+}
+
 // Ensure the redis import is used (it's needed for the RedisClient call via testutil).
 var _ *redis.Client

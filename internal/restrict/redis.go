@@ -487,3 +487,33 @@ func (s *RedisStore) ReleaseLock(ctx context.Context, name string, token string)
 	s.recordOp(ctx, span, "release_lock", start, err)
 	return err
 }
+
+// IsGroupReady reports whether a group role has been bootstrapped recently.
+// Returns false (without error) when the key is absent so the caller falls
+// through to an idempotent re-bootstrap.
+func (s *RedisStore) IsGroupReady(ctx context.Context, name string) (bool, error) {
+	ctx, span := s.startOp(ctx, "is_group_ready")
+	start := time.Now()
+	_, err := s.client.Get(ctx, s.key("grp_ready", name)).Result()
+	if err == redis.Nil {
+		s.recordOp(ctx, span, "is_group_ready", start, nil)
+		return false, nil
+	}
+	if err != nil {
+		s.recordOp(ctx, span, "is_group_ready", start, err)
+		return false, err
+	}
+	s.recordOp(ctx, span, "is_group_ready", start, nil)
+	return true, nil
+}
+
+// MarkGroupReady records that a group role has been bootstrapped. The TTL
+// bounds how long the cache is trusted; on miss the bootstrap re-runs
+// idempotently.
+func (s *RedisStore) MarkGroupReady(ctx context.Context, name string, ttl time.Duration) error {
+	ctx, span := s.startOp(ctx, "mark_group_ready")
+	start := time.Now()
+	err := s.client.Set(ctx, s.key("grp_ready", name), "1", ttl).Err()
+	s.recordOp(ctx, span, "mark_group_ready", start, err)
+	return err
+}
