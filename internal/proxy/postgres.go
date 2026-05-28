@@ -496,19 +496,25 @@ func (p *PostgresProxy) revalidateLoop(ctx context.Context, setupSpanCtx trace.S
 				m.Attrs("waypoint.provision.latency", listenerAttr))
 
 			if dbPerms == nil {
-				log.WarnContext(ctx, "permissions revoked; active role reconciled with no grants",
+				revalSpan.SetStatus(codes.Error, "permissions revoked")
+				revalSpan.End()
+				m.RevalFailures.Add(ctx, 1, m.Attrs("waypoint.reval.failures", listenerAttr))
+				log.WarnContext(ctx, "permissions revoked for this database, closing connection",
 					"user", loginName,
 					"database", database,
 					"pg_user", pgUser,
 				)
-			} else {
-				log.DebugContext(ctx, "permissions reconciled",
-					"user", loginName,
-					"database", database,
-					"pg_user", pgUser,
-					"permissions", dbPerms.Permissions,
-				)
+				clientConn.Close()
+				backendConn.Close()
+				return
 			}
+
+			log.DebugContext(ctx, "permissions reconciled",
+				"user", loginName,
+				"database", database,
+				"pg_user", pgUser,
+				"permissions", dbPerms.Permissions,
+			)
 
 			revalSpan.End()
 			log.DebugContext(ctx, "revalidation passed")

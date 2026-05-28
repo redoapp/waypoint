@@ -728,27 +728,22 @@ func TestIntegration_Proxy_RevalidationPermissionRevoked(t *testing.T) {
 	}
 
 	// Switch auth to return a result that grants access to a different database only.
-	// Auth succeeds, but DatabasePermissions("waypoint_test") returns nil.
+	// Auth succeeds for the listener, but DatabasePermissions("waypoint_test") returns nil.
 	revokedResult := makeAuthResult("other_db", auth.DBPermissions{
 		Permissions: []string{"readonly"},
 	}, nil)
 	dynAuth.SetResult(revokedResult, nil)
 
-	// Wait for revalidation to fire and reconcile permissions.
+	// Wait for revalidation to fire and close the connection.
 	time.Sleep(2 * time.Second)
 
-	// The connection should remain open, but the active role should have no
-	// object grants for the revoked database.
+	// The connection should be closed: the caller is no longer authorized for
+	// this specific database, so Waypoint terminates the session rather than
+	// leaving a privilege-less connection occupying the slot.
 	var val int
-	if err := conn.QueryRow(ctx, "SELECT 1").Scan(&val); err != nil {
-		t.Fatalf("connection should remain open after permission reconciliation: %v", err)
-	}
-	_, err = conn.Exec(ctx, "INSERT INTO public.reval_revoked_test VALUES (2)")
+	err = conn.QueryRow(ctx, "SELECT 1").Scan(&val)
 	if err == nil {
-		t.Fatal("insert should be denied after database permissions were revoked")
-	}
-	if !strings.Contains(err.Error(), "permission denied") {
-		t.Fatalf("expected permission denied error, got: %v", err)
+		t.Fatal("expected connection to be closed after database permissions were revoked")
 	}
 }
 
