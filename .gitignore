@@ -28,6 +28,11 @@ covreport
 waypoint-dev.toml
 .env
 
+# Docs site (Astro)
+website/node_modules/
+website/dist/
+website/.astro/
+
 # OS
 .DS_Store
 Thumbs.db

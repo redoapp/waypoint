@@ -1,0 +1,49 @@
+---
+title: Waypoint
+description: Tailscale-aware database proxy with identity-based auth, per-user provisioning, and connection limits.
+template: splash
+hero:
+  tagline: Identity-based database access on your tailnet — no passwords on the client.
+  actions:
+    - text: Get Started
+      link: /waypoint/getting-started/installation/
+      icon: right-arrow
+      variant: primary
+    - text: View on GitHub
+      link: https://github.com/redoapp/waypoint
+      icon: external
+---
+
+import { Card, CardGrid } from '@astrojs/starlight/components';
+
+## What is Waypoint?
+
+Waypoint is a database proxy that sits on your tailnet between clients and backend databases. It authenticates every connection using the caller's Tailscale identity, checks ACL capability grants (`redo.com/cap/waypoint`), and dynamically provisions scoped backend users — so clients never need passwords or static credentials.
+
+<CardGrid>
+  <Card title="Tailscale-native auth" icon="approve-check">
+    Identifies callers via `tsnet` and `WhoIs`, evaluates capability grants from your ACL policy.
+  </Card>
+  <Card title="Postgres mode" icon="seti:db">
+    Intercepts the PG wire protocol; provisions per-user roles with scoped `GRANT`s and TTL-based cleanup.
+  </Card>
+  <Card title="MongoDB mode" icon="seti:db">
+    Provisions scoped MongoDB users (or selects pre-created static users on Atlas); rewrites replica-set topology so clients stay on the proxy.
+  </Card>
+  <Card title="TCP mode" icon="bars">
+    Transparent L4 proxy for any TCP backend — MySQL, Redis, anything else.
+  </Card>
+  <Card title="Per-user limits" icon="setting">
+    Concurrent connection caps, byte budgets, and duration ceilings — enforced cross-instance via Redis.
+  </Card>
+  <Card title="OpenTelemetry" icon="rocket">
+    Opt-in metrics and traces over OTLP, with per-metric tag allow-lists.
+  </Card>
+</CardGrid>
+
+## Where to go next
+
+- New here? Start with [Installation](/waypoint/getting-started/installation/) and the [Quickstart](/waypoint/getting-started/quickstart/).
+- Setting up a listener? See [Postgres](/waypoint/listeners/postgres/), [MongoDB](/waypoint/listeners/mongodb/), or [TCP](/waypoint/listeners/tcp/).
+- Wiring up ACL grants? Read [Capability Grants](/waypoint/acl/capability-grants/).
+- Running in production? See [Observability](/waypoint/observability/metrics/) and [Operations](/waypoint/operations/monitor/).

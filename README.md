@@ -1,5 +1,7 @@
 # Waypoint
 
+**Docs site:** https://redoapp.github.io/waypoint/
+
 Waypoint is a Tailscale-aware database proxy that authenticates connections using Tailscale identity and ACL capability grants. It sits between clients on a tailnet and backend databases, enforcing per-user permissions, connection limits, and bandwidth budgets — with no passwords on the client side.
 
 ## Features

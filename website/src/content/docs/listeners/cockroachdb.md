@@ -1,26 +1,31 @@
-# CockroachDB Support
+---
+title: CockroachDB
+description: CockroachDB-specific behaviors compared to PostgreSQL.
+sidebar:
+  order: 4
+---
 
 Waypoint supports CockroachDB alongside PostgreSQL as a database backend.
 
-## Dialect Detection
+## Dialect detection
 
 Waypoint automatically detects whether the backend is PostgreSQL or CockroachDB by querying `SELECT version()` on the first connection. No configuration change is needed.
 
-## Minimum Version
+## Minimum version
 
 CockroachDB v24.3 or later is recommended.
 
-## Key Differences from PostgreSQL
+## Key differences from PostgreSQL
 
-### No Automatic Role Cleanup
+### No automatic role cleanup
 
-Waypoint does not automatically clean up expired roles. Instead, roles accumulate in the database. This is safe because:
+Waypoint does not automatically clean up expired roles on CockroachDB. Instead, roles accumulate in the database. This is safe because:
 
-- Passwords are rotated on every `EnsureUser` call, so expired roles cannot authenticate
-- Roles only receive CONNECT and explicitly granted permissions
-- The `revalidateLoop` in the proxy terminates connections when ACL permissions are revoked
+- Passwords are rotated on every `EnsureUser` call, so expired roles cannot authenticate.
+- Roles only receive `CONNECT` and explicitly granted permissions.
+- The `revalidateLoop` in the proxy terminates connections when ACL permissions are revoked.
 
-### Manual Cleanup
+### Manual cleanup
 
 If role accumulation becomes a concern, operators can manually drop idle `wp_*` roles:
 

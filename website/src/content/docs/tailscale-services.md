@@ -1,4 +1,7 @@
-# Tailscale Services
+---
+title: Tailscale Services
+description: Register listeners as Tailscale Services with stable FQDNs.
+---
 
 Waypoint can register listeners as [Tailscale Services](https://tailscale.com/kb/1438/tailscale-services) using the `service` field. This gives each listener its own stable FQDN (e.g. `waypoint-db.tailf3d5b.ts.net`) that is load-balanced across all nodes hosting the service.
 
@@ -29,7 +32,7 @@ enabled = true
 service = "svc:waypoint-ssh"
 ```
 
-## Tailscale Admin Prerequisites
+## Tailscale admin prerequisites
 
 `ListenService()` advertises the node as a host for the service, but the service must be pre-configured in the Tailscale admin console. Without these steps the service will not appear or function correctly.
 
@@ -41,7 +44,7 @@ service = "svc:waypoint-ssh"
 
 If any of these steps are missing, `ListenService()` may succeed at the API level but the service will not be reachable or visible in the admin panel.
 
-## DNS Shadowing Pitfall
+## DNS shadowing pitfall
 
 The Tailscale hostname and the service name (without `svc:` prefix) **must not match**. When they collide — e.g. `hostname = "waypoint-db"` and `service = "svc:waypoint-db"` — both resolve to the same FQDN. The machine's DNS entry shadows the service, making the service invisible in the Tailscale admin panel.
 

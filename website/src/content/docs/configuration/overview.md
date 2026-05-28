@@ -1,0 +1,43 @@
+---
+title: Configuration Overview
+description: TOML file structure and environment variable interpolation.
+sidebar:
+  order: 1
+---
+
+Waypoint reads a single TOML file (default: `waypoint.toml`, override with `-config`). It has a small set of top-level sections plus an array of listeners.
+
+```toml
+[tailscale]      # tsnet identity, hostname, auth keys
+[redis]          # connection tracking + distributed locks
+[revalidation]   # mid-session identity re-checks
+[provisioning]   # global toggles (e.g. allow_raw_sql)
+[defaults.limits]  # default per-user limits
+[metrics]        # OTLP endpoint, sample rate
+[metrics.enable] # opt-in per metric name + tag allow-list
+
+[[listeners]]    # one block per port
+```
+
+## Environment variable interpolation
+
+Any string value may contain `${VAR}`. Variables are resolved from the process environment at load time. Missing variables fail loudly rather than silently expanding to an empty string.
+
+```toml
+[listeners.postgres]
+admin_password = "${PG_ADMIN_PASSWORD}"
+```
+
+`run-proxy` (the devenv script) sources a local `.env` file before exec'ing the binary, which is convenient in development. In production, prefer your orchestrator's secret-injection mechanism.
+
+## Full example
+
+See [`examples/waypoint.toml`](https://github.com/redoapp/waypoint/blob/main/examples/waypoint.toml) in the repo for an annotated reference covering every option, including the commented-out alternatives for OAuth, WIF, MongoDB SRV discovery, and Tailscale Services.
+
+## Section guides
+
+- [Tailscale](/waypoint/configuration/tailscale/) — hostname, auth keys, OAuth client credentials, Workload Identity Federation.
+- [Redis](/waypoint/configuration/redis/) — address, key prefix, service-name tag for OTel.
+- [TLS](/waypoint/configuration/tls/) — `tls_mode`, Tailscale-managed certs, custom certs.
+- [Revalidation](/waypoint/configuration/revalidation/) — mid-session re-checks.
+- [Provisioning](/waypoint/configuration/provisioning/) — `allow_raw_sql`, default limits.

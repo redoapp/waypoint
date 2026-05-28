@@ -9,6 +9,8 @@
     golangci-lint
     delve
     git
+    nodejs_22
+    nodePackages.pnpm
   ];
 
   env = {
@@ -63,9 +65,21 @@
     SERVE=":8080" bash scripts/coverage.sh "$@"
   '';
 
+  scripts.docs-dev.exec = ''
+    cd "${config.devenv.root}/website"
+    pnpm install
+    exec pnpm dev
+  '';
+
+  scripts.docs-build.exec = ''
+    cd "${config.devenv.root}/website"
+    pnpm install --frozen-lockfile
+    exec pnpm build
+  '';
+
   enterShell = ''
     echo "Go: $(go version)"
     echo "Valkey service configured (start with 'devenv up')"
-    echo "Commands: run-proxy, debug-proxy, test, coverage, coverage-unit, coverage-serve"
+    echo "Commands: run-proxy, debug-proxy, test, coverage, coverage-unit, coverage-serve, docs-dev, docs-build"
   '';
 }

@@ -1,0 +1,117 @@
+---
+title: MongoDB
+description: Replica-set proxying with topology rewrite and database/static provisioning modes.
+sidebar:
+  order: 2
+---
+
+MongoDB mode proxies replica-set connections. Waypoint exposes one listener port per member, rewrites the topology hosts in `hello` / `isMaster` responses, and authenticates clients as scoped backend users.
+
+## Two ways to enumerate members
+
+### SRV discovery
+
+For SRV-backed clusters (most managed offerings), omit `members` and let Waypoint resolve the SRV record at startup, then bind consecutive ports starting at `listen`:
+
+```toml
+[[listeners]]
+name = "mongo-prod"
+listen = ":27017"
+mode = "mongodb"
+backend_via_tailscale = true
+tls = true
+tls_mode = "require"
+
+[listeners.mongodb]
+admin_user = "waypoint_admin"
+admin_password = "${MONGO_ADMIN_PASSWORD}"
+auth_database = "admin"
+replica_set = "rs0"
+srv = "cluster.example.com"   # resolves _mongodb._tcp.cluster.example.com
+srv_max_members = 3           # binds :27017, :27018, :27019
+```
+
+When combining SRV discovery with a Tailscale Service, set `advertise` so topology rewrites can be built before service listeners are registered.
+
+### Explicit members
+
+When you need fixed addresses (e.g. self-hosted clusters), map members explicitly:
+
+```toml
+[[listeners]]
+name = "mongo-prod"
+mode = "mongodb"
+backend_via_tailscale = true
+
+[listeners.mongodb]
+admin_user = "waypoint_admin"
+admin_password = "${MONGO_ADMIN_PASSWORD}"
+auth_database = "admin"
+replica_set = "rs0"
+
+[[listeners.mongodb.members]]
+backend = "mongo1.prod.internal:27017"
+listen = ":27017"
+advertise = "waypoint-db:27017"
+
+[[listeners.mongodb.members]]
+backend = "mongo2.prod.internal:27017"
+listen = ":27018"
+advertise = "waypoint-db:27018"
+
+[[listeners.mongodb.members]]
+backend = "mongo3.prod.internal:27017"
+listen = ":27019"
+advertise = "waypoint-db:27019"
+```
+
+`advertise` is the host:port Waypoint substitutes into topology responses so that drivers reconnect through the proxy, not directly to the backend member.
+
+## Provisioning modes
+
+### `mode = "database"` (default)
+
+Waypoint uses `admin_user` / `admin_password` to create and update scoped MongoDB users on the backend, following the same identity-derived naming as Postgres.
+
+```toml
+[listeners.mongodb.provision]
+mode = "database"
+```
+
+### `mode = "static"` (Atlas-compatible)
+
+For MongoDB Atlas — or any cluster where user-management commands are not available — `static` mode picks from a pre-created set of backend users you configure.
+
+```toml
+[listeners.mongodb.provision]
+mode = "static"
+
+[[listeners.mongodb.provision.static_users]]
+name = "app-readwrite"
+username = "atlas_app_rw"
+password = "${MONGO_APP_RW_PASSWORD}"
+auth_database = "admin"
+database = "app"
+permissions = ["readwrite"]
+
+[[listeners.mongodb.provision.static_users]]
+name = "readonly"
+username = "atlas_readonly"
+password = "${MONGO_READONLY_PASSWORD}"
+auth_database = "admin"
+permissions = ["readonly"]   # matches any all-readonly grant set
+```
+
+The matching rules:
+
+- When `database` is set, Waypoint matches the **exact expanded database role set** the grant resolves to.
+- When only `permissions` is set, it matches grants where **every database** has that same preset.
+- Configure only the static users you want to allow. If a grant has no matching static user, Waypoint returns an authentication error to the client and does not connect to the backend.
+
+Static users must already have the matching roles in MongoDB or Atlas — Waypoint does not create or modify them.
+
+## TLS and SNI rewrite
+
+Set `tls = true` for backend TLS, and `tls_mode` (`off` / `optional` / `require`) for client-facing TLS. See [TLS](/waypoint/configuration/tls/) for certificate selection.
+
+When MongoDB clients connect with TLS+SNI, Waypoint rewrites topology hostnames to the SNI hostname (preserving the advertised ports). This keeps drivers pinned to the proxy across reconnects.
