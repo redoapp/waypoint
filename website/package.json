@@ -6,6 +6,8 @@
   "scripts": {
     "dev": "astro dev",
     "start": "astro dev",
+    "verify": "node scripts/verify-test-refs.mjs",
+    "prebuild": "pnpm verify",
     "build": "astro build",
     "preview": "astro preview",
     "astro": "astro"

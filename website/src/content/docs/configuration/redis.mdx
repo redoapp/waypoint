@@ -5,6 +5,8 @@ sidebar:
   order: 3
 ---
 
+import TestRef from '../../../components/TestRef.astro';
+
 Waypoint stores all cross-instance coordination state in Redis (or Valkey):
 
 - Per-user concurrent-connection counts and byte budgets.
@@ -30,7 +32,7 @@ Optional. Use `password` for AUTH-protected instances; `db` selects a logical da
 
 ## key_prefix
 
-Every key Waypoint writes is prefixed with this string. Pick something distinctive so you can run multiple Waypoint deployments against one Redis instance without collisions, and so you can `KEYS waypoint:*` for debugging.
+Every key Waypoint writes is prefixed with this string. <TestRef name="TestNewRedisStore_DefaultPrefix" /> <TestRef name="TestRedisStore_Key" /> Pick something distinctive so you can run multiple Waypoint deployments against one Redis instance without collisions <TestRef name="TestRedisStore_ScopedKeysIsolation" />, and so you can `KEYS waypoint:*` for debugging.
 
 ## service_name
 
@@ -38,6 +40,6 @@ Sets the `peer.service` attribute on Redis spans in OpenTelemetry traces. Defaul
 
 ## Reliability
 
-Waypoint treats Redis as a hard dependency for authorization decisions. If Redis is unreachable, new connections fail closed (rejected) — the proxy will not silently drop limit enforcement. Existing connections continue until the next revalidation tick.
+Waypoint treats Redis as a hard dependency for authorization decisions. Per-user connection counts are tracked cross-instance via Redis with atomic acquire/release. <TestRef name="TestIntegration_Tracker_AcquireRelease" /> <TestRef name="TestIntegration_Tracker_ConcurrentAcquire" /> <TestRef name="TestIntegration_Tracker_AcquireReleaseCycle_CountConsistency" /> If Redis is unreachable, new connections fail closed (rejected) — the proxy will not silently drop limit enforcement. Existing connections continue until the next revalidation tick.
 
 For HA, point Waypoint at a Sentinel-fronted or clustered Redis. The client (`github.com/redis/go-redis/v9`) follows redirects and reconnects automatically.

@@ -1,0 +1,135 @@
+.test-ref {
+  display: none;
+}
+
+html[data-verified-mode='on'] .test-ref {
+  position: relative;
+  display: inline-block;
+  margin-inline-start: 0.2em;
+  vertical-align: baseline;
+  line-height: 1;
+}
+
+.test-ref-marker {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.15em;
+  height: 1.15em;
+  font-size: 0.72em;
+  line-height: 1;
+  font-weight: 700;
+  color: var(--sl-color-green-high);
+  background: var(--sl-color-green-low);
+  border: 1px solid var(--sl-color-green);
+  border-radius: 50%;
+  cursor: help;
+  user-select: none;
+  vertical-align: middle;
+}
+
+.test-ref-marker:hover,
+.test-ref-marker:focus-visible {
+  background: var(--sl-color-green);
+  color: var(--sl-color-black);
+  outline: none;
+}
+
+.test-ref-popup {
+  position: absolute;
+  z-index: 20;
+  bottom: calc(100% + 0.5em);
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  flex-direction: column;
+  gap: 0.15em;
+  padding: 0.3em 0.5em;
+  max-width: 26em;
+  border: 1px solid var(--sl-color-gray-4);
+  border-radius: 0.3rem;
+  background: var(--sl-color-bg);
+  color: var(--sl-color-text);
+  font-size: 0.78rem;
+  line-height: 1.3;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.18);
+  white-space: nowrap;
+  visibility: hidden;
+  opacity: 0;
+  /* Leaving: hide immediately. */
+  transition: opacity 80ms ease, visibility 0s linear 80ms;
+}
+
+/* Generous invisible bridge so the cursor can wander between marker and popup. */
+.test-ref-popup::before {
+  content: '';
+  position: absolute;
+  left: -1.5em;
+  right: -1.5em;
+  top: 100%;
+  height: 1.2em;
+}
+
+.test-ref:hover .test-ref-popup,
+.test-ref:focus-within .test-ref-popup {
+  visibility: visible;
+  opacity: 1;
+  /* Entering: wait briefly before revealing, so passing the cursor over doesn't flash the popup. */
+  transition: opacity 100ms ease 250ms, visibility 0s linear 250ms;
+}
+
+.test-ref-popup-name {
+  background: transparent;
+  padding: 0;
+  font-size: 0.95em;
+  color: var(--sl-color-text);
+  border: 0;
+}
+
+.test-ref-popup-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4em;
+  color: var(--sl-color-text-accent);
+  text-decoration: none;
+}
+
+.test-ref-popup-link:hover {
+  text-decoration: underline;
+}
+
+#verified-mode-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35em;
+  padding: 0.3em 0.6em;
+  margin-inline-end: 0.5rem;
+  border: 1px solid var(--sl-color-gray-5);
+  border-radius: 0.3rem;
+  background: transparent;
+  color: var(--sl-color-text);
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.85rem;
+  line-height: 1;
+}
+
+#verified-mode-toggle:hover {
+  background: var(--sl-color-gray-6);
+}
+
+#verified-mode-toggle[aria-pressed='true'] {
+  background: var(--sl-color-green-low);
+  border-color: var(--sl-color-green);
+  color: var(--sl-color-green-high);
+}
+
+.verified-mode-icon {
+  font-weight: 700;
+}
+
+@media (max-width: 50rem) {
+  .verified-mode-label {
+    display: none;
+  }
+}

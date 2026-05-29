@@ -5,7 +5,9 @@ sidebar:
   order: 1
 ---
 
-Waypoint emits OpenTelemetry metrics over OTLP to any compatible collector.
+import TestRef from '../../../components/TestRef.astro';
+
+Waypoint emits OpenTelemetry metrics over OTLP to any compatible collector. <TestRef name="TestConfig_Defaults" />
 
 ```toml
 [metrics]
@@ -24,13 +26,13 @@ temporality = "delta"      # "delta" (default, recommended for Datadog) or "cumu
 
 ## Per-metric opt-in
 
-Metrics are emitted only when explicitly listed under `[metrics.enable]`. The key is the metric name; the value is a **tag allow-list**:
+Metrics are emitted only when explicitly listed under `[metrics.enable]`. <TestRef name="TestConfig_IsMetricEnabled" /> <TestRef name="TestEnabledMetrics_Record" /> <TestRef name="TestNonEnabledMetrics_UseNoop" /> The key is the metric name; the value is a **tag allow-list**:
 
-- `["listener", "mode"]` — only these tags are attached.
-- `["*"]` — all available tags.
-- `[]` — no tags (the metric is a single scalar).
+- `["listener", "mode"]` — only these tags are attached. <TestRef name="TestAttrs_FiltersTags" /> <TestRef name="TestConfig_TagsForMetric" />
+- `["*"]` — all available tags. <TestRef name="TestAttrs_Wildcard" />
+- `[]` — no tags (the metric is a single scalar). <TestRef name="TestAttrs_EmptyTagList" />
 
-This makes cardinality predictable: a metric like `waypoint.bytes.read` tagged by `user` will produce one time series per user; if that's too many, narrow the tag list to `["listener"]`.
+Unknown tag names in the allow-list are flagged at load time. <TestRef name="TestAttrs_FilterVerification" /> <TestRef name="TestAttrs_UnknownMetric" /> This makes cardinality predictable: a metric like `waypoint.bytes.read` tagged by `user` will produce one time series per user; if that's too many, narrow the tag list to `["listener"]`.
 
 ## Available metrics
 
@@ -59,7 +61,7 @@ This makes cardinality predictable: a metric like `waypoint.bytes.read` tagged b
 
 ## Temporality
 
-Default is `delta` because Datadog and most modern collectors prefer it for counters and histograms. Use `cumulative` if your backend (e.g. Prometheus) wants monotonic counters.
+Default is `delta` because Datadog and most modern collectors prefer it for counters and histograms. <TestRef name="TestConfig_TemporalitySelector" /> Use `cumulative` if your backend (e.g. Prometheus) wants monotonic counters.
 
 ## Endpoint
 

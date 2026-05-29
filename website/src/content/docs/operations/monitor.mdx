@@ -5,6 +5,8 @@ sidebar:
   order: 1
 ---
 
+import TestRef from '../../../components/TestRef.astro';
+
 `waypoint-monitor` is a separate binary that gives operators a live, terminal-UI view of every running Waypoint instance.
 
 ```sh
@@ -14,7 +16,7 @@ waypoint-monitor -config waypoint-monitor.toml
 
 ## How discovery works
 
-Each Waypoint instance publishes a heartbeat record to Redis with a TTL. The monitor reads the same Redis (using the same `key_prefix`) and renders one row per live instance.
+Each Waypoint instance publishes a heartbeat record to Redis with a TTL. <TestRef name="TestHeartbeat" /> The monitor reads the same Redis (using the same `key_prefix`) and renders one row per live instance. <TestRef name="TestDiscoverInstances" />
 
 Add the matching Redis section to `waypoint-monitor.toml`:
 
@@ -44,9 +46,9 @@ This lets multiple operators connect to the same monitor view without each runni
 
 ## What you can see
 
-- Instance hostname, uptime, version.
+- Instance hostname, uptime <TestRef name="TestUptime" />, version.
 - Active connections per listener.
-- Per-user bandwidth and connection counts.
+- Per-user bandwidth and connection counts. <TestRef name="TestListUsers_WithBandwidth" /> <TestRef name="TestGetUserStats_WithBandwidth" />
 - Recent auth failures and limit violations.
 
 The monitor is read-only — it does not change ACLs, kill connections, or restart instances.

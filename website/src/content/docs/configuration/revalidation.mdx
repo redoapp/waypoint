@@ -5,7 +5,9 @@ sidebar:
   order: 5
 ---
 
-Tailscale ACL grants can change at any time — users join and leave groups, capabilities are revoked, devices are removed. Waypoint re-evaluates identity for long-lived connections on a fixed interval.
+import TestRef from '../../../components/TestRef.astro';
+
+Tailscale ACL grants can change at any time — users join and leave groups, capabilities are revoked, devices are removed. Waypoint re-evaluates identity for long-lived connections on a fixed interval. <TestRef name="TestRevalidationConfig_Default" /> <TestRef name="TestRevalidationConfig_Custom" />
 
 ```toml
 [revalidation]
@@ -20,11 +22,11 @@ Every `interval`, for every active connection:
 2. The caller's capability grants are re-evaluated against this listener and database.
 3. For Postgres mode, the active backend role is **reconciled live** — `ReconcileRole` runs the necessary `GRANT` / `REVOKE` statements so the role's privileges match the current grant. The session is not dropped and its password is not rotated.
 
-This means permission changes take effect mid-session: a user downgraded from `readwrite` to `readonly` keeps their existing connection but loses write privileges on the next tick.
+This means permission changes take effect mid-session: a user downgraded from `readwrite` to `readonly` keeps their existing connection but loses write privileges on the next tick. <TestRef name="TestIntegration_Proxy_RevalidationReconcilesPermissionDowngrade" />
 
 ## What happens when access is revoked
 
-A *downgrade* (e.g. `readwrite` → `readonly`) is reconciled live and the session continues with reduced privileges. A *full revocation* of access to the connected database closes the connection.
+A *downgrade* (e.g. `readwrite` → `readonly`) is reconciled live and the session continues with reduced privileges. A *full revocation* of access to the connected database closes the connection. <TestRef name="TestIntegration_Proxy_RevalidationPermissionRevoked" />
 
 | Revocation | Outcome |
 |---|---|
@@ -38,7 +40,7 @@ All four cases increment the `waypoint.reval.failures` counter, so a single metr
 ## Tuning
 
 - `1m` is a reasonable default — fast enough to revoke access within a minute, infrequent enough to be invisible.
-- For especially sensitive backends, drop to `15s` or `30s`.
+- For especially sensitive backends, drop to `15s` or `30s`. <TestRef name="TestConfig_IntervalDuration" />
 - Setting `interval` to `0` disables revalidation entirely. This is rarely the right call — at minimum, the proxy still uses revalidation events as a heartbeat for byte-counter flushes.
 
 ## Trace correlation

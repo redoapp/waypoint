@@ -5,13 +5,15 @@ sidebar:
   order: 2
 ---
 
-MongoDB mode proxies replica-set connections. Waypoint exposes one listener port per member, rewrites the topology hosts in `hello` / `isMaster` responses, and authenticates clients as scoped backend users.
+import TestRef from '../../../components/TestRef.astro';
+
+MongoDB mode proxies replica-set connections. Waypoint exposes one listener port per member, rewrites the topology hosts in `hello` / `isMaster` responses <TestRef name="TestRewriteTopology_ReplicaSet" /> <TestRef name="TestTopologyRewriter_RewritesTopology" />, and authenticates clients as scoped backend users. <TestRef name="TestIntegration_MongoProxy_ReplicaSetWithAuth" />
 
 ## Two ways to enumerate members
 
 ### SRV discovery
 
-For SRV-backed clusters (most managed offerings), omit `members` and let Waypoint resolve the SRV record at startup, then bind consecutive ports starting at `listen`:
+For SRV-backed clusters (most managed offerings), omit `members` and let Waypoint resolve the SRV record at startup, then bind consecutive ports starting at `listen`: <TestRef name="TestMaterializeMongoSRVBackends" /> <TestRef name="TestExpandedBackends_WithMongoDBMembers" />
 
 ```toml
 [[listeners]]
@@ -65,7 +67,7 @@ listen = ":27019"
 advertise = "waypoint-db:27019"
 ```
 
-`advertise` is the host:port Waypoint substitutes into topology responses so that drivers reconnect through the proxy, not directly to the backend member.
+`advertise` is the host:port Waypoint substitutes into topology responses so that drivers reconnect through the proxy, not directly to the backend member. <TestRef name="TestBuildMongoTopologyMap" />
 
 ## Provisioning modes
 
@@ -104,9 +106,10 @@ permissions = ["readonly"]   # matches any all-readonly grant set
 
 The matching rules:
 
-- When `database` is set, Waypoint matches the **exact expanded database role set** the grant resolves to.
-- When only `permissions` is set, it matches grants where **every database** has that same preset.
-- Configure only the static users you want to allow. If a grant has no matching static user, Waypoint returns an authentication error to the client and does not connect to the backend.
+- When `database` is set, Waypoint matches the **exact expanded database role set** the grant resolves to. <TestRef name="TestMongoStaticCredentialMatchesDatabasePreset" /> <TestRef name="TestIntegration_MongoProxy_StaticUserReadWriteAllowed" />
+- When only `permissions` is set, it matches grants where **every database** has that same preset. <TestRef name="TestMongoStaticCredentialMatchesPermissionOnlyUser" /> Mixed-preset grants do not match permission-only users. <TestRef name="TestMongoStaticCredentialRejectsMixedPermissionOnlyUser" />
+- When multiple users could match, the more permissive set wins (e.g. `readwrite` beats `readonly`). <TestRef name="TestMongoStaticCredentialReadWriteWinsOverReadonlyGrant" />
+- Configure only the static users you want to allow. If a grant has no matching static user, Waypoint returns an authentication error to the client and does not connect to the backend. <TestRef name="TestMongoStaticMissingCredentialReturnsClientMessage" /> <TestRef name="TestIntegration_MongoProxy_StaticUserMissingReturnsClientMessage" />
 
 Static users must already have the matching roles in MongoDB or Atlas — Waypoint does not create or modify them.
 
@@ -114,4 +117,4 @@ Static users must already have the matching roles in MongoDB or Atlas — Waypoi
 
 Set `tls = true` for backend TLS, and `tls_mode` (`off` / `optional` / `require`) for client-facing TLS. See [TLS](/waypoint/configuration/tls/) for certificate selection.
 
-When MongoDB clients connect with TLS+SNI, Waypoint rewrites topology hostnames to the SNI hostname (preserving the advertised ports). This keeps drivers pinned to the proxy across reconnects.
+When MongoDB clients connect with TLS+SNI, Waypoint rewrites topology hostnames to the SNI hostname (preserving the advertised ports). <TestRef name="TestMongoTopologySNIRewritesAdvertiseHostAndPreservesPorts" /> This keeps drivers pinned to the proxy across reconnects. <TestRef name="TestIntegration_MongoProxy_ReplicaSetTopologyRewrite" />
