@@ -5,7 +5,9 @@ sidebar:
   order: 2
 ---
 
-The `[tailscale]` section controls how Waypoint joins the tailnet as a tsnet node.
+import TestRef from '../../../components/TestRef.astro';
+
+The `[tailscale]` section controls how Waypoint joins the tailnet as a tsnet node. <TestRef name="TestValidate_MissingHostname" />
 
 ```toml
 [tailscale]
@@ -39,7 +41,7 @@ Pick one of three methods:
 auth_key = "${TS_AUTHKEY}"
 ```
 
-Or set `TS_AUTHKEY` in the environment. The key should be tagged with the same tag the node will advertise (e.g. `tag:waypoint`).
+Or set `TS_AUTHKEY` in the environment. <TestRef name="TestLoad_TailscaleAuthKeyEnvExpansion" /> The key should be tagged with the same tag the node will advertise (e.g. `tag:waypoint`). <TestRef name="TestValidate_AuthKey" />
 
 ### OAuth client credentials
 
@@ -48,7 +50,7 @@ client_secret = "${TS_CLIENT_SECRET}"
 advertise_tags = ["tag:waypoint"]
 ```
 
-Requires `advertise_tags`. The OAuth client's owner must be allowed to assert those tags.
+Requires `advertise_tags`. <TestRef name="TestValidate_OAuthMissingTags" /> The OAuth client's owner must be allowed to assert those tags. <TestRef name="TestValidate_OAuth" />
 
 ### Workload Identity Federation
 
@@ -60,6 +62,8 @@ id_token = "${WIF_ID_TOKEN}"
 audience = "https://login.tailscale.com"
 advertise_tags = ["tag:waypoint"]
 ```
+
+WIF requires `client_id` <TestRef name="TestValidate_WIFMissingClientID" /> and `advertise_tags`. <TestRef name="TestValidate_WIFMissingTags" /> Pick exactly one authentication method — combining auth key with OAuth or WIF is rejected at load. <TestRef name="TestValidate_ConflictingMethods" />
 
 ## ephemeral
 

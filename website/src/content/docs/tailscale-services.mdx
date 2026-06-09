@@ -3,7 +3,9 @@ title: Tailscale Services
 description: Register listeners as Tailscale Services with stable FQDNs.
 ---
 
-Waypoint can register listeners as [Tailscale Services](https://tailscale.com/kb/1438/tailscale-services) using the `service` field. This gives each listener its own stable FQDN (e.g. `waypoint-db.tailf3d5b.ts.net`) that is load-balanced across all nodes hosting the service.
+import TestRef from '../../components/TestRef.astro';
+
+Waypoint can register listeners as [Tailscale Services](https://tailscale.com/kb/1438/tailscale-services) using the `service` field. <TestRef name="TestLoad_ServiceField" /> This gives each listener its own stable FQDN (e.g. `waypoint-db.tailf3d5b.ts.net`) that is load-balanced across all nodes hosting the service. <TestRef name="TestIntegration_ListenService_MultiInstance" />
 
 ## Configuration
 
@@ -48,7 +50,7 @@ If any of these steps are missing, `ListenService()` may succeed at the API leve
 
 The Tailscale hostname and the service name (without `svc:` prefix) **must not match**. When they collide — e.g. `hostname = "waypoint-db"` and `service = "svc:waypoint-db"` — both resolve to the same FQDN. The machine's DNS entry shadows the service, making the service invisible in the Tailscale admin panel.
 
-Waypoint validates this at config load time and rejects the configuration with an error. To fix it, use a different hostname:
+Waypoint validates this at config load time and rejects the configuration with an error. <TestRef name="TestValidate_ServiceHostnameCollision" /> Distinct hostnames pass the check. <TestRef name="TestValidate_ServiceHostnameNoCollision" /> To fix it, use a different hostname:
 
 ```toml
 # Bad — hostname shadows the service
@@ -68,6 +70,6 @@ service = "svc:waypoint-db"
 
 ## Constraints
 
-- Service hosts **must be tagged nodes**. Untagged nodes receive `ErrUntaggedServiceHost`.
+- Service hosts **must be tagged nodes**. Untagged nodes receive `ErrUntaggedServiceHost`. <TestRef name="TestIntegration_ListenService_UntaggedNodeFails" /> Tagged nodes register successfully. <TestRef name="TestIntegration_ListenService_TaggedNode" />
 - A host must advertise **all ports** defined for the service. If the service is defined with ports 5432 and 3306, you need two `ListenService` calls (two listeners with the same `service` value).
 - Requires **Tailscale v1.86.0 or later**.

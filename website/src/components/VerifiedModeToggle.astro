@@ -1,0 +1,39 @@
+---
+---
+<button
+  id="verified-mode-toggle"
+  type="button"
+  aria-pressed="false"
+  title="Show test verifications for documented claims"
+>
+  <span class="verified-mode-icon" aria-hidden="true">✓</span>
+  <span class="verified-mode-label">Verified mode</span>
+</button>
+<script is:inline>
+  (function () {
+    var KEY = 'waypointVerifiedMode';
+    var root = document.documentElement;
+    var on = false;
+    try { on = localStorage.getItem(KEY) === 'on'; } catch (e) {}
+    if (on) root.setAttribute('data-verified-mode', 'on');
+
+    function wire() {
+      var btn = document.getElementById('verified-mode-toggle');
+      if (!btn || btn.dataset.wired === '1') return;
+      btn.dataset.wired = '1';
+      btn.setAttribute('aria-pressed', String(on));
+      btn.addEventListener('click', function () {
+        on = !on;
+        if (on) root.setAttribute('data-verified-mode', 'on');
+        else root.removeAttribute('data-verified-mode');
+        btn.setAttribute('aria-pressed', String(on));
+        try { localStorage.setItem(KEY, on ? 'on' : 'off'); } catch (e) {}
+      });
+    }
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', wire);
+    } else {
+      wire();
+    }
+  })();
+</script>

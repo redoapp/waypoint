@@ -1,0 +1,33 @@
+---
+import { resolveTest } from '../lib/test-index.mjs';
+
+interface Props {
+  name: string;
+}
+
+const { name } = Astro.props;
+const loc = resolveTest(name);
+if (!loc) {
+  throw new Error(
+    `TestRef: cannot resolve test "${name}". Run \`pnpm verify\` from website/ for details.`,
+  );
+}
+const href = `https://github.com/redoapp/waypoint/blob/main/${loc.file}#L${loc.line}`;
+const tipId = `test-ref-${crypto.randomUUID().slice(0, 8)}`;
+---
+<span class="test-ref">
+  <span
+    class="test-ref-marker"
+    tabindex="0"
+    role="button"
+    aria-label={`Verified by ${name}`}
+    aria-describedby={tipId}
+  >✓</span>
+  <span id={tipId} class="test-ref-popup" role="tooltip">
+    <code class="test-ref-popup-name">{name}</code>
+    <a class="test-ref-popup-link" href={href} target="_blank" rel="noopener">
+      <span>{loc.file}:{loc.line}</span>
+      <span aria-hidden="true">↗</span>
+    </a>
+  </span>
+</span>

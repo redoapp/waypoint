@@ -10,6 +10,10 @@ export default defineConfig({
       title: 'Waypoint',
       description:
         'Tailscale-aware database proxy: identity-based auth, per-user provisioning, connection limits.',
+      customCss: ['./src/styles/verified.css'],
+      components: {
+        SocialIcons: './src/components/SocialIcons.astro',
+      },
       social: [
         {
           icon: 'github',

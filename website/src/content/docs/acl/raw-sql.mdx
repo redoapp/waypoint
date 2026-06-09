@@ -5,7 +5,9 @@ sidebar:
   order: 3
 ---
 
-For advanced cases the presets don't cover — specific tables, `REVOKE`, `ALTER DEFAULT PRIVILEGES`, materialized views, foreign servers — a database grant can include a `sql` field with Go templates that are run during role provisioning.
+import TestRef from '../../../components/TestRef.astro';
+
+For advanced cases the presets don't cover — specific tables, `REVOKE`, `ALTER DEFAULT PRIVILEGES`, materialized views, foreign servers — a database grant can include a `sql` field with Go templates that are run during role provisioning. <TestRef name="TestIntegration_Proxy_RawSQLPermissions" />
 
 ```json
 {
@@ -47,6 +49,10 @@ allow_raw_sql = true
 ```
 
 See [Provisioning & Defaults](/waypoint/configuration/provisioning/).
+
+## Validation
+
+Templates are parsed and validated before execution. Common attack shapes — injection attempts, multi-statement batches, structural malformations, disallowed statement types — are rejected at load time. <TestRef name="TestValidateSQL_InjectionAttempts" /> <TestRef name="TestValidateSQL_RejectedStatementTypes" /> <TestRef name="TestValidateSQL_Malicious" /> Only `GRANT`, `REVOKE`, and `ALTER DEFAULT PRIVILEGES` statements are accepted. <TestRef name="TestValidateSQL_Grants" /> <TestRef name="TestValidateSQL_Revokes" /> <TestRef name="TestValidateSQL_AlterDefaultPrivileges" />
 
 ## Recommendations
 

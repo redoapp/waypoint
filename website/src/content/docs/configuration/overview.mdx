@@ -5,7 +5,9 @@ sidebar:
   order: 1
 ---
 
-Waypoint reads a single TOML file (default: `waypoint.toml`, override with `-config`). It has a small set of top-level sections plus an array of listeners.
+import TestRef from '../../../components/TestRef.astro';
+
+Waypoint reads a single TOML file (default: `waypoint.toml`, override with `-config`). It has a small set of top-level sections plus an array of listeners. <TestRef name="TestLoad_FullConfig" /> <TestRef name="TestLoad_MissingFile" /> <TestRef name="TestLoad_InvalidTOML" />
 
 ```toml
 [tailscale]      # tsnet identity, hostname, auth keys
@@ -21,7 +23,7 @@ Waypoint reads a single TOML file (default: `waypoint.toml`, override with `-con
 
 ## Environment variable interpolation
 
-Any string value may contain `${VAR}`. Variables are resolved from the process environment at load time. Missing variables fail loudly rather than silently expanding to an empty string.
+Any string value may contain `${VAR}`. Variables are resolved from the process environment at load time. Missing variables fail loudly rather than silently expanding to an empty string. <TestRef name="TestLoad_EnvVarExpansion" />
 
 ```toml
 [listeners.postgres]
