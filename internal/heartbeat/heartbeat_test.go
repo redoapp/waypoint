@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -38,8 +39,24 @@ func TestHeartbeat(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 
+	const adminSecret = "SUPER_SECRET_ADMIN_PW"
+	const staticSecret = "STATIC_USER_SECRET"
 	listeners := []config.ListenerConfig{
 		{Name: "test-tcp", Listen: ":5432", Mode: "tcp", Backend: "db:5432"},
+		{
+			Name: "test-pg", Listen: ":5433", Mode: "postgres", Backend: "pg:5432",
+			Postgres: &config.PostgresAdmin{AdminUser: "admin", AdminPassword: adminSecret},
+		},
+		{
+			Name: "test-mongo", Listen: ":27017", Mode: "mongodb", Backend: "mongo:27017",
+			MongoDB: &config.MongoDBAdmin{
+				AdminUser: "admin", AdminPassword: adminSecret,
+				Provision: &config.MongoProvision{
+					Mode:        config.MongoProvisionStatic,
+					StaticUsers: []config.MongoStaticUser{{Name: "ro", Username: "ro", Password: staticSecret}},
+				},
+			},
+		},
 	}
 
 	cfg := Config{
@@ -85,13 +102,31 @@ func TestHeartbeat(t *testing.T) {
 		t.Errorf("bytes_written = %q, want %q", fields["bytes_written"], "2048")
 	}
 
-	// Check listeners JSON.
-	var parsedListeners []config.ListenerConfig
+	// Admin credentials must never be published to Redis.
+	if strings.Contains(fields["listeners"], adminSecret) || strings.Contains(fields["listeners"], staticSecret) {
+		t.Fatalf("heartbeat leaked a secret into Redis: %s", fields["listeners"])
+	}
+
+	// Check redacted listeners JSON: names preserved, provisioner kind surfaced.
+	var parsedListeners []RedactedListener
 	if err := json.Unmarshal([]byte(fields["listeners"]), &parsedListeners); err != nil {
 		t.Fatalf("unmarshal listeners: %v", err)
 	}
-	if len(parsedListeners) != 1 || parsedListeners[0].Name != "test-tcp" {
-		t.Errorf("unexpected listeners: %+v", parsedListeners)
+	if len(parsedListeners) != 3 {
+		t.Fatalf("got %d listeners, want 3: %+v", len(parsedListeners), parsedListeners)
+	}
+	byName := map[string]RedactedListener{}
+	for _, l := range parsedListeners {
+		byName[l.Name] = l
+	}
+	if byName["test-tcp"].Provisioner != "" {
+		t.Errorf("test-tcp provisioner = %q, want empty", byName["test-tcp"].Provisioner)
+	}
+	if byName["test-pg"].Provisioner != "postgres" {
+		t.Errorf("test-pg provisioner = %q, want postgres", byName["test-pg"].Provisioner)
+	}
+	if byName["test-mongo"].Provisioner != "mongodb" {
+		t.Errorf("test-mongo provisioner = %q, want mongodb", byName["test-mongo"].Provisioner)
 	}
 
 	// Check TTL is set.

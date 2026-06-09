@@ -201,8 +201,10 @@ func (l *ListenerConfig) ListenPort() (uint16, error) {
 }
 
 type PostgresAdmin struct {
-	AdminUser     string `toml:"admin_user"`
-	AdminPassword string `toml:"admin_password"`
+	AdminUser string `toml:"admin_user"`
+	// AdminPassword is a secret and must never be serialized off-process
+	// (e.g. into the Redis heartbeat). json:"-" guards against accidental marshaling.
+	AdminPassword string `toml:"admin_password" json:"-"`
 	AdminDatabase string `toml:"admin_database"`
 	UserPrefix    string `toml:"user_prefix"`
 	UserTTL       string `toml:"user_ttl"`
@@ -232,8 +234,9 @@ func (p *PostgresAdmin) UserTTLDuration() time.Duration {
 
 // MongoDBAdmin holds admin credentials for MongoDB user provisioning.
 type MongoDBAdmin struct {
-	AdminUser     string          `toml:"admin_user"`
-	AdminPassword string          `toml:"admin_password"`
+	AdminUser string `toml:"admin_user"`
+	// AdminPassword is a secret and must never be serialized off-process. See PostgresAdmin.
+	AdminPassword string          `toml:"admin_password" json:"-"`
 	AuthDatabase  string          `toml:"auth_database"` // usually "admin"
 	UserPrefix    string          `toml:"user_prefix"`
 	UserTTL       string          `toml:"user_ttl"`
@@ -258,9 +261,10 @@ type MongoProvision struct {
 
 // MongoStaticUser maps an ACL role set to an existing MongoDB/Atlas user.
 type MongoStaticUser struct {
-	Name         string            `toml:"name"`
-	Username     string            `toml:"username"`
-	Password     string            `toml:"password"`
+	Name     string `toml:"name"`
+	Username string `toml:"username"`
+	// Password is a secret and must never be serialized off-process. See PostgresAdmin.
+	Password     string            `toml:"password" json:"-"`
 	AuthDatabase string            `toml:"auth_database"`
 	Database     string            `toml:"database"`
 	Permissions  []string          `toml:"permissions"`

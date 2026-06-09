@@ -1,3 +1,6 @@
+# Web UI bind address. Served on the tailnet via tsnet (NOT a public socket) and
+# gated behind the redo.com/cap/waypointManager capability — only tailnet peers
+# granted that capability can reach it.
 listen = ":8080"
 
 [tailscale]

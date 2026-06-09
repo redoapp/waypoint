@@ -15,8 +15,10 @@ import (
 
 	"github.com/redis/go-redis/v9"
 	"github.com/redoapp/waypoint/internal/admin"
+	"github.com/redoapp/waypoint/internal/auth"
 	"github.com/redoapp/waypoint/internal/logging"
 	"github.com/redoapp/waypoint/internal/monitor"
+	"tailscale.com/client/local"
 	"tailscale.com/tsnet"
 )
 
@@ -67,22 +69,27 @@ func main() {
 
 	store := monitor.NewStore(rdb, cfg.Redis.KeyPrefix)
 
-	// Start tsnet + SSH TUI if enabled.
+	// The monitor exposes per-user limits, internal topology, and state-changing
+	// reset endpoints, so it must live on the tailnet and authorize every caller.
+	// tsnet is always started (the config already mandates Tailscale settings);
+	// the web UI binds to a tsnet listener and is gated behind the manager
+	// capability, mirroring the SSH TUI.
+	tsSrv := new(tsnet.Server)
+	cfg.Tailscale.Apply(tsSrv)
+	if err := tsSrv.Start(); err != nil {
+		logger.Error("tsnet start failed", "error", err)
+		os.Exit(1)
+	}
+	defer tsSrv.Close()
+
+	lc, err := tsSrv.LocalClient()
+	if err != nil {
+		logger.Error("tsnet local client failed", "error", err)
+		os.Exit(1)
+	}
+
+	// Start SSH TUI if enabled.
 	if cfg.SSH.Enabled {
-		tsSrv := new(tsnet.Server)
-		cfg.Tailscale.Apply(tsSrv)
-		if err := tsSrv.Start(); err != nil {
-			logger.Error("tsnet start failed", "error", err)
-			os.Exit(1)
-		}
-		defer tsSrv.Close()
-
-		lc, err := tsSrv.LocalClient()
-		if err != nil {
-			logger.Error("tsnet local client failed", "error", err)
-			os.Exit(1)
-		}
-
 		hostKeyPath := cfg.SSH.HostKey
 		if hostKeyPath == "" {
 			hostKeyPath = filepath.Join(cfg.Tailscale.StateDir, "ssh_host_ed25519_key")
@@ -130,8 +137,13 @@ func main() {
 	h.registerRoutes(mux)
 
 	server := &http.Server{
-		Addr:    cfg.Listen,
-		Handler: mux,
+		Handler: requireManager(lc, logger, mux),
+	}
+
+	webLn, err := tsSrv.Listen("tcp", cfg.Listen)
+	if err != nil {
+		logger.Error("web listen failed", "listen", cfg.Listen, "error", err)
+		os.Exit(1)
 	}
 
 	go func() {
@@ -141,11 +153,24 @@ func main() {
 		server.Shutdown(shutdownCtx)
 	}()
 
-	logger.Info("starting monitor", "addr", cfg.Listen)
-	if err := server.ListenAndServe(); err != http.ErrServerClosed {
+	logger.Info("starting monitor", "addr", cfg.Listen, "hostname", cfg.Tailscale.Hostname)
+	if err := server.Serve(webLn); err != http.ErrServerClosed {
 		logger.Error("server error", "error", err)
 		os.Exit(1)
 	}
 
 	logger.Info("shutdown complete")
+}
+
+// requireManager gates HTTP requests behind the waypointManager capability,
+// using Tailscale WhoIs on the connecting peer (same check as the SSH TUI).
+func requireManager(lc *local.Client, logger *slog.Logger, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, err := auth.AuthorizeManager(r.Context(), lc, r.RemoteAddr, logger); err != nil {
+			logger.Info("monitor access denied", "remote", r.RemoteAddr, "path", r.URL.Path, "error", err)
+			http.Error(w, "Access denied: you do not have the waypointManager capability.", http.StatusForbidden)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
