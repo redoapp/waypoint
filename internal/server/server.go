@@ -74,6 +74,14 @@ func RunServer(ctx context.Context, configPath string, logger *slog.Logger, leve
 	}
 	defer m.Shutdown(ctx)
 
+	// Continuous profiling (Datadog). No-op unless DD_PROFILING_ENABLED is set.
+	// A profiler failure must not take down the proxy, so log and continue.
+	if stopProfiler, err := metrics.StartProfiling(logger); err != nil {
+		logger.Warn("datadog profiler disabled", "error", err)
+	} else {
+		defer stopProfiler()
+	}
+
 	// Redis client.
 	redisAddr := cfg.Redis.Address
 	if redisAddr == "" {
