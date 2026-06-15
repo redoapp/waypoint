@@ -3,12 +3,19 @@ package mongowire
 import (
 	"crypto/hmac"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"net"
 	"strings"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 )
+
+// ErrAuthFailed marks a handshake that failed because the client presented
+// wrong credentials (e.g. a SCRAM client-proof mismatch). The proxy uses this
+// to treat the failure as a client auth error — logged at warning level and
+// counted as an auth failure — rather than a proxy/backend fault.
+var ErrAuthFailed = errors.New("authentication failed")
 
 // DummyPassword is the well-known password that MongoDB clients may use when
 // connecting through waypoint with credentials. Tailscale identity is the real
@@ -315,7 +322,7 @@ func readAndCompleteSASL(clientConn net.Conn, srv *SCRAMServer, clientFirst, ser
 		errReply, _ := BuildErrorReply(contMsg.Header.RequestID, 18,
 			fmt.Sprintf("authentication failed: use password %q or connect without credentials", DummyPassword))
 		WriteMessage(clientConn, errReply)
-		return nil, fmt.Errorf("client proof mismatch: use password %q or connect without credentials", DummyPassword)
+		return nil, fmt.Errorf("client proof mismatch: use password %q or connect without credentials: %w", DummyPassword, ErrAuthFailed)
 	}
 
 	serverKey := scramHMAC(saltedPassword, []byte("Server Key"))

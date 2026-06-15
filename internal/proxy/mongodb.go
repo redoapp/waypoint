@@ -84,10 +84,7 @@ func (p *MongoDBProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 	// We need the backend's real hello to build a proper reply.
 	clientHello, err := mongowire.ReadClientHello(clientConn)
 	if err != nil {
-		setupSpan.RecordError(err)
-		setupSpan.SetStatus(codes.Error, "read client hello failed")
-		setupSpan.End()
-		log.ErrorContext(ctx, "read client hello failed", "error", err)
+		recordSetupFailure(ctx, log, m, setupSpan, err, "read client hello failed", "read client hello failed", p.Name, "mongodb")
 		return
 	}
 
@@ -291,10 +288,18 @@ func (p *MongoDBProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 
 	hsResult, err := mongowire.CompleteHandshakeWithTopologyMap(clientConn, clientHello, backendHelloDoc, proxyAddr, topologyMap)
 	if err != nil {
-		setupSpan.RecordError(err)
-		setupSpan.SetStatus(codes.Error, "client handshake failed")
-		setupSpan.End()
-		log.ErrorContext(ctx, "client handshake failed", "error", err)
+		if errors.Is(err, mongowire.ErrAuthFailed) {
+			// Client presented wrong credentials. It already received a proper
+			// SCRAM rejection; this is a client error, not a proxy fault, so it
+			// is not an error span — count it as an auth failure instead.
+			setupSpan.SetAttributes(attribute.String("waypoint.setup_outcome", "auth_failed"))
+			setupSpan.End()
+			m.AuthFailures.Add(ctx, 1, m.Attrs("waypoint.auth.failures", listenerAttr))
+			m.ConnRejected.Add(ctx, 1, m.Attrs("waypoint.conn.rejected", listenerAttr, modeAttr))
+			log.WarnContext(ctx, "client handshake auth failed", "error", err)
+			return
+		}
+		recordSetupFailure(ctx, log, m, setupSpan, err, "client handshake failed", "client handshake failed", p.Name, "mongodb")
 		return
 	}
 

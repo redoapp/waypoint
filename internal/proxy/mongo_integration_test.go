@@ -943,3 +943,119 @@ func TestIntegration_MongoProxy_ReplicaSetWithAuth(t *testing.T) {
 		t.Fatalf("find via SCRAM through RS: %v", err)
 	}
 }
+
+// TestIntegration_MongoProxy_TwoClustersRouteIndependently guards against the
+// reported bug where configuring two MongoDB clusters caused both listeners to
+// proxy to the same backend. Two independent MongoDB containers are seeded with
+// distinct marker documents; a client reading through each proxy must observe
+// only its own cluster's marker.
+func TestIntegration_MongoProxy_TwoClustersRouteIndependently(t *testing.T) {
+	connStrA, backendA := testutil.MongoDBBackend(t)
+	connStrB, backendB := testutil.MongoDBBackendSecondary(t)
+
+	if backendA == backendB {
+		t.Fatalf("expected two distinct backends, both = %q", backendA)
+	}
+
+	const (
+		dbName   = "routingtest"
+		collName = "marker"
+	)
+	// Seed a distinct marker directly into each cluster (bypassing the proxy).
+	seedMongoMarker(t, connStrA, dbName, collName, "cluster-a")
+	seedMongoMarker(t, connStrB, dbName, collName, "cluster-b")
+
+	result := makeMongoAuthResult(map[string]auth.MongoDBPermissions{
+		dbName: {Permissions: []string{"readwrite"}},
+	}, nil)
+
+	addrA := setupMongoProxyForBackend(t, backendA, result)
+	addrB := setupMongoProxyForBackend(t, backendB, result)
+
+	if got := readMongoMarker(t, addrA, dbName, collName); got != "cluster-a" {
+		t.Fatalf("proxy A returned marker %q, want cluster-a (listener A routed to the wrong backend)", got)
+	}
+	if got := readMongoMarker(t, addrB, dbName, collName); got != "cluster-b" {
+		t.Fatalf("proxy B returned marker %q, want cluster-b (listener B routed to the wrong backend)", got)
+	}
+}
+
+// setupMongoProxyForBackend starts a database-provisioning MongoDB proxy in
+// front of the given backend and returns its listen address.
+func setupMongoProxyForBackend(t *testing.T, backend string, authResult *auth.AuthResult) string {
+	t.Helper()
+
+	rdb := testutil.RedisClient(t)
+	m := metrics.Noop()
+	store := restrict.NewRedisStore(rdb, "mongoroutetest:", m)
+	tracker := restrict.NewTracker(store, m, slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})))
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	provisioner := provision.NewMongoProvisioner("admin", "adminpass", backend, "admin", "wp_", "test", false, store, logger, nil)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { ln.Close() })
+
+	p := &proxy.MongoDBProxy{
+		Backend:     backend,
+		Name:        "test-listener",
+		ListenAddr:  ln.Addr().String(),
+		Auth:        &mockAuthorizer{result: authResult},
+		Tracker:     tracker,
+		Provisioner: provisioner,
+		Metrics:     m,
+		MongoConfig: &config.MongoDBAdmin{
+			AdminUser:     "admin",
+			AdminPassword: "adminpass",
+			AuthDatabase:  "admin",
+			UserPrefix:    "wp_",
+		},
+		Logger:       logger,
+		BytesRead:    &atomic.Int64{},
+		BytesWritten: &atomic.Int64{},
+	}
+
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go p.HandleConn(context.Background(), conn)
+		}
+	}()
+
+	return ln.Addr().String()
+}
+
+// seedMongoMarker inserts a single {cluster: value} document directly into the
+// backend (not through the proxy) so tests can identify which cluster a proxy
+// is actually talking to.
+func seedMongoMarker(t *testing.T, connStr, dbName, collName, value string) {
+	t.Helper()
+	client := mongoIntegrationAdminClient(t, connStr)
+	_, err := client.Database(dbName).Collection(collName).InsertOne(context.Background(), bson.D{
+		{Key: "cluster", Value: value},
+	})
+	if err != nil {
+		t.Fatalf("seed marker %q: %v", value, err)
+	}
+}
+
+// readMongoMarker connects through the proxy at addr and returns the cluster
+// marker value it observes.
+func readMongoMarker(t *testing.T, addr, dbName, collName string) string {
+	t.Helper()
+	client := mongoProxyConnect(t, addr, dbName)
+	var doc struct {
+		Cluster string `bson:"cluster"`
+	}
+	err := client.Database(dbName).Collection(collName).FindOne(context.Background(), bson.D{}).Decode(&doc)
+	if err != nil {
+		t.Fatalf("read marker via %s: %v", addr, err)
+	}
+	return doc.Cluster
+}

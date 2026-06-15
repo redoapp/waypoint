@@ -139,10 +139,15 @@ func (p *PostgresProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 			pgwire.SendErrorResponse(clientConn, "FATAL", "28000", "TLS is required for this listener")
 			return
 		}
-		setupSpan.RecordError(err)
-		setupSpan.SetStatus(codes.Error, "read startup failed")
-		setupSpan.End()
-		log.ErrorContext(ctx, "read startup failed", "error", err)
+		if errors.Is(err, pgwire.ErrCancelRequest) {
+			// Client sent a CancelRequest, not a startup. We don't forward query
+			// cancellation; close cleanly without recording an error.
+			setupSpan.SetAttributes(attribute.String("waypoint.setup_outcome", "cancel_request"))
+			setupSpan.End()
+			log.DebugContext(ctx, "client sent cancel request; closing")
+			return
+		}
+		recordSetupFailure(ctx, log, m, setupSpan, err, "read startup failed", "read startup failed", p.Name, "postgres")
 		return
 	}
 

@@ -49,6 +49,7 @@ max_conns_total = 200
 # "waypoint.conn.total"       = ["listener", "mode"]
 # "waypoint.conn.duration"    = ["listener", "user", "backend"]
 # "waypoint.conn.rejected"    = ["listener", "mode"]
+# "waypoint.handshake.aborted" = ["listener", "mode"]  # benign client disconnects during handshake
 # "waypoint.auth.attempts"    = ["listener"]
 # "waypoint.auth.failures"    = ["listener"]
 # "waypoint.auth.latency"     = ["listener", "backend"]

@@ -38,6 +38,11 @@ type Metrics struct {
 	ConnTotal    metric.Int64Counter
 	ConnDuration metric.Float64Histogram
 	ConnRejected metric.Int64Counter
+	// HandshakeAborted counts connection setups that ended in a benign client
+	// disconnect during the handshake (e.g. MongoDB driver monitoring probes).
+	// These are deliberately not recorded as error spans; this counter keeps
+	// them observable.
+	HandshakeAborted metric.Int64Counter
 
 	// Auth metrics.
 	AuthAttempts metric.Int64Counter
@@ -224,6 +229,9 @@ func (m *Metrics) init() (*Metrics, error) {
 		return nil, err
 	}
 	if m.ConnRejected, err = meter("waypoint.conn.rejected").Int64Counter("waypoint.conn.rejected"); err != nil {
+		return nil, err
+	}
+	if m.HandshakeAborted, err = meter("waypoint.handshake.aborted").Int64Counter("waypoint.handshake.aborted"); err != nil {
 		return nil, err
 	}
 	if m.AuthAttempts, err = meter("waypoint.auth.attempts").Int64Counter("waypoint.auth.attempts"); err != nil {

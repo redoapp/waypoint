@@ -417,6 +417,132 @@ func TestBuildMongoTopologyMapWithSRVBackends(t *testing.T) {
 	}
 }
 
+// TestTwoMongoListenersRouteToDistinctClusters guards against the reported bug
+// where configuring two MongoDB clusters caused both listeners to point at the
+// same backend. It loads a config with two mongodb listeners, then derives each
+// listener's backend wiring exactly as Run does and asserts the two listeners
+// never share a backend address, provision seed, or topology-map entry.
+func TestTwoMongoListenersRouteToDistinctClusters(t *testing.T) {
+	const cfgTOML = `
+[tailscale]
+hostname = "waypoint-db"
+
+[[listeners]]
+name = "mongo-a"
+mode = "mongodb"
+
+[listeners.mongodb]
+admin_user = "admin"
+admin_password = "passa"
+
+[[listeners.mongodb.members]]
+backend = "mongo-a1.internal:27017"
+listen = ":27017"
+advertise = "waypoint-db:27017"
+
+[[listeners.mongodb.members]]
+backend = "mongo-a2.internal:27017"
+listen = ":27018"
+advertise = "waypoint-db:27018"
+
+[[listeners]]
+name = "mongo-b"
+mode = "mongodb"
+
+[listeners.mongodb]
+admin_user = "admin"
+admin_password = "passb"
+
+[[listeners.mongodb.members]]
+backend = "mongo-b1.internal:27017"
+listen = ":27027"
+advertise = "waypoint-db:27027"
+
+[[listeners.mongodb.members]]
+backend = "mongo-b2.internal:27017"
+listen = ":27028"
+advertise = "waypoint-db:27028"
+`
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "waypoint.toml")
+	if err := os.WriteFile(path, []byte(cfgTOML), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if len(cfg.Listeners) != 2 {
+		t.Fatalf("expected 2 listeners, got %d", len(cfg.Listeners))
+	}
+
+	// Derive each listener's backend wiring the same way Run does.
+	type wiring struct {
+		backends         []string
+		provisionSeeds   []string
+		topologyBackends []string
+	}
+	derived := make([]wiring, len(cfg.Listeners))
+	for i, lCfg := range cfg.Listeners {
+		pairs := lCfg.ExpandedBackends()
+		topologyMap, err := buildMongoTopologyMap(lCfg, pairs, cfg.Tailscale.Hostname)
+		if err != nil {
+			t.Fatalf("listener %q topology map: %v", lCfg.Name, err)
+		}
+		var w wiring
+		for _, be := range pairs {
+			w.backends = append(w.backends, be.Backend)
+		}
+		w.provisionSeeds = mongoProvisionBackends(lCfg, pairs)
+		for backend := range topologyMap {
+			w.topologyBackends = append(w.topologyBackends, backend)
+		}
+		derived[i] = w
+	}
+
+	// Each listener must resolve to its own cluster's members.
+	if !containsAll(derived[0].backends, "mongo-a1.internal:27017", "mongo-a2.internal:27017") {
+		t.Fatalf("listener mongo-a backends = %v, want mongo-a members", derived[0].backends)
+	}
+	if !containsAll(derived[1].backends, "mongo-b1.internal:27017", "mongo-b2.internal:27017") {
+		t.Fatalf("listener mongo-b backends = %v, want mongo-b members", derived[1].backends)
+	}
+
+	// No backend, provision seed, or topology-map key may be shared between the
+	// two listeners — that overlap is exactly the "both point to the same
+	// cluster" bug.
+	assertDisjoint(t, "backend", derived[0].backends, derived[1].backends)
+	assertDisjoint(t, "provision seed", derived[0].provisionSeeds, derived[1].provisionSeeds)
+	assertDisjoint(t, "topology key", derived[0].topologyBackends, derived[1].topologyBackends)
+}
+
+func containsAll(haystack []string, needles ...string) bool {
+	set := make(map[string]bool, len(haystack))
+	for _, h := range haystack {
+		set[h] = true
+	}
+	for _, n := range needles {
+		if !set[n] {
+			return false
+		}
+	}
+	return true
+}
+
+func assertDisjoint(t *testing.T, kind string, a, b []string) {
+	t.Helper()
+	set := make(map[string]bool, len(a))
+	for _, v := range a {
+		set[v] = true
+	}
+	for _, v := range b {
+		if set[v] {
+			t.Fatalf("%s %q is shared between both listeners; clusters are not isolated", kind, v)
+		}
+	}
+}
+
 func buildTestSRVDNSResponse(t *testing.T, name string, records ...tsdns.SRVRecord) []byte {
 	t.Helper()
 

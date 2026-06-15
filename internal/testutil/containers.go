@@ -47,6 +47,13 @@ var (
 	mongoBackend string
 	mongoErr     error
 
+	// A second, fully independent MongoDB backend used by tests that need to
+	// prove two configured clusters route to distinct backends.
+	mongoSecondaryOnce    sync.Once
+	mongoSecondaryConnStr string
+	mongoSecondaryBackend string
+	mongoSecondaryErr     error
+
 	mongoRSOnce sync.Once
 	mongoRSData *MongoRSInfo
 	mongoRSErr  error
@@ -387,96 +394,120 @@ func MongoDBBackend(t *testing.T) (connStr string, backend string) {
 	t.Helper()
 
 	mongoOnce.Do(func() {
-		ctx := context.Background()
-		container, err := tcmongo.Run(ctx, "mongo:8",
-			tcmongo.WithUsername("admin"),
-			tcmongo.WithPassword("adminpass"),
-		)
-		if err != nil {
-			mongoErr = fmt.Errorf("start mongodb container: %w", err)
-			return
-		}
-
-		cs, err := container.ConnectionString(ctx)
-		if err != nil {
-			mongoErr = fmt.Errorf("mongodb connection string: %w", err)
-			return
-		}
-
-		host, err := container.Host(ctx)
-		if err != nil {
-			mongoErr = fmt.Errorf("mongodb host: %w", err)
-			return
-		}
-
-		port, err := container.MappedPort(ctx, "27017/tcp")
-		if err != nil {
-			mongoErr = fmt.Errorf("mongodb port: %w", err)
-			return
-		}
-
-		opts := options.Client().ApplyURI(cs).SetServerSelectionTimeout(30 * time.Second)
-		var client *mongo.Client
-		for i := 0; i < 20; i++ {
-			client, err = mongo.Connect(opts)
-			if err == nil {
-				err = client.Ping(ctx, nil)
-				if err == nil {
-					client.Disconnect(ctx)
-					break
-				}
-				client.Disconnect(ctx)
-			}
-			time.Sleep(1 * time.Second)
-		}
-		if err != nil {
-			mongoErr = fmt.Errorf("mongodb connect after reconfig: %w", err)
-			return
-		}
-
-		mongoConnStr = cs
-		mongoBackend = fmt.Sprintf("%s:%s", host, port.Port())
+		mongoConnStr, mongoBackend, mongoErr = startMongoBackendContainer()
 	})
 
 	if mongoErr != nil {
 		t.Fatalf("mongodb container: %v", mongoErr)
 	}
 
-	// Clean up non-system databases and provisioned users before each test.
+	cleanupMongoBackend(mongoConnStr)
+	return mongoConnStr, mongoBackend
+}
+
+// MongoDBBackendSecondary starts a second, fully independent MongoDB container
+// (once per test binary) and returns its connection info. It exists so tests can
+// configure two distinct clusters and verify each listener routes to its own
+// backend rather than both pointing at the same one.
+func MongoDBBackendSecondary(t *testing.T) (connStr string, backend string) {
+	t.Helper()
+
+	mongoSecondaryOnce.Do(func() {
+		mongoSecondaryConnStr, mongoSecondaryBackend, mongoSecondaryErr = startMongoBackendContainer()
+	})
+
+	if mongoSecondaryErr != nil {
+		t.Fatalf("secondary mongodb container: %v", mongoSecondaryErr)
+	}
+
+	cleanupMongoBackend(mongoSecondaryConnStr)
+	return mongoSecondaryConnStr, mongoSecondaryBackend
+}
+
+// startMongoBackendContainer runs a standalone mongo:8 container with
+// admin/adminpass and waits until it accepts connections.
+func startMongoBackendContainer() (connStr string, backend string, err error) {
 	ctx := context.Background()
-	opts := options.Client().ApplyURI(mongoConnStr)
-	client, err := mongo.Connect(opts)
-	if err == nil {
-		names, _ := client.ListDatabaseNames(ctx, bson.M{})
-		for _, name := range names {
-			if name != "admin" && name != "local" && name != "config" {
-				client.Database(name).Drop(ctx)
+	container, err := tcmongo.Run(ctx, "mongo:8",
+		tcmongo.WithUsername("admin"),
+		tcmongo.WithPassword("adminpass"),
+	)
+	if err != nil {
+		return "", "", fmt.Errorf("start mongodb container: %w", err)
+	}
+
+	cs, err := container.ConnectionString(ctx)
+	if err != nil {
+		return "", "", fmt.Errorf("mongodb connection string: %w", err)
+	}
+
+	host, err := container.Host(ctx)
+	if err != nil {
+		return "", "", fmt.Errorf("mongodb host: %w", err)
+	}
+
+	port, err := container.MappedPort(ctx, "27017/tcp")
+	if err != nil {
+		return "", "", fmt.Errorf("mongodb port: %w", err)
+	}
+
+	opts := options.Client().ApplyURI(cs).SetServerSelectionTimeout(30 * time.Second)
+	var client *mongo.Client
+	for i := 0; i < 20; i++ {
+		client, err = mongo.Connect(opts)
+		if err == nil {
+			err = client.Ping(ctx, nil)
+			if err == nil {
+				client.Disconnect(ctx)
+				break
 			}
+			client.Disconnect(ctx)
 		}
-		// Drop provisioned users (wp_ prefix) but keep the admin user.
-		result := client.Database("admin").RunCommand(ctx, bson.D{
-			{Key: "usersInfo", Value: 1},
-		})
-		var resp struct {
-			Users []struct {
-				User string `bson:"user"`
-			} `bson:"users"`
+		time.Sleep(1 * time.Second)
+	}
+	if err != nil {
+		return "", "", fmt.Errorf("mongodb connect after reconfig: %w", err)
+	}
+
+	return cs, fmt.Sprintf("%s:%s", host, port.Port()), nil
+}
+
+// cleanupMongoBackend drops non-system databases and provisioned (wp_) users so
+// each test starts from a clean slate on a shared backend.
+func cleanupMongoBackend(connStr string) {
+	ctx := context.Background()
+	opts := options.Client().ApplyURI(connStr)
+	client, err := mongo.Connect(opts)
+	if err != nil {
+		return
+	}
+	names, _ := client.ListDatabaseNames(ctx, bson.M{})
+	for _, name := range names {
+		if name != "admin" && name != "local" && name != "config" {
+			client.Database(name).Drop(ctx)
 		}
-		if result.Err() == nil {
-			if err := result.Decode(&resp); err == nil {
-				for _, u := range resp.Users {
-					if strings.HasPrefix(u.User, "wp_") {
-						client.Database("admin").RunCommand(ctx, bson.D{
-							{Key: "dropUser", Value: u.User},
-						})
-					}
+	}
+	// Drop provisioned users (wp_ prefix) but keep the admin user.
+	result := client.Database("admin").RunCommand(ctx, bson.D{
+		{Key: "usersInfo", Value: 1},
+	})
+	var resp struct {
+		Users []struct {
+			User string `bson:"user"`
+		} `bson:"users"`
+	}
+	if result.Err() == nil {
+		if err := result.Decode(&resp); err == nil {
+			for _, u := range resp.Users {
+				if strings.HasPrefix(u.User, "wp_") {
+					client.Database("admin").RunCommand(ctx, bson.D{
+						{Key: "dropUser", Value: u.User},
+					})
 				}
 			}
 		}
-		client.Disconnect(ctx)
 	}
-
-	return mongoConnStr, mongoBackend
+	client.Disconnect(ctx)
 }
 
 // MongoDBReplicaSet starts a shared 3-node MongoDB replica set (once per test

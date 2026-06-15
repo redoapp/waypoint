@@ -12,9 +12,23 @@ import (
 	"github.com/redoapp/waypoint/internal/config"
 )
 
-var ErrTLSRequired = errors.New("postgres client TLS required")
+var (
+	ErrTLSRequired = errors.New("postgres client TLS required")
+	// ErrCancelRequest indicates the client sent a Postgres CancelRequest
+	// rather than a startup message. We do not forward query cancellation, so
+	// the proxy treats this as a benign close rather than an error.
+	ErrCancelRequest = errors.New("postgres cancel request")
+)
 
-const sslRequestCode = 80877103
+// Special request codes carried in the first Int32 of a startup packet. Each is
+// 1234 in the high 16 bits and 567x in the low 16 bits (see PostgreSQL protocol
+// "Message Formats"). Normal startup packets instead carry a protocol version
+// (e.g. 196608 for 3.0).
+const (
+	sslRequestCode    = 80877103 // SSLRequest    (1234<<16 | 5679)
+	gssEncRequestCode = 80877104 // GSSENCRequest (1234<<16 | 5680)
+	cancelRequestCode = 80877102 // CancelRequest (1234<<16 | 5678)
+)
 
 // ReadStartupMessage reads the initial PG startup message from the client and
 // negotiates Postgres SSL/TLS when enabled. It returns the live client
@@ -52,6 +66,21 @@ func ReadStartupMessage(conn net.Conn, mode config.PostgresTLSMode, tlsConfig *t
 			continue
 		}
 
+		if isGSSEncRequest(msgLen, body) {
+			// We don't support GSSAPI encryption. Decline with 'N'; a conforming
+			// client falls back to a plain (or SSL) startup on the same connection.
+			if _, err := conn.Write([]byte{'N'}); err != nil {
+				return conn, nil, fmt.Errorf("deny GSS encryption: %w", err)
+			}
+			continue
+		}
+
+		if isCancelRequest(msgLen, body) {
+			// A CancelRequest is a complete frame, not a startup. Surface a
+			// sentinel so the proxy closes cleanly without recording an error.
+			return conn, nil, ErrCancelRequest
+		}
+
 		if mode == config.PostgresTLSRequire && !tlsAccepted {
 			return conn, nil, ErrTLSRequired
 		}
@@ -87,6 +116,25 @@ func isSSLRequest(msgLen int, body []byte) bool {
 	}
 	version := int(body[0])<<24 | int(body[1])<<16 | int(body[2])<<8 | int(body[3])
 	return version == sslRequestCode
+}
+
+func isGSSEncRequest(msgLen int, body []byte) bool {
+	if msgLen != 8 || len(body) != 4 {
+		return false
+	}
+	version := int(body[0])<<24 | int(body[1])<<16 | int(body[2])<<8 | int(body[3])
+	return version == gssEncRequestCode
+}
+
+// isCancelRequest reports whether the packet is a CancelRequest. Its layout is
+// Int32(16) length, Int32 cancel code, Int32 backend PID, Int32 secret key — so
+// the body (length-prefix excluded) is 12 bytes beginning with the cancel code.
+func isCancelRequest(msgLen int, body []byte) bool {
+	if msgLen != 16 || len(body) != 12 {
+		return false
+	}
+	version := int(body[0])<<24 | int(body[1])<<16 | int(body[2])<<8 | int(body[3])
+	return version == cancelRequestCode
 }
 
 // UpgradeToTLS sends an SSLRequest to the backend and upgrades the connection

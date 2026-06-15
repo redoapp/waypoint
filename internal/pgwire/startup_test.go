@@ -8,6 +8,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"errors"
+	"io"
 	"math/big"
 	"net"
 	"strings"
@@ -79,6 +80,65 @@ func TestReadStartupMessage_SSLDenied(t *testing.T) {
 
 	if msg.Parameters["user"] != "ssluser" {
 		t.Errorf("user = %q, want ssluser", msg.Parameters["user"])
+	}
+}
+
+func TestReadStartupMessage_GSSEncDenied(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	go func() {
+		// Send GSSENCRequest (8 bytes: length=8, version=80877104 = 0x04D21630).
+		client.Write([]byte{0, 0, 0, 8, 0x04, 0xD2, 0x16, 0x30})
+
+		// Read the 'N' denial.
+		buf := make([]byte, 1)
+		n, err := client.Read(buf)
+		if err != nil || n != 1 || buf[0] != 'N' {
+			t.Errorf("expected 'N', got %v (err: %v)", buf[:n], err)
+			return
+		}
+
+		// Then send a real startup message on the same connection.
+		WriteStartupMessage(client, "gssuser", "gssdb", nil)
+	}()
+
+	_, msg, err := ReadStartupMessage(server, config.PostgresTLSOff, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if msg.Parameters["user"] != "gssuser" {
+		t.Errorf("user = %q, want gssuser", msg.Parameters["user"])
+	}
+}
+
+func TestReadStartupMessage_CancelRequest(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	go func() {
+		// CancelRequest: length=16, code=80877102 (0x04D2162E), pid=1, secret=2.
+		client.Write([]byte{0, 0, 0, 16, 0x04, 0xD2, 0x16, 0x2E, 0, 0, 0, 1, 0, 0, 0, 2})
+	}()
+
+	_, _, err := ReadStartupMessage(server, config.PostgresTLSOff, nil)
+	if !errors.Is(err, ErrCancelRequest) {
+		t.Fatalf("expected ErrCancelRequest, got %v", err)
+	}
+}
+
+func TestReadStartupMessage_EOFBeforeStartup(t *testing.T) {
+	client, server := net.Pipe()
+	defer server.Close()
+
+	// Client closes without sending anything.
+	go client.Close()
+
+	_, _, err := ReadStartupMessage(server, config.PostgresTLSOff, nil)
+	if !errors.Is(err, io.EOF) {
+		t.Fatalf("expected error wrapping io.EOF, got %v", err)
 	}
 }
 
