@@ -84,6 +84,11 @@ admin_database = "postgres"
 user_prefix = "wp_"
 user_ttl = "24h"
 # service_name = "my-prod-db"   # peer.service override for OTel (default: listener name)
+# Roles that may create tables (e.g. a migration owner). When set, Waypoint
+# installs ALTER DEFAULT PRIVILEGES so tables these roles create in the future
+# automatically carry each preset's privileges — new tables are usable
+# immediately without waiting for a re-grant. Only applies to preset grants.
+# table_creator_roles = ["app_owner", "migrator"]
 
 [[listeners]]
 name = "raw-mysql"

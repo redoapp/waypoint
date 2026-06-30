@@ -421,6 +421,7 @@ func RunServer(ctx context.Context, configPath string, logger *slog.Logger, leve
 					lCfg.Postgres.UserPrefix,
 					lCfg.BackendTLS,
 					config.AllowRawSQLResolved(lCfg.Postgres, &cfg.Provisioning),
+					lCfg.Postgres.TableCreatorRoles,
 					pgPeerService,
 					store,
 					logger.With("component", "provisioner", "listener", lCfg.Name),
