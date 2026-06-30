@@ -182,6 +182,30 @@ Access is controlled by Tailscale ACL capability grants. The `permissions` field
 
 By default, presets apply to the `public` schema. Use `schemas` to target other schemas.
 
+#### New tables
+
+Preset grants use `GRANT ... ON ALL TABLES IN SCHEMA`, which only covers tables
+that exist at grant time — a table created afterward is invisible to existing
+users until the grant is re-applied. To make new tables usable immediately, list
+the backend roles that create tables (typically a migration owner) under
+`table_creator_roles` on the Postgres listener:
+
+```toml
+[listeners.postgres]
+admin_user = "waypoint_admin"
+table_creator_roles = ["app_owner", "migrator"]
+```
+
+When set, Waypoint additionally issues `ALTER DEFAULT PRIVILEGES FOR ROLE <role>`
+for each preset group, so tables and sequences those roles create in the future
+automatically receive the same privileges the preset grants on existing objects
+(`readonly` → `SELECT`, `readwrite` → `SELECT`/`INSERT`/`UPDATE`/`DELETE`,
+`admin` → `ALL PRIVILEGES`). `ALTER DEFAULT PRIVILEGES` only applies to the
+role that creates the object, so every table-creating role must be listed.
+
+This applies to preset grants only. Grant sets that use the `sql` field manage
+their own `ALTER DEFAULT PRIVILEGES` explicitly (see below).
+
 Postgres clients can lower the effective preset for one connection with the
 `waypoint_presets` query parameter:
 

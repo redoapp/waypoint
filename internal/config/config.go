@@ -210,6 +210,11 @@ type PostgresAdmin struct {
 	UserTTL       string `toml:"user_ttl"`
 	AllowRawSQL   *bool  `toml:"allow_raw_sql"` // nil = use global
 	ServiceName   string `toml:"service_name"`  // peer.service override for OTel (default: listener name)
+	// TableCreatorRoles names existing backend roles that may create tables
+	// (e.g. a migration owner). When set, future tables created by these
+	// roles automatically receive each preset group's privileges via
+	// ALTER DEFAULT PRIVILEGES, so new tables are immediately usable.
+	TableCreatorRoles []string `toml:"table_creator_roles"`
 }
 
 // AllowRawSQLResolved returns whether raw SQL is allowed for this listener,
@@ -489,6 +494,14 @@ func validate(cfg *Config) error {
 		if l.MongoDB != nil {
 			if err := validateMongoProvision(i, l.MongoDB); err != nil {
 				return err
+			}
+		}
+
+		if l.Postgres != nil {
+			for j, role := range l.Postgres.TableCreatorRoles {
+				if strings.TrimSpace(role) == "" {
+					return fmt.Errorf("listeners[%d].postgres.table_creator_roles[%d] must not be empty", i, j)
+				}
 			}
 		}
 

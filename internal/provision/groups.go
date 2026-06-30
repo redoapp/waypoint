@@ -168,8 +168,53 @@ func (p *Provisioner) ensurePresetGroup(ctx context.Context, tx pgx.Tx, dialect 
 			return "", fmt.Errorf("grant %q to group: %w", frag, err)
 		}
 	}
+	if err := p.applyDefaultPrivileges(ctx, tx, preset, schema, name); err != nil {
+		return "", err
+	}
 	_ = p.store.MarkGroupReady(ctx, name, groupReadyTTL)
 	return name, nil
+}
+
+// applyDefaultPrivileges installs ALTER DEFAULT PRIVILEGES entries so that
+// tables and sequences created in the future by one of the configured
+// table-creator roles automatically carry this preset group's privileges.
+// GRANT ... ON ALL TABLES only affects objects that exist at grant time, so
+// without this, tables created after a group is bootstrapped stay invisible
+// to its members until the next re-bootstrap. This runs only for preset
+// groups — the composite/raw-SQL path lets authors manage their own
+// ALTER DEFAULT PRIVILEGES explicitly — and only when creator roles are
+// configured.
+func (p *Provisioner) applyDefaultPrivileges(ctx context.Context, tx pgx.Tx, preset, schema, group string) error {
+	for _, stmt := range buildDefaultPrivilegeStatements(p.tableCreatorRoles, preset, schema, group) {
+		if _, err := tx.Exec(ctx, stmt); err != nil {
+			return fmt.Errorf("apply default privileges (%s, schema %q): %w", preset, schema, err)
+		}
+	}
+	return nil
+}
+
+// buildDefaultPrivilegeStatements returns the ALTER DEFAULT PRIVILEGES
+// statements that mirror a preset's table/sequence grants onto future
+// objects created by each creator role. It returns nil when there are no
+// creator roles or the preset has no default-privilege analogue.
+func buildDefaultPrivilegeStatements(creators []string, preset, schema, group string) []string {
+	grants := defaultPrivilegeGrants(preset)
+	if len(creators) == 0 || len(grants) == 0 {
+		return nil
+	}
+	quotedGroup := pgx.Identifier{group}.Sanitize()
+	quotedSchema := pgx.Identifier{schema}.Sanitize()
+	var stmts []string
+	for _, creator := range creators {
+		quotedCreator := pgx.Identifier{creator}.Sanitize()
+		for _, grant := range grants {
+			stmts = append(stmts, fmt.Sprintf(
+				"ALTER DEFAULT PRIVILEGES FOR ROLE %s IN SCHEMA %s GRANT %s TO %s",
+				quotedCreator, quotedSchema, grant, quotedGroup,
+			))
+		}
+	}
+	return stmts
 }
 
 // ensureCompositeGroup creates the content-addressed composite group
