@@ -204,6 +204,21 @@ backend = "10.0.1.5:3306"
 # user_ttl = "24h"
 # service_name = "opensearch-prod"
 #
+# Amazon OpenSearch Service with IAM / fine-grained access control: sign the
+# Security-API provisioning calls with AWS SigV4 instead of Basic auth. The
+# signing IAM identity must be mapped to a backend role that can manage internal
+# users/roles (and the domain must have the internal user database enabled, since
+# proxied client requests still use the provisioned internal user's Basic auth).
+# Credentials come from the default AWS chain; role_arn is assumed if set.
+# backend_auth = "aws_iam"   # "basic" (default) | "aws_iam"
+# admin_user / admin_password are then optional.
+#
+# [listeners.opensearch.aws]
+# region = "us-east-1"
+# service = "es"            # "es" (managed, default) | "aoss" (serverless)
+# role_arn = "arn:aws:iam::123456789012:role/waypoint-opensearch"
+# profile = "prod"          # optional shared-config profile
+#
 # [listeners.opensearch.provision]
 # mode = "database" # default: create/update Security plugin roles and users
 #

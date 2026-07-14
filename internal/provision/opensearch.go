@@ -65,12 +65,28 @@ type OpenSearchProvisioner struct {
 	store       *restrict.RedisStore
 	logger      *slog.Logger
 	httpClient  *http.Client
+	auth        OpenSearchAuthenticator
 
 	credCache sync.Map // map[string]*cachedCredential
 }
 
-// NewOpenSearchProvisioner creates a new OpenSearch provisioner.
-func NewOpenSearchProvisioner(adminUser, adminPassword, backend, userPrefix, peerService string, backendTLS bool, store *restrict.RedisStore, logger *slog.Logger, dialFunc func(ctx context.Context, network, addr string) (net.Conn, error)) *OpenSearchProvisioner {
+// OpenSearchProvisionerOption customizes an OpenSearchProvisioner at construction.
+type OpenSearchProvisionerOption func(*OpenSearchProvisioner)
+
+// WithOpenSearchAuthenticator overrides the default Basic-auth backend
+// authentication (e.g. with AWS SigV4 signing for Amazon OpenSearch Service).
+func WithOpenSearchAuthenticator(a OpenSearchAuthenticator) OpenSearchProvisionerOption {
+	return func(p *OpenSearchProvisioner) {
+		if a != nil {
+			p.auth = a
+		}
+	}
+}
+
+// NewOpenSearchProvisioner creates a new OpenSearch provisioner. By default it
+// authenticates to the Security REST API with Basic auth using the supplied
+// admin credentials; pass WithOpenSearchAuthenticator to sign requests instead.
+func NewOpenSearchProvisioner(adminUser, adminPassword, backend, userPrefix, peerService string, backendTLS bool, store *restrict.RedisStore, logger *slog.Logger, dialFunc func(ctx context.Context, network, addr string) (net.Conn, error), opts ...OpenSearchProvisionerOption) *OpenSearchProvisioner {
 	if userPrefix == "" {
 		userPrefix = "wp_"
 	}
@@ -100,7 +116,7 @@ func NewOpenSearchProvisioner(adminUser, adminPassword, backend, userPrefix, pee
 		transport.TLSClientConfig = tlsConfig
 	}
 
-	return &OpenSearchProvisioner{
+	p := &OpenSearchProvisioner{
 		adminURL:    baseURL,
 		adminUser:   adminUser,
 		adminPass:   adminPassword,
@@ -112,7 +128,12 @@ func NewOpenSearchProvisioner(adminUser, adminPassword, backend, userPrefix, pee
 			Transport: transport,
 			Timeout:   30 * time.Second,
 		},
+		auth: basicAuthenticator{user: adminUser, pass: adminPassword},
 	}
+	for _, opt := range opts {
+		opt(p)
+	}
+	return p
 }
 
 // ExpandOpenSearchPermissions expands ACL presets and raw grants into a
@@ -381,24 +402,30 @@ func (p *OpenSearchProvisioner) ensureInternalUser(ctx context.Context, username
 }
 
 func (p *OpenSearchProvisioner) doJSON(ctx context.Context, method, path string, in any, out any) error {
-	var body io.Reader
+	var payload []byte
 	if in != nil {
 		data, err := json.Marshal(in)
 		if err != nil {
 			return fmt.Errorf("marshal request: %w", err)
 		}
-		body = bytes.NewReader(data)
+		payload = data
 	}
 
 	u := *p.adminURL
 	u.Path = strings.TrimRight(p.adminURL.Path, "/") + path
+	var body io.Reader
+	if payload != nil {
+		body = bytes.NewReader(payload)
+	}
 	req, err := http.NewRequestWithContext(ctx, method, u.String(), body)
 	if err != nil {
 		return fmt.Errorf("new request: %w", err)
 	}
-	req.SetBasicAuth(p.adminUser, p.adminPass)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
+	if err := p.auth.Authenticate(ctx, req, payload); err != nil {
+		return fmt.Errorf("authenticate request: %w", err)
+	}
 
 	resp, err := p.httpClient.Do(req)
 	if err != nil {

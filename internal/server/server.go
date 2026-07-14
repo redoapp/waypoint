@@ -379,6 +379,20 @@ func RunServer(ctx context.Context, configPath string, logger *slog.Logger, leve
 			}
 
 			if lCfg.OpenSearch.EffectiveProvisionMode() == config.OpenSearchProvisionDatabase {
+				var provOpts []provision.OpenSearchProvisionerOption
+				if lCfg.OpenSearch.EffectiveBackendAuth() == config.OpenSearchBackendAuthAWSIAM {
+					authr, err := provision.NewOpenSearchSigV4Authenticator(
+						ctx,
+						lCfg.OpenSearch.AWS.Region,
+						lCfg.OpenSearch.AWS.EffectiveAWSService(),
+						lCfg.OpenSearch.AWS.RoleARN,
+						lCfg.OpenSearch.AWS.Profile,
+					)
+					if err != nil {
+						return fmt.Errorf("configure AWS IAM auth for listener %s: %w", lCfg.Name, err)
+					}
+					provOpts = append(provOpts, provision.WithOpenSearchAuthenticator(authr))
+				}
 				openSearchProvisioner = provision.NewOpenSearchProvisioner(
 					lCfg.OpenSearch.AdminUser,
 					lCfg.OpenSearch.AdminPassword,
@@ -389,6 +403,7 @@ func RunServer(ctx context.Context, configPath string, logger *slog.Logger, leve
 					store,
 					logger.With("component", "opensearch-provisioner", "listener", lCfg.Name),
 					dialer,
+					provOpts...,
 				)
 			}
 

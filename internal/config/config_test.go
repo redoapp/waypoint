@@ -803,6 +803,114 @@ allowed_actions = ["read"]
 	}
 }
 
+func TestLoad_OpenSearchAWSIAMConfig(t *testing.T) {
+	content := `
+[tailscale]
+hostname = "waypoint-test"
+
+[[listeners]]
+name = "search"
+listen = ":9200"
+mode = "opensearch"
+backend = "search-prod.us-east-1.es.amazonaws.com:443"
+tls = true
+
+[listeners.opensearch]
+backend_auth = "aws_iam"
+
+[listeners.opensearch.aws]
+region = "us-east-1"
+role_arn = "arn:aws:iam::123456789012:role/waypoint"
+`
+	path := writeTestConfig(t, content)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	os := cfg.Listeners[0].OpenSearch
+	if os.EffectiveBackendAuth() != OpenSearchBackendAuthAWSIAM {
+		t.Fatalf("backend_auth = %q", os.EffectiveBackendAuth())
+	}
+	if os.AWS == nil || os.AWS.Region != "us-east-1" {
+		t.Fatalf("aws region not parsed: %+v", os.AWS)
+	}
+	if os.AWS.EffectiveAWSService() != OpenSearchAWSServiceManaged {
+		t.Fatalf("service = %q, want default es", os.AWS.EffectiveAWSService())
+	}
+	if os.AWS.RoleARN != "arn:aws:iam::123456789012:role/waypoint" {
+		t.Fatalf("role_arn = %q", os.AWS.RoleARN)
+	}
+}
+
+func TestValidate_OpenSearchAWSIAMRequiresRegion(t *testing.T) {
+	content := `
+[tailscale]
+hostname = "waypoint-test"
+
+[[listeners]]
+name = "search"
+listen = ":9200"
+mode = "opensearch"
+backend = "search.internal:9200"
+
+[listeners.opensearch]
+backend_auth = "aws_iam"
+`
+	path := writeTestConfig(t, content)
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "aws.region is required") {
+		t.Errorf("expected aws region error, got: %v", err)
+	}
+}
+
+func TestValidate_OpenSearchInvalidBackendAuth(t *testing.T) {
+	content := `
+[tailscale]
+hostname = "waypoint-test"
+
+[[listeners]]
+name = "search"
+listen = ":9200"
+mode = "opensearch"
+backend = "search.internal:9200"
+
+[listeners.opensearch]
+admin_user = "admin"
+admin_password = "adminpass"
+backend_auth = "kerberos"
+`
+	path := writeTestConfig(t, content)
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "backend_auth must be") {
+		t.Errorf("expected backend_auth error, got: %v", err)
+	}
+}
+
+func TestValidate_OpenSearchInvalidAWSService(t *testing.T) {
+	content := `
+[tailscale]
+hostname = "waypoint-test"
+
+[[listeners]]
+name = "search"
+listen = ":9200"
+mode = "opensearch"
+backend = "search.internal:9200"
+
+[listeners.opensearch]
+backend_auth = "aws_iam"
+
+[listeners.opensearch.aws]
+region = "us-east-1"
+service = "dynamodb"
+`
+	path := writeTestConfig(t, content)
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "aws.service must be") {
+		t.Errorf("expected aws service error, got: %v", err)
+	}
+}
+
 func TestLoad_MongoDBClientTLSConfig(t *testing.T) {
 	content := `
 [tailscale]

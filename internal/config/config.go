@@ -300,7 +300,53 @@ type OpenSearchAdmin struct {
 	UserPrefix    string               `toml:"user_prefix"`
 	UserTTL       string               `toml:"user_ttl"`
 	ServiceName   string               `toml:"service_name"` // peer.service override for OTel (default: listener name)
+	BackendAuth   string               `toml:"backend_auth"` // "basic" (default) | "aws_iam"
+	AWS           *OpenSearchAWS       `toml:"aws"`          // required when backend_auth = "aws_iam"
 	Provision     *OpenSearchProvision `toml:"provision"`
+}
+
+const (
+	OpenSearchBackendAuthBasic  = "basic"
+	OpenSearchBackendAuthAWSIAM = "aws_iam"
+
+	// OpenSearchAWSServiceManaged is the SigV4 service name for Amazon
+	// OpenSearch Service managed domains; Serverless collections use "aoss".
+	OpenSearchAWSServiceManaged    = "es"
+	OpenSearchAWSServiceServerless = "aoss"
+)
+
+// OpenSearchAWS configures AWS SigV4 request signing for the OpenSearch backend
+// (Amazon OpenSearch Service with IAM / fine-grained access control). Credentials
+// come from the default AWS chain (env, shared config/profile, IRSA, or instance
+// role); RoleARN, when set, is assumed on top of that base identity.
+type OpenSearchAWS struct {
+	Region  string `toml:"region"`
+	Service string `toml:"service"`  // "es" (managed, default) | "aoss" (serverless)
+	RoleARN string `toml:"role_arn"` // optional STS AssumeRole target
+	Profile string `toml:"profile"`  // optional shared-config profile
+}
+
+// EffectiveBackendAuth returns the backend authentication scheme, defaulting to
+// basic auth.
+func (o *OpenSearchAdmin) EffectiveBackendAuth() string {
+	if o == nil {
+		return OpenSearchBackendAuthBasic
+	}
+	switch strings.ToLower(strings.TrimSpace(o.BackendAuth)) {
+	case "", OpenSearchBackendAuthBasic:
+		return OpenSearchBackendAuthBasic
+	default:
+		return strings.ToLower(strings.TrimSpace(o.BackendAuth))
+	}
+}
+
+// EffectiveAWSService returns the SigV4 service name, defaulting to managed
+// Amazon OpenSearch Service ("es").
+func (a *OpenSearchAWS) EffectiveAWSService() string {
+	if a == nil || strings.TrimSpace(a.Service) == "" {
+		return OpenSearchAWSServiceManaged
+	}
+	return strings.ToLower(strings.TrimSpace(a.Service))
 }
 
 const (
@@ -615,6 +661,9 @@ func validate(cfg *Config) error {
 			if mode != "opensearch" {
 				return fmt.Errorf("listeners[%d]: [listeners.opensearch] is only supported for mode %q, got %q", i, "opensearch", l.Mode)
 			}
+			if err := validateOpenSearchBackendAuth(i, l.OpenSearch); err != nil {
+				return err
+			}
 			if err := validateOpenSearchProvision(i, l.OpenSearch); err != nil {
 				return err
 			}
@@ -713,6 +762,28 @@ func validMongoPreset(preset string) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+func validateOpenSearchBackendAuth(listenerIndex int, o *OpenSearchAdmin) error {
+	switch o.EffectiveBackendAuth() {
+	case OpenSearchBackendAuthBasic:
+		return nil
+	case OpenSearchBackendAuthAWSIAM:
+		if o.AWS == nil || strings.TrimSpace(o.AWS.Region) == "" {
+			return fmt.Errorf("listeners[%d].opensearch.aws.region is required when backend_auth is %q",
+				listenerIndex, OpenSearchBackendAuthAWSIAM)
+		}
+		switch o.AWS.EffectiveAWSService() {
+		case OpenSearchAWSServiceManaged, OpenSearchAWSServiceServerless:
+		default:
+			return fmt.Errorf("listeners[%d].opensearch.aws.service must be %q or %q, got %q",
+				listenerIndex, OpenSearchAWSServiceManaged, OpenSearchAWSServiceServerless, o.AWS.Service)
+		}
+		return nil
+	default:
+		return fmt.Errorf("listeners[%d].opensearch.backend_auth must be %q or %q, got %q",
+			listenerIndex, OpenSearchBackendAuthBasic, OpenSearchBackendAuthAWSIAM, o.BackendAuth)
 	}
 }
 
