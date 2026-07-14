@@ -61,15 +61,42 @@ func TestMongoFormatUsername_ShortNoHash(t *testing.T) {
 }
 
 func TestMongoAdminURI_Standalone(t *testing.T) {
-	uri := mongoAdminURI("admin", "pass", []string{"mongo1:27017"}, "", "admin", false)
+	uri := mongoAdminURI("admin", "pass", []string{"mongo1:27017"}, "", "admin", false, false)
 	if uri != "mongodb://admin:pass@mongo1:27017/admin?directConnection=true" {
 		t.Fatalf("uri = %q", uri)
 	}
 }
 
 func TestMongoAdminURI_ReplicaSet(t *testing.T) {
-	uri := mongoAdminURI("admin", "pass", []string{"mongo1:27017", "mongo2:27017", "mongo3:27017"}, "rs0", "admin", true)
+	uri := mongoAdminURI("admin", "pass", []string{"mongo1:27017", "mongo2:27017", "mongo3:27017"}, "rs0", "admin", true, false)
 	want := "mongodb://admin:pass@mongo1:27017,mongo2:27017,mongo3:27017/admin?replicaSet=rs0&tls=true"
+	if uri != want {
+		t.Fatalf("uri = %q, want %q", uri, want)
+	}
+}
+
+func TestMongoAdminURI_Sharded(t *testing.T) {
+	// Sharded connects through the mongos routers: no replicaSet and no
+	// directConnection, so the driver discovers the sharded topology.
+	uri := mongoAdminURI("admin", "pass", []string{"mongos1:27017", "mongos2:27017"}, "", "admin", false, true)
+	want := "mongodb://admin:pass@mongos1:27017,mongos2:27017/admin"
+	if uri != want {
+		t.Fatalf("uri = %q, want %q", uri, want)
+	}
+}
+
+func TestMongoAdminURI_ShardedSingleMongos(t *testing.T) {
+	// Even with a single mongos, sharded mode must not set directConnection.
+	uri := mongoAdminURI("admin", "pass", []string{"mongos1:27017"}, "", "admin", false, true)
+	want := "mongodb://admin:pass@mongos1:27017/admin"
+	if uri != want {
+		t.Fatalf("uri = %q, want %q", uri, want)
+	}
+}
+
+func TestMongoAdminURI_ShardedTLS(t *testing.T) {
+	uri := mongoAdminURI("admin", "pass", []string{"mongos1:27017", "mongos2:27017"}, "", "admin", true, true)
+	want := "mongodb://admin:pass@mongos1:27017,mongos2:27017/admin?tls=true"
 	if uri != want {
 		t.Fatalf("uri = %q, want %q", uri, want)
 	}

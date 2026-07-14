@@ -241,6 +241,7 @@ type MongoDBAdmin struct {
 	UserPrefix    string          `toml:"user_prefix"`
 	UserTTL       string          `toml:"user_ttl"`
 	ServiceName   string          `toml:"service_name"` // peer.service override for OTel (default: listener name)
+	Topology      string          `toml:"topology"`     // "replicaset" (default), "sharded", or "standalone"
 	ReplicaSet    string          `toml:"replica_set"`  // optional replica set name for admin provisioning
 	SRV           string          `toml:"srv"`          // optional MongoDB SRV name for backend discovery
 	SRVMaxMembers int             `toml:"srv_max_members"`
@@ -251,6 +252,12 @@ type MongoDBAdmin struct {
 const (
 	MongoProvisionDatabase = "database"
 	MongoProvisionStatic   = "static"
+)
+
+const (
+	MongoTopologyReplicaSet = "replicaset"
+	MongoTopologySharded    = "sharded"
+	MongoTopologyStandalone = "standalone"
 )
 
 // MongoProvision selects how a MongoDB listener obtains backend credentials.
@@ -294,6 +301,26 @@ func (m *MongoDBAdmin) UserTTLDuration() time.Duration {
 
 func (m *MongoDBAdmin) HasSRV() bool {
 	return m != nil && strings.TrimSpace(m.SRV) != ""
+}
+
+// EffectiveTopology returns the configured cluster topology, lower-cased and
+// defaulting to "replicaset" (which also covers standalone via the provisioner's
+// single-seed directConnection behavior) when unset.
+func (m *MongoDBAdmin) EffectiveTopology() string {
+	if m == nil {
+		return MongoTopologyReplicaSet
+	}
+	t := strings.ToLower(strings.TrimSpace(m.Topology))
+	if t == "" {
+		return MongoTopologyReplicaSet
+	}
+	return t
+}
+
+// IsSharded reports whether the listener targets a sharded cluster (mongos
+// routers) rather than a replica set or standalone server.
+func (m *MongoDBAdmin) IsSharded() bool {
+	return m.EffectiveTopology() == MongoTopologySharded
 }
 
 func (m *MongoDBAdmin) EffectiveProvisionMode() string {
@@ -487,6 +514,22 @@ func validate(cfg *Config) error {
 		}
 
 		if l.MongoDB != nil {
+			switch l.MongoDB.EffectiveTopology() {
+			case MongoTopologyReplicaSet, MongoTopologyStandalone:
+			case MongoTopologySharded:
+				if mode != "mongodb" {
+					return fmt.Errorf("listeners[%d]: mongodb.topology is only supported for mode %q, got %q", i, "mongodb", l.Mode)
+				}
+				if strings.TrimSpace(l.MongoDB.ReplicaSet) != "" {
+					return fmt.Errorf("listeners[%d]: mongodb.replica_set cannot be combined with topology %q", i, MongoTopologySharded)
+				}
+				if len(l.MongoDB.Members) == 0 && !l.MongoDB.HasSRV() {
+					return fmt.Errorf("listeners[%d]: mongodb.topology %q requires mongodb.members (mongos routers) or mongodb.srv", i, MongoTopologySharded)
+				}
+			default:
+				return fmt.Errorf("listeners[%d]: mongodb.topology must be one of %q, %q, %q, got %q", i, MongoTopologyReplicaSet, MongoTopologySharded, MongoTopologyStandalone, l.MongoDB.Topology)
+			}
+
 			if err := validateMongoProvision(i, l.MongoDB); err != nil {
 				return err
 			}

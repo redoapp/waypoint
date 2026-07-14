@@ -64,7 +64,7 @@ func NewMongoReplicaSetProvisioner(adminUser, adminPassword string, backends []s
 	if authDatabase == "" {
 		authDatabase = "admin"
 	}
-	uri := mongoAdminURI(adminUser, adminPassword, backends, replicaSet, authDatabase, backendTLS)
+	uri := mongoAdminURI(adminUser, adminPassword, backends, replicaSet, authDatabase, backendTLS, false)
 
 	return &MongoProvisioner{
 		adminURI:    uri,
@@ -77,7 +77,32 @@ func NewMongoReplicaSetProvisioner(adminUser, adminPassword string, backends []s
 	}
 }
 
-func mongoAdminURI(adminUser, adminPassword string, backends []string, replicaSet, authDatabase string, backendTLS bool) string {
+// NewMongoShardedProvisioner creates a Mongo provisioner that connects to a
+// sharded cluster through its mongos routers. Unlike the replica-set
+// provisioner it never sets replicaSet or directConnection, so the driver
+// detects the sharded topology and routes createUser/updateUser through a
+// mongos — which propagates the change to the config servers and all shards.
+func NewMongoShardedProvisioner(adminUser, adminPassword string, mongosBackends []string, authDatabase, userPrefix, peerService string, backendTLS bool, store *restrict.RedisStore, logger *slog.Logger, dialFunc func(ctx context.Context, network, addr string) (net.Conn, error)) *MongoProvisioner {
+	if userPrefix == "" {
+		userPrefix = "wp_"
+	}
+	if authDatabase == "" {
+		authDatabase = "admin"
+	}
+	uri := mongoAdminURI(adminUser, adminPassword, mongosBackends, "", authDatabase, backendTLS, true)
+
+	return &MongoProvisioner{
+		adminURI:    uri,
+		authDB:      authDatabase,
+		userPrefix:  userPrefix,
+		peerService: peerService,
+		store:       store,
+		logger:      logger,
+		dialFunc:    dialFunc,
+	}
+}
+
+func mongoAdminURI(adminUser, adminPassword string, backends []string, replicaSet, authDatabase string, backendTLS, sharded bool) string {
 	cleanBackends := make([]string, 0, len(backends))
 	for _, backend := range backends {
 		if backend != "" {
@@ -89,9 +114,14 @@ func mongoAdminURI(adminUser, adminPassword string, backends []string, replicaSe
 	}
 
 	q := url.Values{}
-	if replicaSet != "" {
+	switch {
+	case sharded:
+		// Sharded: connect through mongos. Never set replicaSet or
+		// directConnection so the driver discovers the sharded topology and
+		// routes admin commands through a mongos (propagating cluster-wide).
+	case replicaSet != "":
 		q.Set("replicaSet", replicaSet)
-	} else if len(cleanBackends) == 1 {
+	case len(cleanBackends) == 1:
 		// Keep standalone and single-seed behavior from trying to discover
 		// internal replica-set addresses unless explicitly configured.
 		q.Set("directConnection", "true")

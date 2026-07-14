@@ -21,6 +21,9 @@ import (
 	"github.com/redoapp/waypoint/internal/server"
 	"github.com/redoapp/waypoint/internal/testutil"
 	"github.com/redoapp/waypoint/internal/tsdns"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 	"golang.org/x/net/dns/dnsmessage"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/store/mem"
@@ -976,4 +979,214 @@ peerFound:
 		t.Fatalf("Assertion 3 failed: expected 10.99.0.1, got %v", ips)
 	}
 	t.Log("Assertion 3 passed: NewRoutedQueryFunc resolved db.example.internal to 10.99.0.1 via custom forwarder")
+}
+
+// tsnetContextDialer adapts a tsnet.Server to the mongo driver's ContextDialer
+// so the MongoDB client dials the waypoint listener through the tailnet.
+type tsnetContextDialer struct{ s *tsnet.Server }
+
+func (d tsnetContextDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	return d.s.Dial(ctx, network, address)
+}
+
+// TestE2E_MongoSharded_ReadWrite is a full end-to-end test that runs the real
+// server against a sharded MongoDB cluster (config-server RS + two shard RSs +
+// mongos routers). A client connects through the tailnet to the waypoint
+// MongoDB listener (topology = "sharded"), which provisions a dynamic user via
+// the mongos and proxies read/write traffic to the sharded backend.
+//
+// This is heavy (spins up an 11-container sharded cluster plus a mock Tailscale
+// control plane); run with an extended timeout, e.g.:
+//
+//	go test -tags integration -run 'TestE2E_MongoSharded' -timeout 300s ./test/e2e
+func TestE2E_MongoSharded_ReadWrite(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 280*time.Second)
+	defer cancel()
+
+	// --- Sharded MongoDB backend ---
+	sharded := testutil.MongoDBShardedCluster(t)
+	mongosBackend := sharded.Mongos[0]
+
+	// --- Test infrastructure ---
+	netns.SetEnabled(false)
+	t.Cleanup(func() { netns.SetEnabled(true) })
+
+	derpMap := integration.RunDERPAndSTUN(t, logger.Discard, "127.0.0.1")
+	control := &testcontrol.Server{
+		DERPMap:        derpMap,
+		DNSConfig:      &tailcfg.DNSConfig{Proxied: true},
+		MagicDNSDomain: "tail-scale.ts.net",
+	}
+	control.HTTPTestServer = httptest.NewUnstartedServer(control)
+	control.HTTPTestServer.Start()
+	t.Cleanup(control.HTTPTestServer.Close)
+	controlURL := control.HTTPTestServer.URL
+
+	// Grant readwrite on e2edb through the "mongo-sharded" backend.
+	capRule := auth.CapRule{
+		Limits: &auth.LimitsCap{MaxConns: 10},
+		Backends: map[string]auth.BackendCap{
+			"mongo-sharded": {
+				Mongo: &auth.MongoCap{
+					Databases: map[string]auth.MongoDBPermissions{
+						"e2edb": {Permissions: []string{"readwrite"}},
+					},
+				},
+			},
+		},
+	}
+	capJSON, err := json.Marshal(capRule)
+	if err != nil {
+		t.Fatalf("marshal cap rule: %v", err)
+	}
+	control.SetGlobalAppCaps(tailcfg.PeerCapMap{
+		tailcfg.PeerCapability(auth.WaypointCap): {tailcfg.RawMessage(capJSON)},
+	})
+
+	rdb := testutil.RedisClient(t)
+
+	// --- Config file: sharded mongodb listener ---
+	stateDir := filepath.Join(t.TempDir(), "wp-state")
+	os.MkdirAll(stateDir, 0755)
+
+	configContent := fmt.Sprintf(`
+[tailscale]
+hostname = "waypoint-mongo-e2e"
+control_url = "%s"
+state_dir = "%s"
+ephemeral = true
+
+[redis]
+address = "%s"
+key_prefix = "e2e-mongo:"
+
+[[listeners]]
+name = "mongo-sharded"
+mode = "mongodb"
+
+[listeners.mongodb]
+admin_user = "admin"
+admin_password = "adminpass"
+auth_database = "admin"
+topology = "sharded"
+
+[[listeners.mongodb.members]]
+backend = "%s"
+listen = ":27020"
+`, controlURL, stateDir, rdb.Options().Addr, mongosBackend)
+
+	configPath := filepath.Join(t.TempDir(), "waypoint.toml")
+	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	// --- Start waypoint via the real server path ---
+	runCtx, runCancel := context.WithCancel(ctx)
+	defer runCancel()
+
+	var testLevelVar slog.LevelVar
+	testLevelVar.Set(slog.LevelInfo)
+	lgr := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: &testLevelVar}))
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- server.RunServer(runCtx, configPath, lgr, &testLevelVar, nil)
+	}()
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("RunServer exited early: %v", err)
+	case <-time.After(2 * time.Second):
+	}
+
+	// --- Client node ---
+	clientDir := filepath.Join(t.TempDir(), "client")
+	os.MkdirAll(clientDir, 0755)
+
+	clientNode := &tsnet.Server{
+		Dir:        clientDir,
+		ControlURL: controlURL,
+		Hostname:   "e2e-mongo-client",
+		Store:      new(mem.Store),
+		Ephemeral:  true,
+	}
+	t.Cleanup(func() { clientNode.Close() })
+
+	if _, err := clientNode.Up(ctx); err != nil {
+		t.Fatalf("client Up: %v", err)
+	}
+
+	// Wait for the waypoint peer to appear.
+	var waypointIP string
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		lc, err := clientNode.LocalClient()
+		if err != nil {
+			t.Fatalf("client LocalClient: %v", err)
+		}
+		status, err := lc.Status(ctx)
+		if err != nil {
+			t.Fatalf("client status: %v", err)
+		}
+		for _, peer := range status.Peer {
+			if peer.HostName == "waypoint-mongo-e2e" {
+				waypointIP = peer.TailscaleIPs[0].String()
+				break
+			}
+		}
+		if waypointIP != "" {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	if waypointIP == "" {
+		t.Fatal("timed out waiting for waypoint-mongo-e2e peer")
+	}
+
+	// --- Verify: connect a mongo client through the tailnet and read/write ---
+	uri := fmt.Sprintf("mongodb://%s:27020/e2edb?directConnection=true&serverSelectionTimeoutMS=15000", waypointIP)
+	clientOpts := options.Client().ApplyURI(uri).SetDialer(tsnetContextDialer{clientNode})
+
+	var mc *mongo.Client
+	dialDeadline := time.Now().Add(40 * time.Second)
+	for {
+		mc, err = mongo.Connect(clientOpts)
+		if err == nil {
+			if pingErr := mc.Ping(ctx, nil); pingErr == nil {
+				break
+			} else {
+				err = pingErr
+				mc.Disconnect(ctx)
+			}
+		}
+		if time.Now().After(dialDeadline) {
+			t.Fatalf("connect to waypoint mongo listener through tailnet: %v", err)
+		}
+		time.Sleep(1 * time.Second)
+	}
+	defer mc.Disconnect(context.Background())
+
+	coll := mc.Database("e2edb").Collection("items")
+	if _, err := coll.InsertOne(ctx, bson.D{{Key: "name", Value: "e2e-sharded"}, {Key: "n", Value: 42}}); err != nil {
+		t.Fatalf("insert through sharded waypoint proxy: %v", err)
+	}
+
+	var doc bson.M
+	if err := coll.FindOne(ctx, bson.D{{Key: "name", Value: "e2e-sharded"}}).Decode(&doc); err != nil {
+		t.Fatalf("find through sharded waypoint proxy: %v", err)
+	}
+	if doc["n"] != int32(42) {
+		t.Fatalf("read-back mismatch: got %+v", doc)
+	}
+
+	// --- Shutdown ---
+	mc.Disconnect(context.Background())
+	runCancel()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("RunServer: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for shutdown")
+	}
 }

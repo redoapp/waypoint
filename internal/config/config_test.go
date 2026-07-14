@@ -1316,6 +1316,142 @@ listen = ":27017"
 	}
 }
 
+func TestLoad_MongoDBShardedTopology(t *testing.T) {
+	content := `
+[tailscale]
+hostname = "waypoint-test"
+
+[[listeners]]
+name = "mongo-sharded"
+mode = "mongodb"
+
+[listeners.mongodb]
+admin_user = "admin"
+admin_password = "pass"
+auth_database = "admin"
+topology = "sharded"
+
+[[listeners.mongodb.members]]
+backend = "mongos1.internal:27017"
+listen = ":27017"
+advertise = "waypoint-test:27017"
+
+[[listeners.mongodb.members]]
+backend = "mongos2.internal:27017"
+listen = ":27018"
+advertise = "waypoint-test:27018"
+`
+	path := writeTestConfig(t, content)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	l := cfg.Listeners[0]
+	if !l.MongoDB.IsSharded() {
+		t.Errorf("IsSharded() = false, want true (topology=%q)", l.MongoDB.Topology)
+	}
+	if l.MongoDB.EffectiveTopology() != MongoTopologySharded {
+		t.Errorf("EffectiveTopology() = %q, want %q", l.MongoDB.EffectiveTopology(), MongoTopologySharded)
+	}
+
+	pairs := l.ExpandedBackends()
+	expected := []BackendPair{
+		{Listen: ":27017", Backend: "mongos1.internal:27017", Advertise: "waypoint-test:27017"},
+		{Listen: ":27018", Backend: "mongos2.internal:27017", Advertise: "waypoint-test:27018"},
+	}
+	if len(pairs) != len(expected) {
+		t.Fatalf("ExpandedBackends len = %d, want %d (one listener per mongos)", len(pairs), len(expected))
+	}
+	for i, want := range expected {
+		if pairs[i] != want {
+			t.Errorf("pairs[%d] = %+v, want %+v", i, pairs[i], want)
+		}
+	}
+}
+
+func TestValidate_MongoDBDefaultTopologyIsReplicaSet(t *testing.T) {
+	m := &MongoDBAdmin{}
+	if m.EffectiveTopology() != MongoTopologyReplicaSet {
+		t.Errorf("EffectiveTopology() = %q, want %q", m.EffectiveTopology(), MongoTopologyReplicaSet)
+	}
+	if m.IsSharded() {
+		t.Error("IsSharded() = true, want false for default topology")
+	}
+}
+
+func TestValidate_MongoDBShardedRejectsReplicaSet(t *testing.T) {
+	content := `
+[tailscale]
+hostname = "waypoint-test"
+
+[[listeners]]
+name = "mongo-sharded"
+mode = "mongodb"
+
+[listeners.mongodb]
+admin_user = "admin"
+admin_password = "pass"
+topology = "sharded"
+replica_set = "rs0"
+
+[[listeners.mongodb.members]]
+backend = "mongos1.internal:27017"
+listen = ":27017"
+`
+	path := writeTestConfig(t, content)
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "replica_set cannot be combined with topology") {
+		t.Errorf("expected replica_set/sharded conflict error, got: %v", err)
+	}
+}
+
+func TestValidate_MongoDBShardedRequiresMembersOrSRV(t *testing.T) {
+	content := `
+[tailscale]
+hostname = "waypoint-test"
+
+[[listeners]]
+name = "mongo-sharded"
+mode = "mongodb"
+listen = ":27017"
+backend = "mongos1.internal:27017"
+
+[listeners.mongodb]
+admin_user = "admin"
+admin_password = "pass"
+topology = "sharded"
+`
+	path := writeTestConfig(t, content)
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "requires mongodb.members") {
+		t.Errorf("expected sharded requires members/srv error, got: %v", err)
+	}
+}
+
+func TestValidate_MongoDBUnknownTopology(t *testing.T) {
+	content := `
+[tailscale]
+hostname = "waypoint-test"
+
+[[listeners]]
+name = "mongo-bad"
+mode = "mongodb"
+listen = ":27017"
+backend = "mongo1.internal:27017"
+
+[listeners.mongodb]
+admin_user = "admin"
+admin_password = "pass"
+topology = "clustered"
+`
+	path := writeTestConfig(t, content)
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "mongodb.topology must be one of") {
+		t.Errorf("expected unknown topology error, got: %v", err)
+	}
+}
+
 // --- ExpandedBackends tests ---
 
 func TestExpandedBackends_NoPortMap(t *testing.T) {

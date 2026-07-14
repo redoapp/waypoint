@@ -1059,3 +1059,282 @@ func readMongoMarker(t *testing.T, addr, dbName, collName string) string {
 	}
 	return doc.Cluster
 }
+
+// --- Sharded cluster (mongos) tests ---
+
+// retryMongoOp retries fn until it succeeds or the deadline passes. It absorbs
+// the brief window after a user is provisioned via one mongos before it becomes
+// authable on another mongos (bounded by userCacheInvalidationIntervalSecs).
+// Real MongoDB drivers likewise retry after a connection pool is cleared.
+func retryMongoOp(t *testing.T, timeout time.Duration, fn func() error) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	for {
+		if lastErr = fn(); lastErr == nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("operation did not succeed within %s: %v", timeout, lastErr)
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
+// setupMongoShardedProxies starts one database-provisioning MongoDBProxy in
+// front of each mongos router of a shared sharded cluster and returns their
+// listen addresses (one per mongos) along with the cluster info. All proxies
+// share a sharded provisioner.
+//
+// Note: this makes the single call to testutil.MongoDBShardedCluster(t) for the
+// test (which also runs the per-call cleanup that drops non-system databases
+// and wp_ users). Tests must not call the fixture again afterward, or that
+// cleanup will drop state created after setup — seed via the returned info's
+// admin ConnStr instead.
+func setupMongoShardedProxies(t *testing.T, authResult *auth.AuthResult, authErr error) ([]string, *testutil.MongoShardedInfo) {
+	t.Helper()
+
+	info := testutil.MongoDBShardedCluster(t)
+	rdb := testutil.RedisClient(t)
+	m := metrics.Noop()
+	store := restrict.NewRedisStore(rdb, "mongoshardtest:", m)
+	tracker := restrict.NewTracker(store, m, slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})))
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	// Sharded provisioner connects through the mongos routers (no replicaSet,
+	// no directConnection) so createUser propagates cluster-wide.
+	provisioner := provision.NewMongoShardedProvisioner("admin", "adminpass", info.Mongos, "admin", "wp_", "test", false, store, logger, nil)
+
+	mongoCfg := &config.MongoDBAdmin{
+		AdminUser:     "admin",
+		AdminPassword: "adminpass",
+		AuthDatabase:  "admin",
+		UserPrefix:    "wp_",
+		Topology:      config.MongoTopologySharded,
+	}
+
+	addrs := make([]string, 0, len(info.Mongos))
+	for _, mongos := range info.Mongos {
+		mongos := mongos
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("listen: %v", err)
+		}
+		t.Cleanup(func() { ln.Close() })
+
+		p := &proxy.MongoDBProxy{
+			Backend:      mongos,
+			Name:         "test-listener",
+			ListenAddr:   ln.Addr().String(),
+			Auth:         &mockAuthorizer{result: authResult, err: authErr},
+			Tracker:      tracker,
+			Provisioner:  provisioner,
+			Metrics:      m,
+			MongoConfig:  mongoCfg,
+			Logger:       logger,
+			BytesRead:    &atomic.Int64{},
+			BytesWritten: &atomic.Int64{},
+		}
+
+		go func() {
+			for {
+				conn, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				go p.HandleConn(context.Background(), conn)
+			}
+		}()
+
+		addrs = append(addrs, ln.Addr().String())
+	}
+
+	return addrs, info
+}
+
+func TestIntegration_MongoProxy_ShardedReadWrite(t *testing.T) {
+	result := makeMongoAuthResult(map[string]auth.MongoDBPermissions{
+		"shardeddb": {Permissions: []string{"readwrite"}},
+	}, nil)
+
+	addrs, _ := setupMongoShardedProxies(t, result, nil)
+	client := mongoProxyConnect(t, addrs[0], "shardeddb")
+	ctx := context.Background()
+
+	retryMongoOp(t, 20*time.Second, func() error {
+		_, err := client.Database("shardeddb").Collection("items").InsertOne(ctx, bson.D{
+			{Key: "name", Value: "via-mongos"},
+			{Key: "count", Value: 7},
+		})
+		return err
+	})
+
+	var doc bson.M
+	err := client.Database("shardeddb").Collection("items").FindOne(ctx, bson.D{
+		{Key: "name", Value: "via-mongos"},
+	}).Decode(&doc)
+	if err != nil {
+		t.Fatalf("find through mongos proxy: %v", err)
+	}
+	if doc["name"] != "via-mongos" || doc["count"] != int32(7) {
+		t.Errorf("data integrity failed: %+v", doc)
+	}
+}
+
+// TestIntegration_MongoProxy_ShardedCollection exercises real cross-shard
+// routing: the collection is hash-sharded across both shards, then many
+// documents are written and read back through the proxy.
+func TestIntegration_MongoProxy_ShardedCollection(t *testing.T) {
+	const (
+		dbName   = "shardcolldb"
+		collName = "spread"
+	)
+
+	// Set up the proxies first: this makes the single fixture call (and its
+	// cleanup). Sharding + writes happen afterward so cleanup can't undo them.
+	result := makeMongoAuthResult(map[string]auth.MongoDBPermissions{
+		dbName: {Permissions: []string{"readwrite"}},
+	}, nil)
+	addrs, info := setupMongoShardedProxies(t, result, nil)
+
+	// Shard the collection via a direct admin connection to a mongos.
+	admin := mongoIntegrationAdminClient(t, info.ConnStr)
+	ctx := context.Background()
+	if err := admin.Database("admin").RunCommand(ctx, bson.D{{Key: "enableSharding", Value: dbName}}).Err(); err != nil {
+		t.Fatalf("enableSharding: %v", err)
+	}
+	if err := admin.Database("admin").RunCommand(ctx, bson.D{
+		{Key: "shardCollection", Value: dbName + "." + collName},
+		{Key: "key", Value: bson.D{{Key: "_id", Value: "hashed"}}},
+	}).Err(); err != nil {
+		t.Fatalf("shardCollection: %v", err)
+	}
+
+	// Write and read many documents through the proxy.
+	client := mongoProxyConnect(t, addrs[0], dbName)
+	coll := client.Database(dbName).Collection(collName)
+
+	const n = 200
+	docs := make([]interface{}, n)
+	for i := 0; i < n; i++ {
+		docs[i] = bson.D{{Key: "i", Value: i}}
+	}
+	retryMongoOp(t, 20*time.Second, func() error {
+		_, err := coll.InsertMany(ctx, docs)
+		return err
+	})
+
+	got, err := coll.CountDocuments(ctx, bson.D{})
+	if err != nil {
+		t.Fatalf("count through mongos proxy: %v", err)
+	}
+	if got != n {
+		t.Errorf("count = %d, want %d", got, n)
+	}
+
+	// Confirm the collection really is sharded (the write went through a
+	// sharded topology, not a single node).
+	var stats bson.M
+	if err := admin.Database(dbName).RunCommand(ctx, bson.D{{Key: "collStats", Value: collName}}).Decode(&stats); err != nil {
+		t.Fatalf("collStats: %v", err)
+	}
+	if sharded, ok := stats["sharded"].(bool); !ok || !sharded {
+		t.Errorf("collStats.sharded = %v, want true", stats["sharded"])
+	}
+}
+
+func TestIntegration_MongoProxy_ShardedProvisioning(t *testing.T) {
+	// Dynamic provisioning through a mongos with a readonly grant: the user is
+	// created cluster-wide via mongos, can read, but cannot write.
+	roResult := makeMongoAuthResult(map[string]auth.MongoDBPermissions{
+		"provdb": {Permissions: []string{"readonly"}},
+	}, nil)
+	addrs, info := setupMongoShardedProxies(t, roResult, nil)
+	ctx := context.Background()
+
+	// Seed data directly via the admin connection so the db exists (avoids a
+	// second fixture call, which would drop the provisioned user).
+	admin := mongoIntegrationAdminClient(t, info.ConnStr)
+	if _, err := admin.Database("provdb").Collection("data").InsertOne(ctx, bson.D{{Key: "seed", Value: true}}); err != nil {
+		t.Fatalf("seed data via admin: %v", err)
+	}
+
+	roClient := mongoProxyConnect(t, addrs[0], "provdb")
+
+	retryMongoOp(t, 20*time.Second, func() error {
+		cur, err := roClient.Database("provdb").Collection("data").Find(ctx, bson.D{})
+		if err != nil {
+			return err
+		}
+		cur.Close(ctx)
+		return nil
+	})
+
+	if _, err := roClient.Database("provdb").Collection("data").InsertOne(ctx, bson.D{{Key: "x", Value: 1}}); err == nil {
+		t.Fatal("insert should be denied for readonly provisioned user through mongos proxy")
+	}
+}
+
+func TestIntegration_MongoProxy_ShardedHelloPassthrough(t *testing.T) {
+	result := makeMongoAuthResult(map[string]auth.MongoDBPermissions{
+		"hellodb": {Permissions: []string{"readwrite"}},
+	}, nil)
+	addrs, _ := setupMongoShardedProxies(t, result, nil)
+
+	uri := fmt.Sprintf("mongodb://%s/hellodb?directConnection=true&serverSelectionTimeoutMS=10000", addrs[0])
+	client, err := mongo.Connect(options.Client().ApplyURI(uri))
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer client.Disconnect(context.Background())
+
+	var helloResp bson.M
+	retryMongoOp(t, 20*time.Second, func() error {
+		return client.Database("admin").RunCommand(context.Background(), bson.D{{Key: "hello", Value: 1}}).Decode(&helloResp)
+	})
+
+	// mongos identifies itself with msg:"isdbgrid" ...
+	if msg, _ := helloResp["msg"].(string); msg != "isdbgrid" {
+		t.Errorf("hello.msg = %q, want isdbgrid (expected mongos response)", helloResp["msg"])
+	}
+	// ... and advertises no replica-set topology, so nothing is rewritten.
+	if _, ok := helloResp["hosts"]; ok {
+		t.Errorf("mongos hello unexpectedly contains 'hosts': %v", helloResp["hosts"])
+	}
+	if _, ok := helloResp["setName"]; ok {
+		t.Errorf("mongos hello unexpectedly contains 'setName': %v", helloResp["setName"])
+	}
+}
+
+// TestIntegration_MongoProxy_ShardedMultipleMongos verifies both mongos-fronting
+// proxies serve the same sharded cluster: a write through one router is visible
+// through the other.
+func TestIntegration_MongoProxy_ShardedMultipleMongos(t *testing.T) {
+	result := makeMongoAuthResult(map[string]auth.MongoDBPermissions{
+		"multidb": {Permissions: []string{"readwrite"}},
+	}, nil)
+	addrs, _ := setupMongoShardedProxies(t, result, nil)
+	if len(addrs) < 2 {
+		t.Fatalf("expected at least 2 mongos proxies, got %d", len(addrs))
+	}
+
+	ctx := context.Background()
+	writeClient := mongoProxyConnect(t, addrs[0], "multidb")
+	retryMongoOp(t, 20*time.Second, func() error {
+		_, err := writeClient.Database("multidb").Collection("shared").InsertOne(ctx, bson.D{
+			{Key: "key", Value: "written-via-mongos1"},
+		})
+		return err
+	})
+
+	readClient := mongoProxyConnect(t, addrs[1], "multidb")
+	var doc bson.M
+	retryMongoOp(t, 20*time.Second, func() error {
+		return readClient.Database("multidb").Collection("shared").FindOne(ctx, bson.D{
+			{Key: "key", Value: "written-via-mongos1"},
+		}).Decode(&doc)
+	})
+	if doc["key"] != "written-via-mongos1" {
+		t.Errorf("doc key = %v, want written-via-mongos1", doc["key"])
+	}
+}

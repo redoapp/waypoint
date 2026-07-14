@@ -185,6 +185,45 @@ func TestRewriteTopology_Standalone(t *testing.T) {
 	}
 }
 
+func TestRewriteTopology_MongosPassthrough(t *testing.T) {
+	// A mongos hello reply identifies itself with msg:"isdbgrid" and carries
+	// NO replica-set host fields (hosts/setName/primary). The proxy must leave
+	// it untouched so the sharded topology reaches the client verbatim.
+	body := buildTestOpMsgBody(bson.D{
+		{Key: "isWritablePrimary", Value: true},
+		{Key: "msg", Value: "isdbgrid"},
+		{Key: "maxBsonObjectSize", Value: 16777216},
+		{Key: "maxMessageSizeBytes", Value: 48000000},
+		{Key: "logicalSessionTimeoutMinutes", Value: 30},
+		{Key: "ok", Value: 1.0},
+	})
+
+	rewritten := RewriteTopologyWithMap(body, "waypoint:27017", map[string]string{
+		"shard0-node1:27017": "waypoint:27100",
+	})
+
+	if len(rewritten) != len(body) {
+		t.Fatalf("mongos hello length changed: got %d, want %d", len(rewritten), len(body))
+	}
+	for i := range body {
+		if rewritten[i] != body[i] {
+			t.Fatalf("mongos hello mutated at byte %d", i)
+		}
+	}
+
+	// Sanity check the marker survives round-trip parsing.
+	d := parseTestOpMsgBody(t, rewritten)
+	var msg string
+	for _, e := range d {
+		if e.Key == "msg" {
+			msg, _ = e.Value.(string)
+		}
+	}
+	if msg != "isdbgrid" {
+		t.Errorf("msg = %q, want isdbgrid", msg)
+	}
+}
+
 func TestRewriteTopology_WithChecksum(t *testing.T) {
 	// Build body with FlagChecksumPresent and trailing 4-byte CRC.
 	raw, _ := bson.Marshal(bson.D{

@@ -156,6 +156,31 @@ backend = "10.0.1.5:3306"
 # listen = ":27019"
 # advertise = "waypoint-db:27019"
 
+# Sharded cluster: set topology = "sharded" and list the mongos routers as
+# members (one Waypoint listener per mongos). A mongos advertises no replica-set
+# topology, so no address rewriting is needed; the provisioner connects through
+# the mongos so dynamic users propagate to the config servers and all shards.
+# topology is mutually exclusive with replica_set.
+#
+# With multiple mongos routers, a user provisioned via one mongos may take up to
+# userCacheInvalidationIntervalSecs (default 30s) to become authable on the
+# others; lower that mongos parameter if clients spread across routers.
+# [listeners.mongodb]
+# admin_user = "waypoint_admin"
+# admin_password = "${MONGO_ADMIN_PASSWORD}"
+# auth_database = "admin"
+# topology = "sharded"
+#
+# [[listeners.mongodb.members]] # a mongos router
+# backend = "mongos1.prod.internal:27017"
+# listen = ":27017"
+# advertise = "waypoint-db:27017"
+#
+# [[listeners.mongodb.members]] # another mongos router
+# backend = "mongos2.prod.internal:27017"
+# listen = ":27018"
+# advertise = "waypoint-db:27018"
+
 # Example: backend reachable only via Tailscale (MagicDNS name or 100.x.y.z IP).
 # [[listeners]]
 # name = "ts-backend"

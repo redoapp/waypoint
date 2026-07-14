@@ -325,19 +325,34 @@ func RunServer(ctx context.Context, configPath string, logger *slog.Logger, leve
 			}
 
 			if lCfg.MongoDB.EffectiveProvisionMode() == config.MongoProvisionDatabase {
-				mongoProvisioner = provision.NewMongoReplicaSetProvisioner(
-					lCfg.MongoDB.AdminUser,
-					lCfg.MongoDB.AdminPassword,
-					mongoProvisionBackends(lCfg, backends),
-					lCfg.MongoDB.ReplicaSet,
-					lCfg.MongoDB.AuthDatabase,
-					lCfg.MongoDB.UserPrefix,
-					mongoPeerService,
-					lCfg.BackendTLS,
-					store,
-					logger.With("component", "mongo-provisioner", "listener", lCfg.Name),
-					dialer,
-				)
+				if lCfg.MongoDB.IsSharded() {
+					mongoProvisioner = provision.NewMongoShardedProvisioner(
+						lCfg.MongoDB.AdminUser,
+						lCfg.MongoDB.AdminPassword,
+						mongoProvisionBackends(lCfg, backends),
+						lCfg.MongoDB.AuthDatabase,
+						lCfg.MongoDB.UserPrefix,
+						mongoPeerService,
+						lCfg.BackendTLS,
+						store,
+						logger.With("component", "mongo-provisioner", "listener", lCfg.Name),
+						dialer,
+					)
+				} else {
+					mongoProvisioner = provision.NewMongoReplicaSetProvisioner(
+						lCfg.MongoDB.AdminUser,
+						lCfg.MongoDB.AdminPassword,
+						mongoProvisionBackends(lCfg, backends),
+						lCfg.MongoDB.ReplicaSet,
+						lCfg.MongoDB.AuthDatabase,
+						lCfg.MongoDB.UserPrefix,
+						mongoPeerService,
+						lCfg.BackendTLS,
+						store,
+						logger.With("component", "mongo-provisioner", "listener", lCfg.Name),
+						dialer,
+					)
+				}
 			}
 
 			mongoTopologyMap, err = buildMongoTopologyMap(lCfg, backends, cfg.Tailscale.Hostname)
@@ -634,6 +649,12 @@ func mongoProvisionBackends(lCfg config.ListenerConfig, backends []config.Backen
 
 func buildMongoTopologyMap(lCfg config.ListenerConfig, backends []config.BackendPair, tailscaleHostname string) (map[string]string, error) {
 	if lCfg.MongoDB == nil || (!lCfg.MongoDB.HasSRV() && len(lCfg.MongoDB.Members) == 0) {
+		return nil, nil
+	}
+	// Sharded clusters are reached through mongos routers, whose hello replies
+	// carry no replica-set host fields to rewrite. Skip the topology map so
+	// the proxy never attempts an address rewrite for a mongos response.
+	if lCfg.MongoDB.IsSharded() {
 		return nil, nil
 	}
 

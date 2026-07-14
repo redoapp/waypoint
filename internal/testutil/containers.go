@@ -57,6 +57,10 @@ var (
 	mongoRSOnce sync.Once
 	mongoRSData *MongoRSInfo
 	mongoRSErr  error
+
+	mongoShardedOnce sync.Once
+	mongoShardedData *MongoShardedInfo
+	mongoShardedErr  error
 )
 
 // MongoRSInfo contains connection info for a multi-node MongoDB replica set.
@@ -64,6 +68,13 @@ type MongoRSInfo struct {
 	ConnStr string   // mongodb://admin:adminpass@host1:port1,host2:port2,host3:port3/?replicaSet=rs0&authSource=admin
 	Primary string   // host:port of the primary (mapped port on host)
 	Members []string // all member host:port addresses (mapped ports on host)
+}
+
+// MongoShardedInfo contains connection info for a sharded MongoDB cluster
+// (config-server replica set + shard replica sets fronted by mongos routers).
+type MongoShardedInfo struct {
+	ConnStr string   // mongodb://admin:adminpass@mongos1,mongos2/?authSource=admin
+	Mongos  []string // mapped host:port for each mongos router
 }
 
 // RedisClient starts a shared Redis 7-alpine container (once per test binary)
@@ -758,4 +769,319 @@ exec mongod --replSet rs0 --keyFile /tmp/keyfile --bind_ip_all --port 27017
 	}
 
 	return mongoRSData
+}
+
+// startMongoRSGroup starts an N-node MongoDB replica set on the given docker
+// network, initiates it, and waits for a primary. roleFlag is "--configsvr"
+// for a config-server RS or "--shardsvr" for a shard RS. Returns the started
+// containers (never terminated; they live for the test binary's lifetime).
+func startMongoRSGroup(ctx context.Context, nwName, keyContent, replSet, roleFlag string, aliases []string) ([]testcontainers.Container, error) {
+	mkScript := func() string {
+		return fmt.Sprintf(`#!/bin/sh
+set -e
+echo '%s' > /tmp/keyfile
+chmod 400 /tmp/keyfile
+chown 999:999 /tmp/keyfile
+exec mongod %s --replSet %s --keyFile /tmp/keyfile --bind_ip_all --port 27017
+`, keyContent, roleFlag, replSet)
+	}
+
+	type containerResult struct {
+		container testcontainers.Container
+		err       error
+	}
+	results := make([]chan containerResult, len(aliases))
+	for i, alias := range aliases {
+		results[i] = make(chan containerResult, 1)
+		go func(idx int, alias string) {
+			c, cerr := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
+				ContainerRequest: testcontainers.ContainerRequest{
+					Image:        "mongo:8",
+					ExposedPorts: []string{"27017/tcp"},
+					Entrypoint:   []string{"/bin/sh", "-c", mkScript()},
+					Networks:     []string{nwName},
+					NetworkAliases: map[string][]string{
+						nwName: {alias},
+					},
+					// Ephemeral data dirs via tmpfs so no named volumes are
+					// created — avoids exhausting Podman's volume-lock pool
+					// when the reaper is disabled (rootless Podman).
+					Tmpfs: map[string]string{"/data/db": "rw", "/data/configdb": "rw"},
+					WaitingFor: wait.ForLog("Waiting for connections").
+						WithStartupTimeout(90 * time.Second),
+				},
+				Started: true,
+			})
+			results[idx] <- containerResult{container: c, err: cerr}
+		}(i, alias)
+	}
+
+	containers := make([]testcontainers.Container, len(aliases))
+	for i := range containers {
+		r := <-results[i]
+		if r.err != nil {
+			return nil, fmt.Errorf("start %s: %w", aliases[i], r.err)
+		}
+		containers[i] = r.container
+	}
+
+	// rs.initiate() on the first member via direct localhost connection.
+	memberDocs := make([]string, len(aliases))
+	for i, alias := range aliases {
+		memberDocs[i] = fmt.Sprintf(`{ _id: %d, host: "%s:27017" }`, i, alias)
+	}
+	rsInitCmd := fmt.Sprintf(`rs.initiate({ _id: "%s", configsvr: %t, members: [%s] })`,
+		replSet, roleFlag == "--configsvr", strings.Join(memberDocs, ", "))
+	code, _, execErr := containers[0].Exec(ctx, []string{
+		"mongosh", "--host", "localhost", "--port", "27017", "--eval", rsInitCmd,
+	})
+	if execErr != nil {
+		return nil, fmt.Errorf("%s rs.initiate exec: %w", replSet, execErr)
+	}
+	if code != 0 {
+		return nil, fmt.Errorf("%s rs.initiate exit code: %d", replSet, code)
+	}
+
+	// Wait for primary election.
+	for i := 0; i < 60; i++ {
+		code, _, _ := containers[0].Exec(ctx, []string{
+			"mongosh", "--host", "localhost", "--port", "27017", "--quiet", "--eval",
+			`const s = rs.status(); const hasPrimary = s.members && s.members.some(m => m.stateStr === "PRIMARY"); if (hasPrimary) { print("OK"); quit(0); } else { quit(1); }`,
+		})
+		if code == 0 {
+			return containers, nil
+		}
+		time.Sleep(2 * time.Second)
+	}
+	return nil, fmt.Errorf("%s primary election timed out after 120s", replSet)
+}
+
+// MongoDBShardedCluster starts a shared sharded MongoDB cluster (once per test
+// binary): a 3-node config-server replica set, two 3-node shard replica sets,
+// and two mongos routers. Auth uses admin/adminpass with a shared keyFile for
+// internal cluster auth. Each call cleans up provisioned users and non-system
+// databases (via a mongos) for isolation.
+func MongoDBShardedCluster(t *testing.T) *MongoShardedInfo {
+	t.Helper()
+
+	mongoShardedOnce.Do(func() {
+		ctx := context.Background()
+
+		nw, err := network.New(ctx)
+		if err != nil {
+			mongoShardedErr = fmt.Errorf("create docker network: %w", err)
+			return
+		}
+
+		keyBytes := make([]byte, 32)
+		if _, err := rand.Read(keyBytes); err != nil {
+			mongoShardedErr = fmt.Errorf("generate keyfile: %w", err)
+			return
+		}
+		keyContent := base64.StdEncoding.EncodeToString(keyBytes)
+
+		// Config-server replica set.
+		cfgAliases := []string{"cfgsvr1", "cfgsvr2", "cfgsvr3"}
+		cfgContainers, err := startMongoRSGroup(ctx, nw.Name, keyContent, "cfg0", "--configsvr", cfgAliases)
+		if err != nil {
+			mongoShardedErr = fmt.Errorf("config replica set: %w", err)
+			return
+		}
+
+		// Two shard replica sets.
+		shard0Aliases := []string{"shard0a", "shard0b", "shard0c"}
+		if _, err := startMongoRSGroup(ctx, nw.Name, keyContent, "shard0", "--shardsvr", shard0Aliases); err != nil {
+			mongoShardedErr = fmt.Errorf("shard0 replica set: %w", err)
+			return
+		}
+		shard1Aliases := []string{"shard1a", "shard1b", "shard1c"}
+		if _, err := startMongoRSGroup(ctx, nw.Name, keyContent, "shard1", "--shardsvr", shard1Aliases); err != nil {
+			mongoShardedErr = fmt.Errorf("shard1 replica set: %w", err)
+			return
+		}
+
+		// Create the cluster admin user on the config RS via the localhost
+		// exception. It is stored on the config servers and is authoritative
+		// cluster-wide (visible through mongos).
+		createUserCmd := `db.getSiblingDB("admin").createUser({
+			user: "admin",
+			pwd: "adminpass",
+			roles: [{ role: "root", db: "admin" }]
+		})`
+		var userCreated bool
+		for attempt := 0; attempt < 30 && !userCreated; attempt++ {
+			for _, c := range cfgContainers {
+				code, _, cerr := c.Exec(ctx, []string{
+					"mongosh", "--host", "localhost", "--port", "27017", "--eval", createUserCmd,
+				})
+				if cerr == nil && code == 0 {
+					userCreated = true
+					break
+				}
+			}
+			if !userCreated {
+				time.Sleep(2 * time.Second)
+			}
+		}
+		if !userCreated {
+			mongoShardedErr = fmt.Errorf("create admin user on config RS failed")
+			return
+		}
+
+		// Start mongos routers pointing at the config RS.
+		configDB := "cfg0/cfgsvr1:27017,cfgsvr2:27017,cfgsvr3:27017"
+		// userCacheInvalidationIntervalSecs is lowered to its minimum (1s) so a
+		// user provisioned through one mongos becomes authable on the other
+		// mongos quickly. With the 30s default, a freshly created user is not
+		// immediately visible cluster-wide, which surfaces as transient backend
+		// auth failures when a client hits a different mongos than the one that
+		// provisioned it.
+		mongosScript := fmt.Sprintf(`#!/bin/sh
+set -e
+echo '%s' > /tmp/keyfile
+chmod 400 /tmp/keyfile
+chown 999:999 /tmp/keyfile
+exec mongos --configdb %s --keyFile /tmp/keyfile --bind_ip_all --port 27017 --setParameter userCacheInvalidationIntervalSecs=1
+`, keyContent, configDB)
+
+		mongosAliases := []string{"mongos1", "mongos2"}
+		type containerResult struct {
+			container testcontainers.Container
+			err       error
+		}
+		mongosResults := make([]chan containerResult, len(mongosAliases))
+		for i, alias := range mongosAliases {
+			mongosResults[i] = make(chan containerResult, 1)
+			go func(idx int, alias string) {
+				c, cerr := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
+					ContainerRequest: testcontainers.ContainerRequest{
+						Image:        "mongo:8",
+						ExposedPorts: []string{"27017/tcp"},
+						Entrypoint:   []string{"/bin/sh", "-c", mongosScript},
+						Networks:     []string{nw.Name},
+						NetworkAliases: map[string][]string{
+							nw.Name: {alias},
+						},
+						// mongos keeps no data dir; tmpfs avoids the image's
+						// declared VOLUME creating a named volume.
+						Tmpfs: map[string]string{"/data/db": "rw", "/data/configdb": "rw"},
+						WaitingFor: wait.ForLog("Waiting for connections").
+							WithStartupTimeout(90 * time.Second),
+					},
+					Started: true,
+				})
+				mongosResults[idx] <- containerResult{container: c, err: cerr}
+			}(i, alias)
+		}
+		mongosContainers := make([]testcontainers.Container, len(mongosAliases))
+		for i := range mongosContainers {
+			r := <-mongosResults[i]
+			if r.err != nil {
+				mongoShardedErr = fmt.Errorf("start %s: %w", mongosAliases[i], r.err)
+				return
+			}
+			mongosContainers[i] = r.container
+		}
+
+		// Add both shards via a mongos (authenticated as admin).
+		addShardCmd := `sh.addShard("shard0/shard0a:27017,shard0b:27017,shard0c:27017");
+			sh.addShard("shard1/shard1a:27017,shard1b:27017,shard1c:27017");`
+		var shardsAdded bool
+		for attempt := 0; attempt < 30 && !shardsAdded; attempt++ {
+			code, _, cerr := mongosContainers[0].Exec(ctx, []string{
+				"mongosh", "--host", "localhost", "--port", "27017",
+				"-u", "admin", "-p", "adminpass", "--authenticationDatabase", "admin",
+				"--eval", addShardCmd,
+			})
+			if cerr == nil && code == 0 {
+				shardsAdded = true
+				break
+			}
+			time.Sleep(2 * time.Second)
+		}
+		if !shardsAdded {
+			mongoShardedErr = fmt.Errorf("add shards failed")
+			return
+		}
+
+		// Collect mapped mongos addresses.
+		hostIP, err := mongosContainers[0].Host(ctx)
+		if err != nil {
+			mongoShardedErr = fmt.Errorf("get host: %w", err)
+			return
+		}
+		var mongosAddrs []string
+		for i, c := range mongosContainers {
+			port, err := c.MappedPort(ctx, "27017/tcp")
+			if err != nil {
+				mongoShardedErr = fmt.Errorf("mapped port %s: %w", mongosAliases[i], err)
+				return
+			}
+			mongosAddrs = append(mongosAddrs, fmt.Sprintf("%s:%s", hostIP, port.Port()))
+		}
+
+		// Verify connectivity through the mongos routers.
+		connStr := fmt.Sprintf("mongodb://admin:adminpass@%s/?authSource=admin", strings.Join(mongosAddrs, ","))
+		verifyOpts := options.Client().ApplyURI(connStr).SetServerSelectionTimeout(30 * time.Second)
+		var client *mongo.Client
+		for attempt := 0; attempt < 15; attempt++ {
+			client, err = mongo.Connect(verifyOpts)
+			if err == nil {
+				if err = client.Ping(ctx, nil); err == nil {
+					break
+				}
+				client.Disconnect(ctx)
+			}
+			time.Sleep(2 * time.Second)
+		}
+		if err != nil {
+			mongoShardedErr = fmt.Errorf("connect to mongos: %w", err)
+			return
+		}
+		client.Disconnect(ctx)
+
+		mongoShardedData = &MongoShardedInfo{
+			ConnStr: connStr,
+			Mongos:  mongosAddrs,
+		}
+	})
+
+	if mongoShardedErr != nil {
+		t.Fatalf("mongodb sharded cluster: %v", mongoShardedErr)
+	}
+
+	// Clean up provisioned users and non-system databases via a mongos.
+	ctx := context.Background()
+	opts := options.Client().ApplyURI(mongoShardedData.ConnStr).SetServerSelectionTimeout(15 * time.Second)
+	client, err := mongo.Connect(opts)
+	if err == nil {
+		names, _ := client.ListDatabaseNames(ctx, bson.M{})
+		for _, name := range names {
+			if name != "admin" && name != "local" && name != "config" {
+				client.Database(name).Drop(ctx)
+			}
+		}
+		result := client.Database("admin").RunCommand(ctx, bson.D{
+			{Key: "usersInfo", Value: 1},
+		})
+		var resp struct {
+			Users []struct {
+				User string `bson:"user"`
+			} `bson:"users"`
+		}
+		if result.Err() == nil {
+			if err := result.Decode(&resp); err == nil {
+				for _, u := range resp.Users {
+					if strings.HasPrefix(u.User, "wp_") {
+						client.Database("admin").RunCommand(ctx, bson.D{
+							{Key: "dropUser", Value: u.User},
+						})
+					}
+				}
+			}
+		}
+		client.Disconnect(ctx)
+	}
+
+	return mongoShardedData
 }
