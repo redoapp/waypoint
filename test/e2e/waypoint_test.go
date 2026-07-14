@@ -1434,7 +1434,34 @@ mode = "database"
 		t.Fatalf("search did not return the seeded document: %s", searchBody)
 	}
 
-	// 3. A write must be denied — the grant is read-only, proving the
+	// 3. Node info through the proxy: every node's HTTP publish_address must be
+	//    rewritten to the advertised Waypoint endpoint so clients that discover
+	//    nodes via the API route back through Waypoint rather than to the real
+	//    backend address.
+	nodesStatus, nodesBody := osDo(http.MethodGet, "/_nodes/http", "")
+	if nodesStatus != http.StatusOK {
+		t.Fatalf("_nodes/http through waypoint status = %d: %s", nodesStatus, nodesBody)
+	}
+	var nodesDoc struct {
+		Nodes map[string]struct {
+			HTTP struct {
+				PublishAddress string `json:"publish_address"`
+			} `json:"http"`
+		} `json:"nodes"`
+	}
+	if err := json.Unmarshal(nodesBody, &nodesDoc); err != nil {
+		t.Fatalf("decode _nodes/http: %v (%s)", err, nodesBody)
+	}
+	if len(nodesDoc.Nodes) == 0 {
+		t.Fatalf("_nodes/http returned no nodes: %s", nodesBody)
+	}
+	for id, node := range nodesDoc.Nodes {
+		if node.HTTP.PublishAddress != "waypoint-opensearch-e2e:9200" {
+			t.Fatalf("node %s publish_address = %q, want rewritten waypoint-opensearch-e2e:9200", id, node.HTTP.PublishAddress)
+		}
+	}
+
+	// 4. A write must be denied — the grant is read-only, proving the
 	//    provisioned role's scoping is enforced through the full stack.
 	writeStatus, writeBody := osDo(http.MethodPost, "/logs-2026/_doc", `{"message":"should-be-denied"}`)
 	if writeStatus != http.StatusForbidden {
@@ -1444,6 +1471,263 @@ mode = "database"
 	// --- Shutdown ---
 	// Close the keep-alive connection so the proxy's connection handler unblocks
 	// and the server can drain and exit.
+	httpClient.CloseIdleConnections()
+	runCancel()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("RunServer: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for shutdown")
+	}
+}
+
+// putOpenSearchSecurityJSON issues an admin PUT to the OpenSearch Security REST
+// API (used to pre-create the backend user/role a static listener maps to).
+func putOpenSearchSecurityJSON(t *testing.T, backend, path, jsonBody string) {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPut, "http://"+backend+path, strings.NewReader(jsonBody))
+	if err != nil {
+		t.Fatalf("build PUT %s: %v", path, err)
+	}
+	req.SetBasicAuth(testutil.OpenSearchAdminUser, testutil.OpenSearchAdminPassword)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("PUT %s: %v", path, err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode/100 != 2 {
+		t.Fatalf("PUT %s status = %d: %s", path, resp.StatusCode, body)
+	}
+}
+
+// TestE2E_OpenSearch_StaticMode is a full end-to-end test of the static
+// provision mode. A backend user/role is pre-created out of band; the listener
+// is configured with a static_users entry whose normalized grant set matches
+// the caller's ACL grant. Waypoint authenticates the caller, matches the grant
+// signature to the configured static user, injects that user's credentials, and
+// proxies the request — no dynamic provisioning involved.
+func TestE2E_OpenSearch_StaticMode(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Second)
+	defer cancel()
+
+	// --- OpenSearch backend + pre-created static user ---
+	backend := testutil.OpenSearchBackend(t)
+	seedOpenSearchDoc(t, backend, "logs-static", `{"message":"static-hello","level":"info"}`)
+
+	const (
+		staticRole = "e2e_static_role"
+		staticUser = "e2e_static_ro"
+		staticPass = "Static_R0_Passw0rd!"
+	)
+	// The role's grants must match what the ACL cap expands to (readonly on
+	// logs-* -> cluster_composite_ops_ro + index read), plus cluster_monitor.
+	putOpenSearchSecurityJSON(t, backend, "/_plugins/_security/api/roles/"+staticRole,
+		`{"cluster_permissions":["cluster_composite_ops_ro","cluster_monitor"],"index_permissions":[{"index_patterns":["logs-*"],"allowed_actions":["read"]}]}`)
+	putOpenSearchSecurityJSON(t, backend, "/_plugins/_security/api/internalusers/"+staticUser,
+		fmt.Sprintf(`{"password":%q,"opendistro_security_roles":[%q]}`, staticPass, staticRole))
+
+	// --- Test infrastructure ---
+	netns.SetEnabled(false)
+	t.Cleanup(func() { netns.SetEnabled(true) })
+
+	derpMap := integration.RunDERPAndSTUN(t, logger.Discard, "127.0.0.1")
+	control := &testcontrol.Server{
+		DERPMap:        derpMap,
+		DNSConfig:      &tailcfg.DNSConfig{Proxied: true},
+		MagicDNSDomain: "tail-scale.ts.net",
+	}
+	control.HTTPTestServer = httptest.NewUnstartedServer(control)
+	control.HTTPTestServer.Start()
+	t.Cleanup(control.HTTPTestServer.Close)
+	controlURL := control.HTTPTestServer.URL
+
+	// The ACL grant must normalize to the same signature as the static user's
+	// configured grant set.
+	capRule := auth.CapRule{
+		Limits: &auth.LimitsCap{MaxConns: 10},
+		Backends: map[string]auth.BackendCap{
+			"search": {
+				OpenSearch: &auth.OpenSearchCap{
+					ClusterPermissions: []string{"cluster_monitor"},
+					Indices: map[string]auth.OpenSearchIndexPermissions{
+						"logs-*": {Permissions: []string{"readonly"}},
+					},
+				},
+			},
+		},
+	}
+	capJSON, err := json.Marshal(capRule)
+	if err != nil {
+		t.Fatalf("marshal cap rule: %v", err)
+	}
+	control.SetGlobalAppCaps(tailcfg.PeerCapMap{
+		tailcfg.PeerCapability(auth.WaypointCap): {tailcfg.RawMessage(capJSON)},
+	})
+
+	rdb := testutil.RedisClient(t)
+
+	stateDir := filepath.Join(t.TempDir(), "wp-state")
+	os.MkdirAll(stateDir, 0755)
+
+	configContent := fmt.Sprintf(`
+[tailscale]
+hostname = "waypoint-opensearch-static-e2e"
+control_url = "%s"
+state_dir = "%s"
+ephemeral = true
+
+[redis]
+address = "%s"
+key_prefix = "e2e-opensearch-static:"
+
+[[listeners]]
+name = "search"
+listen = ":9200"
+mode = "opensearch"
+backend = "%s"
+advertise = "waypoint-opensearch-static-e2e:9200"
+tls_mode = "off"
+
+[listeners.opensearch]
+admin_user = "%s"
+admin_password = "%s"
+
+[listeners.opensearch.provision]
+mode = "static"
+
+[[listeners.opensearch.provision.static_users]]
+name = "logs-ro"
+username = "%s"
+password = "%s"
+cluster_permissions = ["cluster_composite_ops_ro", "cluster_monitor"]
+
+[[listeners.opensearch.provision.static_users.index_permissions]]
+index_patterns = ["logs-*"]
+allowed_actions = ["read"]
+`, controlURL, stateDir, rdb.Options().Addr, backend,
+		testutil.OpenSearchAdminUser, testutil.OpenSearchAdminPassword, staticUser, staticPass)
+
+	configPath := filepath.Join(t.TempDir(), "waypoint.toml")
+	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	// --- Start waypoint via the real server path ---
+	runCtx, runCancel := context.WithCancel(ctx)
+	defer runCancel()
+
+	var testLevelVar slog.LevelVar
+	testLevelVar.Set(slog.LevelInfo)
+	lgr := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: &testLevelVar}))
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- server.RunServer(runCtx, configPath, lgr, &testLevelVar, nil)
+	}()
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("RunServer exited early: %v", err)
+	case <-time.After(2 * time.Second):
+	}
+
+	// --- Client node ---
+	clientDir := filepath.Join(t.TempDir(), "client")
+	os.MkdirAll(clientDir, 0755)
+
+	clientNode := &tsnet.Server{
+		Dir:        clientDir,
+		ControlURL: controlURL,
+		Hostname:   "e2e-opensearch-static-client",
+		Store:      new(mem.Store),
+		Ephemeral:  true,
+	}
+	t.Cleanup(func() { clientNode.Close() })
+
+	if _, err := clientNode.Up(ctx); err != nil {
+		t.Fatalf("client Up: %v", err)
+	}
+
+	var waypointIP string
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		lc, err := clientNode.LocalClient()
+		if err != nil {
+			t.Fatalf("client LocalClient: %v", err)
+		}
+		status, err := lc.Status(ctx)
+		if err != nil {
+			t.Fatalf("client status: %v", err)
+		}
+		for _, peer := range status.Peer {
+			if peer.HostName == "waypoint-opensearch-static-e2e" {
+				waypointIP = peer.TailscaleIPs[0].String()
+				break
+			}
+		}
+		if waypointIP != "" {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	if waypointIP == "" {
+		t.Fatal("timed out waiting for waypoint-opensearch-static-e2e peer")
+	}
+
+	// --- HTTP client dialing through the tailnet ---
+	httpClient := &http.Client{
+		Timeout: 20 * time.Second,
+		Transport: &http.Transport{
+			DialContext: clientNode.Dial,
+		},
+	}
+	base := fmt.Sprintf("http://%s:9200", waypointIP)
+
+	osDo := func(method, path string) (int, []byte) {
+		t.Helper()
+		req, reqErr := http.NewRequestWithContext(ctx, method, base+path, nil)
+		if reqErr != nil {
+			t.Fatalf("build %s %s: %v", method, path, reqErr)
+		}
+		req.Header.Set("Authorization", "Basic bogus-client-credential")
+		resp, doErr := httpClient.Do(req)
+		if doErr != nil {
+			return 0, []byte(doErr.Error())
+		}
+		defer resp.Body.Close()
+		data, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, data
+	}
+
+	// Health through the proxy — retries until the listener is ready. Success
+	// proves the static credential was selected by grant signature and injected.
+	var healthStatus int
+	var healthBody []byte
+	dialDeadline := time.Now().Add(60 * time.Second)
+	for {
+		healthStatus, healthBody = osDo(http.MethodGet, "/_cluster/health")
+		if healthStatus == http.StatusOK {
+			break
+		}
+		if time.Now().After(dialDeadline) {
+			t.Fatalf("cluster health through static waypoint never succeeded: status=%d body=%s", healthStatus, healthBody)
+		}
+		time.Sleep(1 * time.Second)
+	}
+
+	// Search the permitted index — should return the seeded document.
+	searchStatus, searchBody := osDo(http.MethodGet, "/logs-static/_search")
+	if searchStatus != http.StatusOK {
+		t.Fatalf("search through static waypoint status = %d: %s", searchStatus, searchBody)
+	}
+	if !strings.Contains(string(searchBody), "static-hello") {
+		t.Fatalf("search did not return the seeded document: %s", searchBody)
+	}
+
+	// --- Shutdown ---
 	httpClient.CloseIdleConnections()
 	runCancel()
 	select {
