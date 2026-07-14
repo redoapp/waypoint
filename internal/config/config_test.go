@@ -631,7 +631,7 @@ tls_mode = "require"
 `
 	path := writeTestConfig(t, content)
 	_, err := Load(path)
-	if err == nil || !strings.Contains(err.Error(), "tls_mode is only supported for mode \"postgres\" or \"mongodb\"") {
+	if err == nil || !strings.Contains(err.Error(), "tls_mode is only supported for mode \"postgres\", \"mongodb\", or \"opensearch\"") {
 		t.Errorf("expected tls_mode mode error, got: %v", err)
 	}
 }
@@ -675,7 +675,7 @@ key_file = "/tmp/server.key"
 `
 	path := writeTestConfig(t, content)
 	_, err := Load(path)
-	if err == nil || !strings.Contains(err.Error(), "cert_file and key_file are only supported for mode \"postgres\" or \"mongodb\"") {
+	if err == nil || !strings.Contains(err.Error(), "cert_file and key_file are only supported for mode \"postgres\", \"mongodb\", or \"opensearch\"") {
 		t.Errorf("expected cert mode error, got: %v", err)
 	}
 }
@@ -694,8 +694,220 @@ use_tailscale_tls = false
 `
 	path := writeTestConfig(t, content)
 	_, err := Load(path)
-	if err == nil || !strings.Contains(err.Error(), "use_tailscale_tls is only supported for mode \"postgres\" or \"mongodb\"") {
+	if err == nil || !strings.Contains(err.Error(), "use_tailscale_tls is only supported for mode \"postgres\", \"mongodb\", or \"opensearch\"") {
 		t.Errorf("expected use_tailscale_tls mode error, got: %v", err)
+	}
+}
+
+func TestLoad_OpenSearchConfig(t *testing.T) {
+	content := `
+[tailscale]
+hostname = "waypoint-test"
+
+[[listeners]]
+name = "search"
+listen = ":9200"
+mode = "opensearch"
+backend = "search.internal:9200"
+tls = true
+tls_mode = "require"
+use_tailscale_tls = false
+cert_file = "/tmp/server.crt"
+key_file = "/tmp/server.key"
+
+[listeners.opensearch]
+admin_user = "admin"
+admin_password = "adminpass"
+user_prefix = "wp_os_"
+user_ttl = "6h"
+service_name = "opensearch"
+
+[listeners.opensearch.provision]
+mode = "database"
+`
+	path := writeTestConfig(t, content)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	l := cfg.Listeners[0]
+	if l.OpenSearch == nil {
+		t.Fatal("expected opensearch config")
+	}
+	if l.OpenSearch.AdminUser != "admin" {
+		t.Errorf("admin_user = %q", l.OpenSearch.AdminUser)
+	}
+	if l.OpenSearch.UserTTLDuration() != 6*time.Hour {
+		t.Errorf("user_ttl = %v", l.OpenSearch.UserTTLDuration())
+	}
+	if l.OpenSearch.EffectiveProvisionMode() != OpenSearchProvisionDatabase {
+		t.Errorf("provision mode = %q", l.OpenSearch.EffectiveProvisionMode())
+	}
+	if l.EffectiveTLSMode() != TLSRequire {
+		t.Errorf("tls mode = %q, want %q", l.EffectiveTLSMode(), TLSRequire)
+	}
+}
+
+func TestValidate_OpenSearchRequiresConfig(t *testing.T) {
+	content := `
+[tailscale]
+hostname = "waypoint-test"
+
+[[listeners]]
+name = "search"
+listen = ":9200"
+mode = "opensearch"
+backend = "search.internal:9200"
+`
+	path := writeTestConfig(t, content)
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "requires [listeners.opensearch] config") {
+		t.Errorf("expected opensearch config error, got: %v", err)
+	}
+}
+
+func TestValidate_OpenSearchStaticUser(t *testing.T) {
+	content := `
+[tailscale]
+hostname = "waypoint-test"
+
+[[listeners]]
+name = "search"
+listen = ":9200"
+mode = "opensearch"
+backend = "search.internal:9200"
+
+[listeners.opensearch]
+admin_user = "admin"
+admin_password = "adminpass"
+
+[listeners.opensearch.provision]
+mode = "static"
+
+[[listeners.opensearch.provision.static_users]]
+name = "logs-readonly"
+username = "logs_ro"
+password = "secret"
+
+[[listeners.opensearch.provision.static_users.index_permissions]]
+index_patterns = ["logs-*"]
+allowed_actions = ["read"]
+`
+	path := writeTestConfig(t, content)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Listeners[0].OpenSearch.EffectiveProvisionMode() != OpenSearchProvisionStatic {
+		t.Fatalf("mode = %q", cfg.Listeners[0].OpenSearch.EffectiveProvisionMode())
+	}
+}
+
+func TestLoad_OpenSearchAWSIAMConfig(t *testing.T) {
+	content := `
+[tailscale]
+hostname = "waypoint-test"
+
+[[listeners]]
+name = "search"
+listen = ":9200"
+mode = "opensearch"
+backend = "search-prod.us-east-1.es.amazonaws.com:443"
+tls = true
+
+[listeners.opensearch]
+backend_auth = "aws_iam"
+
+[listeners.opensearch.aws]
+region = "us-east-1"
+role_arn = "arn:aws:iam::123456789012:role/waypoint"
+`
+	path := writeTestConfig(t, content)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	os := cfg.Listeners[0].OpenSearch
+	if os.EffectiveBackendAuth() != OpenSearchBackendAuthAWSIAM {
+		t.Fatalf("backend_auth = %q", os.EffectiveBackendAuth())
+	}
+	if os.AWS == nil || os.AWS.Region != "us-east-1" {
+		t.Fatalf("aws region not parsed: %+v", os.AWS)
+	}
+	if os.AWS.EffectiveAWSService() != OpenSearchAWSServiceManaged {
+		t.Fatalf("service = %q, want default es", os.AWS.EffectiveAWSService())
+	}
+	if os.AWS.RoleARN != "arn:aws:iam::123456789012:role/waypoint" {
+		t.Fatalf("role_arn = %q", os.AWS.RoleARN)
+	}
+}
+
+func TestValidate_OpenSearchAWSIAMRequiresRegion(t *testing.T) {
+	content := `
+[tailscale]
+hostname = "waypoint-test"
+
+[[listeners]]
+name = "search"
+listen = ":9200"
+mode = "opensearch"
+backend = "search.internal:9200"
+
+[listeners.opensearch]
+backend_auth = "aws_iam"
+`
+	path := writeTestConfig(t, content)
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "aws.region is required") {
+		t.Errorf("expected aws region error, got: %v", err)
+	}
+}
+
+func TestValidate_OpenSearchInvalidBackendAuth(t *testing.T) {
+	content := `
+[tailscale]
+hostname = "waypoint-test"
+
+[[listeners]]
+name = "search"
+listen = ":9200"
+mode = "opensearch"
+backend = "search.internal:9200"
+
+[listeners.opensearch]
+admin_user = "admin"
+admin_password = "adminpass"
+backend_auth = "kerberos"
+`
+	path := writeTestConfig(t, content)
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "backend_auth must be") {
+		t.Errorf("expected backend_auth error, got: %v", err)
+	}
+}
+
+func TestValidate_OpenSearchInvalidAWSService(t *testing.T) {
+	content := `
+[tailscale]
+hostname = "waypoint-test"
+
+[[listeners]]
+name = "search"
+listen = ":9200"
+mode = "opensearch"
+backend = "search.internal:9200"
+
+[listeners.opensearch]
+backend_auth = "aws_iam"
+
+[listeners.opensearch.aws]
+region = "us-east-1"
+service = "dynamodb"
+`
+	path := writeTestConfig(t, content)
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "aws.service must be") {
+		t.Errorf("expected aws service error, got: %v", err)
 	}
 }
 
