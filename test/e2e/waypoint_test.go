@@ -10,10 +10,12 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/http"
 	"net/http/httptest"
 	"net/netip"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -1180,6 +1182,269 @@ listen = ":27020"
 
 	// --- Shutdown ---
 	mc.Disconnect(context.Background())
+	runCancel()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("RunServer: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for shutdown")
+	}
+}
+
+// seedOpenSearchDoc indexes a document into the backend as admin (refreshing so
+// it is immediately searchable). It talks to the backend container directly,
+// bypassing waypoint, purely to establish test data.
+func seedOpenSearchDoc(t *testing.T, backend, index, jsonDoc string) {
+	t.Helper()
+	url := fmt.Sprintf("http://%s/%s/_doc?refresh=true", backend, index)
+	req, err := http.NewRequest(http.MethodPost, url, strings.NewReader(jsonDoc))
+	if err != nil {
+		t.Fatalf("seed request: %v", err)
+	}
+	req.SetBasicAuth(testutil.OpenSearchAdminUser, testutil.OpenSearchAdminPassword)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("seed %s: %v", index, err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode/100 != 2 {
+		t.Fatalf("seed %s status = %d: %s", index, resp.StatusCode, body)
+	}
+}
+
+// TestE2E_OpenSearch_ProvisionAndProxy is a full end-to-end test that runs the
+// real server against a live OpenSearch backend. A client makes HTTP requests
+// through the tailnet to the waypoint OpenSearch listener (database provision
+// mode). Waypoint authenticates the caller via Tailscale WhoIs, reads the
+// redo.com/cap/waypoint grant, dynamically provisions a scoped backend user via
+// the OpenSearch Security API, and proxies the request with the injected backend
+// credentials. It verifies that:
+//   - an authorized read-only grant can hit cluster health and search a
+//     permitted index through the proxy, and
+//   - the same grant is denied a write, proving scoping is enforced end-to-end.
+func TestE2E_OpenSearch_ProvisionAndProxy(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Second)
+	defer cancel()
+
+	// --- OpenSearch backend ---
+	backend := testutil.OpenSearchBackend(t)
+	seedOpenSearchDoc(t, backend, "logs-2026", `{"message":"e2e-hello","level":"info"}`)
+
+	// --- Test infrastructure ---
+	netns.SetEnabled(false)
+	t.Cleanup(func() { netns.SetEnabled(true) })
+
+	derpMap := integration.RunDERPAndSTUN(t, logger.Discard, "127.0.0.1")
+	control := &testcontrol.Server{
+		DERPMap:        derpMap,
+		DNSConfig:      &tailcfg.DNSConfig{Proxied: true},
+		MagicDNSDomain: "tail-scale.ts.net",
+	}
+	control.HTTPTestServer = httptest.NewUnstartedServer(control)
+	control.HTTPTestServer.Start()
+	t.Cleanup(control.HTTPTestServer.Close)
+	controlURL := control.HTTPTestServer.URL
+
+	// Grant read-only access on logs-* plus cluster monitoring through the
+	// "search" backend.
+	capRule := auth.CapRule{
+		Limits: &auth.LimitsCap{MaxConns: 10},
+		Backends: map[string]auth.BackendCap{
+			"search": {
+				OpenSearch: &auth.OpenSearchCap{
+					ClusterPermissions: []string{"cluster_monitor"},
+					Indices: map[string]auth.OpenSearchIndexPermissions{
+						"logs-*": {Permissions: []string{"readonly"}},
+					},
+				},
+			},
+		},
+	}
+	capJSON, err := json.Marshal(capRule)
+	if err != nil {
+		t.Fatalf("marshal cap rule: %v", err)
+	}
+	control.SetGlobalAppCaps(tailcfg.PeerCapMap{
+		tailcfg.PeerCapability(auth.WaypointCap): {tailcfg.RawMessage(capJSON)},
+	})
+
+	rdb := testutil.RedisClient(t)
+
+	// --- Config file: opensearch listener in database provision mode ---
+	stateDir := filepath.Join(t.TempDir(), "wp-state")
+	os.MkdirAll(stateDir, 0755)
+
+	configContent := fmt.Sprintf(`
+[tailscale]
+hostname = "waypoint-opensearch-e2e"
+control_url = "%s"
+state_dir = "%s"
+ephemeral = true
+
+[redis]
+address = "%s"
+key_prefix = "e2e-opensearch:"
+
+[[listeners]]
+name = "search"
+listen = ":9200"
+mode = "opensearch"
+backend = "%s"
+advertise = "waypoint-opensearch-e2e:9200"
+tls_mode = "off"
+
+[listeners.opensearch]
+admin_user = "%s"
+admin_password = "%s"
+user_prefix = "wp_os_"
+user_ttl = "24h"
+
+[listeners.opensearch.provision]
+mode = "database"
+`, controlURL, stateDir, rdb.Options().Addr, backend, testutil.OpenSearchAdminUser, testutil.OpenSearchAdminPassword)
+
+	configPath := filepath.Join(t.TempDir(), "waypoint.toml")
+	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	// --- Start waypoint via the real server path ---
+	runCtx, runCancel := context.WithCancel(ctx)
+	defer runCancel()
+
+	var testLevelVar slog.LevelVar
+	testLevelVar.Set(slog.LevelInfo)
+	lgr := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: &testLevelVar}))
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- server.RunServer(runCtx, configPath, lgr, &testLevelVar, nil)
+	}()
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("RunServer exited early: %v", err)
+	case <-time.After(2 * time.Second):
+	}
+
+	// --- Client node ---
+	clientDir := filepath.Join(t.TempDir(), "client")
+	os.MkdirAll(clientDir, 0755)
+
+	clientNode := &tsnet.Server{
+		Dir:        clientDir,
+		ControlURL: controlURL,
+		Hostname:   "e2e-opensearch-client",
+		Store:      new(mem.Store),
+		Ephemeral:  true,
+	}
+	t.Cleanup(func() { clientNode.Close() })
+
+	if _, err := clientNode.Up(ctx); err != nil {
+		t.Fatalf("client Up: %v", err)
+	}
+
+	// Wait for the waypoint peer to appear.
+	var waypointIP string
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		lc, err := clientNode.LocalClient()
+		if err != nil {
+			t.Fatalf("client LocalClient: %v", err)
+		}
+		status, err := lc.Status(ctx)
+		if err != nil {
+			t.Fatalf("client status: %v", err)
+		}
+		for _, peer := range status.Peer {
+			if peer.HostName == "waypoint-opensearch-e2e" {
+				waypointIP = peer.TailscaleIPs[0].String()
+				break
+			}
+		}
+		if waypointIP != "" {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	if waypointIP == "" {
+		t.Fatal("timed out waiting for waypoint-opensearch-e2e peer")
+	}
+
+	// --- HTTP client that dials the waypoint listener through the tailnet ---
+	httpClient := &http.Client{
+		Timeout: 20 * time.Second,
+		Transport: &http.Transport{
+			DialContext: clientNode.Dial,
+		},
+	}
+	base := fmt.Sprintf("http://%s:9200", waypointIP)
+
+	// osDo issues a request through the tailnet. Clients present a bogus
+	// Authorization header, which waypoint must strip and replace with the
+	// provisioned backend credentials.
+	osDo := func(method, path, body string) (int, []byte) {
+		t.Helper()
+		var rdr io.Reader
+		if body != "" {
+			rdr = strings.NewReader(body)
+		}
+		req, reqErr := http.NewRequestWithContext(ctx, method, base+path, rdr)
+		if reqErr != nil {
+			t.Fatalf("build %s %s: %v", method, path, reqErr)
+		}
+		req.Header.Set("Authorization", "Basic bogus-client-credential")
+		if body != "" {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		resp, doErr := httpClient.Do(req)
+		if doErr != nil {
+			return 0, []byte(doErr.Error())
+		}
+		defer resp.Body.Close()
+		data, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, data
+	}
+
+	// 1. Cluster health through the proxy — retry until the listener is up and
+	//    the dynamic user has been provisioned.
+	var healthStatus int
+	var healthBody []byte
+	dialDeadline := time.Now().Add(60 * time.Second)
+	for {
+		healthStatus, healthBody = osDo(http.MethodGet, "/_cluster/health", "")
+		if healthStatus == http.StatusOK {
+			break
+		}
+		if time.Now().After(dialDeadline) {
+			t.Fatalf("cluster health through waypoint never succeeded: status=%d body=%s", healthStatus, healthBody)
+		}
+		time.Sleep(1 * time.Second)
+	}
+
+	// 2. Search the permitted index — should return the seeded document.
+	searchStatus, searchBody := osDo(http.MethodGet, "/logs-2026/_search", "")
+	if searchStatus != http.StatusOK {
+		t.Fatalf("search through waypoint status = %d: %s", searchStatus, searchBody)
+	}
+	if !strings.Contains(string(searchBody), "e2e-hello") {
+		t.Fatalf("search did not return the seeded document: %s", searchBody)
+	}
+
+	// 3. A write must be denied — the grant is read-only, proving the
+	//    provisioned role's scoping is enforced through the full stack.
+	writeStatus, writeBody := osDo(http.MethodPost, "/logs-2026/_doc", `{"message":"should-be-denied"}`)
+	if writeStatus != http.StatusForbidden {
+		t.Fatalf("read-only write status = %d (want 403): %s", writeStatus, writeBody)
+	}
+
+	// --- Shutdown ---
+	// Close the keep-alive connection so the proxy's connection handler unblocks
+	// and the server can drain and exit.
+	httpClient.CloseIdleConnections()
 	runCancel()
 	select {
 	case err := <-errCh:
