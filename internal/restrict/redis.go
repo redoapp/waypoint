@@ -416,6 +416,39 @@ func (s *RedisStore) GetBandwidthBytes(ctx context.Context, user, scope string, 
 	return val, err
 }
 
+// GetCredential returns the currently-in-effect password for a provisioned
+// user, or "" when none is cached. Callers must hold the role lock: the value
+// is only meaningful while nothing else can rotate the role's password.
+//
+// This is shared across instances on purpose. A per-process cache would let
+// two replicas each believe a different password is current and flip the role
+// back and forth, breaking each other's in-flight logins.
+func (s *RedisStore) GetCredential(ctx context.Context, pgUser string) (string, error) {
+	ctx, span := s.startOp(ctx, "get_credential")
+	start := time.Now()
+	val, err := s.client.Get(ctx, s.key("cred", pgUser)).Result()
+	if err == redis.Nil {
+		s.recordOp(ctx, span, "get_credential", start, nil)
+		return "", nil
+	}
+	if err != nil {
+		s.recordOp(ctx, span, "get_credential", start, err)
+		return "", err
+	}
+	s.recordOp(ctx, span, "get_credential", start, nil)
+	return val, nil
+}
+
+// SetCredential records the password now in effect for a provisioned user so
+// that connections arriving within ttl reuse it instead of rotating it.
+func (s *RedisStore) SetCredential(ctx context.Context, pgUser, password string, ttl time.Duration) error {
+	ctx, span := s.startOp(ctx, "set_credential")
+	start := time.Now()
+	err := s.client.Set(ctx, s.key("cred", pgUser), password, ttl).Err()
+	s.recordOp(ctx, span, "set_credential", start, err)
+	return err
+}
+
 // TouchLastUsed updates the last-used timestamp for a provisioned user.
 func (s *RedisStore) TouchLastUsed(ctx context.Context, pgUser string) error {
 	ctx, span := s.startOp(ctx, "touch_last_used")

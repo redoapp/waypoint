@@ -252,6 +252,19 @@ func (p *PostgresProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 		setupSpan.RecordError(err)
 		setupSpan.SetStatus(codes.Error, "provision failed")
 		setupSpan.End()
+		if errors.Is(err, provision.ErrLockBusy) {
+			// Contention, not a fault: another connection for this same role is
+			// still provisioning. Say so, so the user retries instead of
+			// reading "internal error" and filing a bug.
+			log.WarnContext(ctx, "provision contended",
+				"user", result.LoginName,
+				"database", requestedDB,
+				"error", err,
+			)
+			pgwire.SendErrorResponse(clientConn, "FATAL", "55006",
+				"your database role is being set up by another connection; please retry")
+			return
+		}
 		log.ErrorContext(ctx, "provision failed",
 			"user", result.LoginName,
 			"database", requestedDB,
