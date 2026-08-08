@@ -71,7 +71,7 @@ func setupProxyWithClientTLS(t *testing.T, authResult *auth.AuthResult, authErr 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 	_, backend := testutil.PostgresBackend(t)
-	provisioner := provision.NewProvisioner("admin", "adminpass", "waypoint_test", backend, "wp_", false, true, "test", store, logger, nil, nil)
+	provisioner := provision.NewProvisioner("admin", "adminpass", "waypoint_test", backend, "wp_", false, true, nil, "test", store, logger, nil, nil)
 
 	p := &proxy.PostgresProxy{
 		Backend:       backend,
@@ -286,7 +286,7 @@ func setupProxyWithAuth(t *testing.T, authorizer proxy.Authorizer, opts ...func(
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 	_, backend := testutil.PostgresBackend(t)
-	provisioner := provision.NewProvisioner("admin", "adminpass", "waypoint_test", backend, "wp_", false, true, "test", store, logger, nil, nil)
+	provisioner := provision.NewProvisioner("admin", "adminpass", "waypoint_test", backend, "wp_", false, true, nil, "test", store, logger, nil, nil)
 
 	p := &proxy.PostgresProxy{
 		Backend:      backend,
@@ -1061,7 +1061,7 @@ func TestIntegration_TailscaleAuthorizer_RealPipeline(t *testing.T) {
 	tracker := restrict.NewTracker(store, m, slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})))
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	_, backend := testutil.PostgresBackend(t)
-	provisioner := provision.NewProvisioner("admin", "adminpass", "waypoint_test", backend, "wp_", false, true, "test", store, logger, nil, nil)
+	provisioner := provision.NewProvisioner("admin", "adminpass", "waypoint_test", backend, "wp_", false, true, nil, "test", store, logger, nil, nil)
 
 	p := &proxy.PostgresProxy{
 		Backend:      backend,
@@ -1413,7 +1413,7 @@ func TestIntegration_TailscaleAuthorizer_NoCapability(t *testing.T) {
 	tracker := restrict.NewTracker(store, m, slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})))
 	lgr := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	_, backend := testutil.PostgresBackend(t)
-	provisioner := provision.NewProvisioner("admin", "adminpass", "waypoint_test", backend, "wp_", false, true, "test", store, lgr, nil, nil)
+	provisioner := provision.NewProvisioner("admin", "adminpass", "waypoint_test", backend, "wp_", false, true, nil, "test", store, lgr, nil, nil)
 
 	p := &proxy.PostgresProxy{
 		Backend:      backend,

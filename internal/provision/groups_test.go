@@ -170,3 +170,63 @@ func TestUsesCompositePath(t *testing.T) {
 		t.Error("any SQL fragment forces composite path")
 	}
 }
+
+func TestBuildDefaultPrivilegeStatements_NoCreators(t *testing.T) {
+	if stmts := buildDefaultPrivilegeStatements(nil, "readonly", "public", "wp_grp_readonly_public_db"); stmts != nil {
+		t.Errorf("expected no statements without creator roles, got %v", stmts)
+	}
+}
+
+func TestBuildDefaultPrivilegeStatements_UnknownPreset(t *testing.T) {
+	if stmts := buildDefaultPrivilegeStatements([]string{"migrator"}, "bogus", "public", "grp"); stmts != nil {
+		t.Errorf("expected no statements for unknown preset, got %v", stmts)
+	}
+}
+
+func TestBuildDefaultPrivilegeStatements_Readonly(t *testing.T) {
+	stmts := buildDefaultPrivilegeStatements([]string{"migrator"}, "readonly", "public", "wp_grp_readonly_public_db")
+	want := []string{
+		`ALTER DEFAULT PRIVILEGES FOR ROLE "migrator" IN SCHEMA "public" GRANT SELECT ON TABLES TO "wp_grp_readonly_public_db"`,
+		`ALTER DEFAULT PRIVILEGES FOR ROLE "migrator" IN SCHEMA "public" GRANT SELECT ON SEQUENCES TO "wp_grp_readonly_public_db"`,
+	}
+	if len(stmts) != len(want) {
+		t.Fatalf("expected %d statements, got %d: %v", len(want), len(stmts), stmts)
+	}
+	for i, s := range stmts {
+		if s != want[i] {
+			t.Errorf("stmt[%d] = %q, want %q", i, s, want[i])
+		}
+	}
+}
+
+func TestBuildDefaultPrivilegeStatements_ReadwriteMirrorsWrites(t *testing.T) {
+	stmts := buildDefaultPrivilegeStatements([]string{"migrator"}, "readwrite", "public", "grp")
+	joined := strings.Join(stmts, "\n")
+	for _, frag := range []string{"INSERT", "UPDATE", "DELETE", "USAGE, SELECT ON SEQUENCES"} {
+		if !strings.Contains(joined, frag) {
+			t.Errorf("readwrite default privileges should include %q: %v", frag, stmts)
+		}
+	}
+}
+
+func TestBuildDefaultPrivilegeStatements_MultipleCreators(t *testing.T) {
+	stmts := buildDefaultPrivilegeStatements([]string{"a", "b"}, "admin", "public", "grp")
+	// admin has 2 grant clauses (tables, sequences) × 2 creators = 4.
+	if len(stmts) != 4 {
+		t.Fatalf("expected 4 statements, got %d: %v", len(stmts), stmts)
+	}
+	if !strings.Contains(stmts[0], `FOR ROLE "a"`) || !strings.Contains(stmts[len(stmts)-1], `FOR ROLE "b"`) {
+		t.Errorf("expected per-creator statements, got %v", stmts)
+	}
+}
+
+func TestBuildDefaultPrivilegeStatements_SanitizesIdentifiers(t *testing.T) {
+	// A creator role with a double-quote must be escaped, not interpolated raw.
+	stmts := buildDefaultPrivilegeStatements([]string{`ev"il`}, "readonly", "public", "grp")
+	if len(stmts) == 0 {
+		t.Fatal("expected statements")
+	}
+	if !strings.Contains(stmts[0], `"ev""il"`) {
+		t.Errorf("creator identifier not safely quoted: %q", stmts[0])
+	}
+}

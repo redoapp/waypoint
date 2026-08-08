@@ -25,18 +25,24 @@ import (
 
 // Provisioner manages dynamic PostgreSQL user lifecycle.
 type Provisioner struct {
-	adminConnStr string
-	userPrefix   string
-	allowRawSQL  bool
-	peerService  string
-	store        *restrict.RedisStore
-	logger       *slog.Logger
-	dialFunc     func(ctx context.Context, network, addr string) (net.Conn, error)
-	lookupFunc   func(ctx context.Context, host string) ([]string, error)
+	adminConnStr      string
+	userPrefix        string
+	allowRawSQL       bool
+	tableCreatorRoles []string
+	peerService       string
+	store             *restrict.RedisStore
+	logger            *slog.Logger
+	dialFunc          func(ctx context.Context, network, addr string) (net.Conn, error)
+	lookupFunc        func(ctx context.Context, host string) ([]string, error)
 }
 
 // NewProvisioner creates a new Provisioner.
-func NewProvisioner(adminUser, adminPassword, adminDatabase, backend, userPrefix string, backendTLS, allowRawSQL bool, peerService string, store *restrict.RedisStore, logger *slog.Logger, dialFunc func(ctx context.Context, network, addr string) (net.Conn, error), lookupFunc func(ctx context.Context, host string) ([]string, error)) *Provisioner {
+//
+// tableCreatorRoles names the existing backend roles that may create tables
+// (e.g. a migration owner). When non-empty, preset groups also receive
+// ALTER DEFAULT PRIVILEGES so that future tables created by those roles
+// automatically carry the preset's privileges. Empty entries are ignored.
+func NewProvisioner(adminUser, adminPassword, adminDatabase, backend, userPrefix string, backendTLS, allowRawSQL bool, tableCreatorRoles []string, peerService string, store *restrict.RedisStore, logger *slog.Logger, dialFunc func(ctx context.Context, network, addr string) (net.Conn, error), lookupFunc func(ctx context.Context, host string) ([]string, error)) *Provisioner {
 	sslmode := "disable"
 	if backendTLS {
 		sslmode = "require"
@@ -51,15 +57,22 @@ func NewProvisioner(adminUser, adminPassword, adminDatabase, backend, userPrefix
 	if userPrefix == "" {
 		userPrefix = "wp_"
 	}
+	var creators []string
+	for _, r := range tableCreatorRoles {
+		if r = strings.TrimSpace(r); r != "" {
+			creators = append(creators, r)
+		}
+	}
 	return &Provisioner{
-		adminConnStr: connStr,
-		userPrefix:   userPrefix,
-		allowRawSQL:  allowRawSQL,
-		peerService:  peerService,
-		store:        store,
-		logger:       logger,
-		dialFunc:     dialFunc,
-		lookupFunc:   lookupFunc,
+		adminConnStr:      connStr,
+		userPrefix:        userPrefix,
+		allowRawSQL:       allowRawSQL,
+		tableCreatorRoles: creators,
+		peerService:       peerService,
+		store:             store,
+		logger:            logger,
+		dialFunc:          dialFunc,
+		lookupFunc:        lookupFunc,
 	}
 }
 
