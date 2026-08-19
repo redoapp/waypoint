@@ -59,22 +59,23 @@ type DefaultLimitsConfig struct {
 }
 
 type ListenerConfig struct {
-	Name                string         `toml:"name"`
-	Listen              string         `toml:"listen"`
-	Mode                string         `toml:"mode"`
-	Backend             string         `toml:"backend"`
-	Advertise           string         `toml:"advertise"`
-	BackendViaTailscale bool           `toml:"backend_via_tailscale"`
-	BackendTLS          bool           `toml:"tls"`
-	PostgresTLSMode     string         `toml:"tls_mode"`
-	UseTailscaleTLS     *bool          `toml:"use_tailscale_tls"`
-	CertFile            string         `toml:"cert_file"`
-	KeyFile             string         `toml:"key_file"`
-	Service             string         `toml:"service"`
-	Postgres            *PostgresAdmin `toml:"postgres"`
-	MongoDB             *MongoDBAdmin  `toml:"mongodb"`
-	PortMap             map[int]int    `toml:"-"`
-	RawPortMap          map[string]int `toml:"port_map,omitempty"`
+	Name                string           `toml:"name"`
+	Listen              string           `toml:"listen"`
+	Mode                string           `toml:"mode"`
+	Backend             string           `toml:"backend"`
+	Advertise           string           `toml:"advertise"`
+	BackendViaTailscale bool             `toml:"backend_via_tailscale"`
+	BackendTLS          bool             `toml:"tls"`
+	PostgresTLSMode     string           `toml:"tls_mode"`
+	UseTailscaleTLS     *bool            `toml:"use_tailscale_tls"`
+	CertFile            string           `toml:"cert_file"`
+	KeyFile             string           `toml:"key_file"`
+	Service             string           `toml:"service"`
+	Postgres            *PostgresAdmin   `toml:"postgres"`
+	MongoDB             *MongoDBAdmin    `toml:"mongodb"`
+	OpenSearch          *OpenSearchAdmin `toml:"opensearch"`
+	PortMap             map[int]int      `toml:"-"`
+	RawPortMap          map[string]int   `toml:"port_map,omitempty"`
 }
 
 type TLSMode string
@@ -291,6 +292,103 @@ type MongoDBMember struct {
 	Advertise string `toml:"advertise"` // client-visible proxy address, e.g. waypoint-db:27017
 }
 
+// OpenSearchAdmin holds admin credentials for OpenSearch Security plugin
+// provisioning.
+type OpenSearchAdmin struct {
+	AdminUser     string               `toml:"admin_user"`
+	AdminPassword string               `toml:"admin_password"`
+	UserPrefix    string               `toml:"user_prefix"`
+	UserTTL       string               `toml:"user_ttl"`
+	ServiceName   string               `toml:"service_name"` // peer.service override for OTel (default: listener name)
+	BackendAuth   string               `toml:"backend_auth"` // "basic" (default) | "aws_iam"
+	AWS           *OpenSearchAWS       `toml:"aws"`          // required when backend_auth = "aws_iam"
+	Provision     *OpenSearchProvision `toml:"provision"`
+}
+
+const (
+	OpenSearchBackendAuthBasic  = "basic"
+	OpenSearchBackendAuthAWSIAM = "aws_iam"
+
+	// OpenSearchAWSServiceManaged is the SigV4 service name for Amazon
+	// OpenSearch Service managed domains; Serverless collections use "aoss".
+	OpenSearchAWSServiceManaged    = "es"
+	OpenSearchAWSServiceServerless = "aoss"
+)
+
+// OpenSearchAWS configures AWS SigV4 request signing for the OpenSearch backend
+// (Amazon OpenSearch Service with IAM / fine-grained access control). Credentials
+// come from the default AWS chain (env, shared config/profile, IRSA, or instance
+// role); RoleARN, when set, is assumed on top of that base identity.
+type OpenSearchAWS struct {
+	Region  string `toml:"region"`
+	Service string `toml:"service"`  // "es" (managed, default) | "aoss" (serverless)
+	RoleARN string `toml:"role_arn"` // optional STS AssumeRole target
+	Profile string `toml:"profile"`  // optional shared-config profile
+}
+
+// EffectiveBackendAuth returns the backend authentication scheme, defaulting to
+// basic auth.
+func (o *OpenSearchAdmin) EffectiveBackendAuth() string {
+	if o == nil {
+		return OpenSearchBackendAuthBasic
+	}
+	switch strings.ToLower(strings.TrimSpace(o.BackendAuth)) {
+	case "", OpenSearchBackendAuthBasic:
+		return OpenSearchBackendAuthBasic
+	default:
+		return strings.ToLower(strings.TrimSpace(o.BackendAuth))
+	}
+}
+
+// EffectiveAWSService returns the SigV4 service name, defaulting to managed
+// Amazon OpenSearch Service ("es").
+func (a *OpenSearchAWS) EffectiveAWSService() string {
+	if a == nil || strings.TrimSpace(a.Service) == "" {
+		return OpenSearchAWSServiceManaged
+	}
+	return strings.ToLower(strings.TrimSpace(a.Service))
+}
+
+const (
+	OpenSearchProvisionDatabase = "database"
+	OpenSearchProvisionStatic   = "static"
+)
+
+// OpenSearchProvision selects how an OpenSearch listener obtains backend
+// credentials.
+type OpenSearchProvision struct {
+	Mode        string                 `toml:"mode"`
+	StaticUsers []OpenSearchStaticUser `toml:"static_users"`
+}
+
+// OpenSearchStaticUser maps a normalized OpenSearch grant set to an existing
+// backend user.
+type OpenSearchStaticUser struct {
+	Name               string                             `toml:"name"`
+	Username           string                             `toml:"username"`
+	Password           string                             `toml:"password"`
+	ClusterPermissions []string                           `toml:"cluster_permissions"`
+	IndexPermissions   []OpenSearchStaticIndexPermission  `toml:"index_permissions"`
+	TenantPermissions  []OpenSearchStaticTenantPermission `toml:"tenant_permissions"`
+}
+
+// OpenSearchStaticIndexPermission describes one index permission block for
+// static user matching. The fields mirror the OpenSearch Security role API.
+type OpenSearchStaticIndexPermission struct {
+	IndexPatterns  []string `toml:"index_patterns"`
+	AllowedActions []string `toml:"allowed_actions"`
+	DLS            string   `toml:"dls"`
+	FLS            []string `toml:"fls"`
+	MaskedFields   []string `toml:"masked_fields"`
+}
+
+// OpenSearchStaticTenantPermission describes one tenant permission block for
+// static user matching.
+type OpenSearchStaticTenantPermission struct {
+	TenantPatterns []string `toml:"tenant_patterns"`
+	AllowedActions []string `toml:"allowed_actions"`
+}
+
 func (m *MongoDBAdmin) UserTTLDuration() time.Duration {
 	d, err := time.ParseDuration(m.UserTTL)
 	if err != nil {
@@ -344,6 +442,28 @@ func (m *MongoDBAdmin) EffectiveAuthDatabase() string {
 	return m.AuthDatabase
 }
 
+func (o *OpenSearchAdmin) UserTTLDuration() time.Duration {
+	d, err := time.ParseDuration(o.UserTTL)
+	if err != nil {
+		return 24 * time.Hour
+	}
+	return d
+}
+
+func (o *OpenSearchAdmin) EffectiveProvisionMode() string {
+	if o == nil || o.Provision == nil {
+		return OpenSearchProvisionDatabase
+	}
+	mode := strings.ToLower(strings.TrimSpace(o.Provision.Mode))
+	if mode == "" {
+		if len(o.Provision.StaticUsers) > 0 {
+			return OpenSearchProvisionStatic
+		}
+		return OpenSearchProvisionDatabase
+	}
+	return mode
+}
+
 // Load reads and parses a TOML config file, expanding environment variables
 // in string values using ${VAR} syntax.
 func Load(path string) (*Config, error) {
@@ -390,8 +510,8 @@ func validate(cfg *Config) error {
 		names[l.Name] = true
 
 		mode := strings.ToLower(l.Mode)
-		if mode != "tcp" && mode != "postgres" && mode != "mongodb" {
-			return fmt.Errorf("listeners[%d].mode must be 'tcp', 'postgres', or 'mongodb', got %q", i, l.Mode)
+		if mode != "tcp" && mode != "postgres" && mode != "mongodb" && mode != "opensearch" {
+			return fmt.Errorf("listeners[%d].mode must be 'tcp', 'postgres', 'mongodb', or 'opensearch', got %q", i, l.Mode)
 		}
 		if l.MongoDB.HasSRV() && mode != "mongodb" {
 			return fmt.Errorf("listeners[%d]: mongodb.srv is only supported for mode %q, got %q", i, "mongodb", l.Mode)
@@ -534,6 +654,20 @@ func validate(cfg *Config) error {
 				return err
 			}
 		}
+		if mode == "opensearch" && l.OpenSearch == nil {
+			return fmt.Errorf("opensearch listener %s requires [listeners.opensearch] config", l.Name)
+		}
+		if l.OpenSearch != nil {
+			if mode != "opensearch" {
+				return fmt.Errorf("listeners[%d]: [listeners.opensearch] is only supported for mode %q, got %q", i, "opensearch", l.Mode)
+			}
+			if err := validateOpenSearchBackendAuth(i, l.OpenSearch); err != nil {
+				return err
+			}
+			if err := validateOpenSearchProvision(i, l.OpenSearch); err != nil {
+				return err
+			}
+		}
 
 		// Check for listen address collisions across all listeners.
 		for _, be := range l.ExpandedBackends() {
@@ -560,13 +694,13 @@ func validate(cfg *Config) error {
 			return fmt.Errorf("listeners[%d] must set both cert_file and key_file together", i)
 		}
 		if (l.CertFile != "" || l.KeyFile != "") && !supportsClientTLS(mode) {
-			return fmt.Errorf("listeners[%d].cert_file and key_file are only supported for mode \"postgres\" or \"mongodb\"", i)
+			return fmt.Errorf("listeners[%d].cert_file and key_file are only supported for mode \"postgres\", \"mongodb\", or \"opensearch\"", i)
 		}
 		if l.PostgresTLSMode != "" && !supportsClientTLS(mode) {
-			return fmt.Errorf("listeners[%d].tls_mode is only supported for mode \"postgres\" or \"mongodb\"", i)
+			return fmt.Errorf("listeners[%d].tls_mode is only supported for mode \"postgres\", \"mongodb\", or \"opensearch\"", i)
 		}
 		if l.UseTailscaleTLS != nil && !supportsClientTLS(mode) {
-			return fmt.Errorf("listeners[%d].use_tailscale_tls is only supported for mode \"postgres\" or \"mongodb\"", i)
+			return fmt.Errorf("listeners[%d].use_tailscale_tls is only supported for mode \"postgres\", \"mongodb\", or \"opensearch\"", i)
 		}
 	}
 	return nil
@@ -631,8 +765,77 @@ func validMongoPreset(preset string) bool {
 	}
 }
 
+func validateOpenSearchBackendAuth(listenerIndex int, o *OpenSearchAdmin) error {
+	switch o.EffectiveBackendAuth() {
+	case OpenSearchBackendAuthBasic:
+		return nil
+	case OpenSearchBackendAuthAWSIAM:
+		if o.AWS == nil || strings.TrimSpace(o.AWS.Region) == "" {
+			return fmt.Errorf("listeners[%d].opensearch.aws.region is required when backend_auth is %q",
+				listenerIndex, OpenSearchBackendAuthAWSIAM)
+		}
+		switch o.AWS.EffectiveAWSService() {
+		case OpenSearchAWSServiceManaged, OpenSearchAWSServiceServerless:
+		default:
+			return fmt.Errorf("listeners[%d].opensearch.aws.service must be %q or %q, got %q",
+				listenerIndex, OpenSearchAWSServiceManaged, OpenSearchAWSServiceServerless, o.AWS.Service)
+		}
+		return nil
+	default:
+		return fmt.Errorf("listeners[%d].opensearch.backend_auth must be %q or %q, got %q",
+			listenerIndex, OpenSearchBackendAuthBasic, OpenSearchBackendAuthAWSIAM, o.BackendAuth)
+	}
+}
+
+func validateOpenSearchProvision(listenerIndex int, o *OpenSearchAdmin) error {
+	mode := o.EffectiveProvisionMode()
+	switch mode {
+	case OpenSearchProvisionDatabase, OpenSearchProvisionStatic:
+	default:
+		return fmt.Errorf("listeners[%d].opensearch.provision.mode must be one of %q or %q, got %q",
+			listenerIndex, OpenSearchProvisionDatabase, OpenSearchProvisionStatic, o.Provision.Mode)
+	}
+
+	if mode != OpenSearchProvisionStatic {
+		return nil
+	}
+	if o.Provision == nil || len(o.Provision.StaticUsers) == 0 {
+		return fmt.Errorf("listeners[%d].opensearch.provision.static_users is required when mode is %q", listenerIndex, OpenSearchProvisionStatic)
+	}
+
+	for i, user := range o.Provision.StaticUsers {
+		prefix := fmt.Sprintf("listeners[%d].opensearch.provision.static_users[%d]", listenerIndex, i)
+		if strings.TrimSpace(user.Username) == "" {
+			return fmt.Errorf("%s.username is required", prefix)
+		}
+		if user.Password == "" {
+			return fmt.Errorf("%s.password is required", prefix)
+		}
+		if len(user.ClusterPermissions) == 0 && len(user.IndexPermissions) == 0 && len(user.TenantPermissions) == 0 {
+			return fmt.Errorf("%s must define cluster_permissions, index_permissions, or tenant_permissions", prefix)
+		}
+		for j, perm := range user.IndexPermissions {
+			if len(perm.IndexPatterns) == 0 {
+				return fmt.Errorf("%s.index_permissions[%d].index_patterns is required", prefix, j)
+			}
+			if len(perm.AllowedActions) == 0 {
+				return fmt.Errorf("%s.index_permissions[%d].allowed_actions is required", prefix, j)
+			}
+		}
+		for j, perm := range user.TenantPermissions {
+			if len(perm.TenantPatterns) == 0 {
+				return fmt.Errorf("%s.tenant_permissions[%d].tenant_patterns is required", prefix, j)
+			}
+			if len(perm.AllowedActions) == 0 {
+				return fmt.Errorf("%s.tenant_permissions[%d].allowed_actions is required", prefix, j)
+			}
+		}
+	}
+	return nil
+}
+
 func supportsClientTLS(mode string) bool {
-	return mode == "postgres" || mode == "mongodb"
+	return mode == "postgres" || mode == "mongodb" || mode == "opensearch"
 }
 
 func validateAdvertiseHostOrAddr(advertise string) error {

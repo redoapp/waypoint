@@ -14,9 +14,10 @@ type CapRule struct {
 
 // BackendCap holds per-backend capabilities and limits.
 type BackendCap struct {
-	PG     *PGCap     `json:"pg,omitempty"`
-	Mongo  *MongoCap  `json:"mongo,omitempty"`
-	Limits *LimitsCap `json:"limits,omitempty"`
+	PG         *PGCap         `json:"pg,omitempty"`
+	Mongo      *MongoCap      `json:"mongo,omitempty"`
+	OpenSearch *OpenSearchCap `json:"opensearch,omitempty"`
+	Limits     *LimitsCap     `json:"limits,omitempty"`
 }
 
 // PGCap holds postgres-specific capabilities.
@@ -45,6 +46,29 @@ type MongoCap struct {
 // Permissions holds preset names ("readonly", "readwrite", "admin").
 type MongoDBPermissions struct {
 	Permissions []string `json:"permissions"`
+}
+
+// OpenSearchCap holds OpenSearch-specific capabilities.
+type OpenSearchCap struct {
+	ClusterPermissions []string                               `json:"cluster_permissions,omitempty"`
+	Indices            map[string]OpenSearchIndexPermissions  `json:"indices,omitempty"`
+	Tenants            map[string]OpenSearchTenantPermissions `json:"tenants,omitempty"`
+}
+
+// OpenSearchIndexPermissions defines access grants for an index pattern.
+// Permissions holds preset names ("readonly", "readwrite", "admin").
+// AllowedActions holds raw OpenSearch Security action groups or actions.
+type OpenSearchIndexPermissions struct {
+	Permissions    []string `json:"permissions,omitempty"`
+	AllowedActions []string `json:"allowed_actions,omitempty"`
+	DLS            string   `json:"dls,omitempty"`
+	FLS            []string `json:"fls,omitempty"`
+	MaskedFields   []string `json:"masked_fields,omitempty"`
+}
+
+// OpenSearchTenantPermissions defines access grants for a tenant pattern.
+type OpenSearchTenantPermissions struct {
+	AllowedActions []string `json:"allowed_actions,omitempty"`
 }
 
 // LimitsCap defines per-user restriction overrides from ACL grants.

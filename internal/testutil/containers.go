@@ -61,6 +61,17 @@ var (
 	mongoShardedOnce sync.Once
 	mongoShardedData *MongoShardedInfo
 	mongoShardedErr  error
+
+	openSearchOnce    sync.Once
+	openSearchBackend string
+	openSearchErr     error
+)
+
+// OpenSearchAdminUser and OpenSearchAdminPassword are the admin credentials the
+// shared OpenSearch test container is bootstrapped with.
+const (
+	OpenSearchAdminUser     = "admin"
+	OpenSearchAdminPassword = "Wp_Str0ng_Passw0rd!"
 )
 
 // MongoRSInfo contains connection info for a multi-node MongoDB replica set.
@@ -1084,4 +1095,59 @@ exec mongos --configdb %s --keyFile /tmp/keyfile --bind_ip_all --port 27017 --se
 	}
 
 	return mongoShardedData
+}
+
+// OpenSearchBackend starts a shared single-node OpenSearch container (once per
+// test binary) with the Security plugin enabled and returns its host:port
+// backend address. The Security REST layer runs over plain HTTP (TLS disabled)
+// so the provisioner can be exercised without certificate wiring. Admin
+// credentials are OpenSearchAdminUser / OpenSearchAdminPassword.
+func OpenSearchBackend(t *testing.T) string {
+	t.Helper()
+
+	openSearchOnce.Do(func() {
+		openSearchBackend, openSearchErr = startOpenSearchContainer()
+	})
+	if openSearchErr != nil {
+		t.Fatalf("opensearch container: %v", openSearchErr)
+	}
+	return openSearchBackend
+}
+
+func startOpenSearchContainer() (string, error) {
+	ctx := context.Background()
+
+	container, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
+		ContainerRequest: testcontainers.ContainerRequest{
+			Image:        "opensearchproject/opensearch:2.19.0",
+			ExposedPorts: []string{"9200/tcp"},
+			Env: map[string]string{
+				"discovery.type":                    "single-node",
+				"plugins.security.ssl.http.enabled": "false",
+				"OPENSEARCH_INITIAL_ADMIN_PASSWORD": OpenSearchAdminPassword,
+				"bootstrap.memory_lock":             "false",
+				"OPENSEARCH_JAVA_OPTS":              "-Xms512m -Xmx512m",
+				"DISABLE_INSTALL_DEMO_CONFIG":       "false",
+			},
+			WaitingFor: wait.ForHTTP("/_cluster/health").
+				WithPort("9200/tcp").
+				WithBasicAuth(OpenSearchAdminUser, OpenSearchAdminPassword).
+				WithStatusCodeMatcher(func(status int) bool { return status == 200 }).
+				WithStartupTimeout(180 * time.Second),
+		},
+		Started: true,
+	})
+	if err != nil {
+		return "", fmt.Errorf("start opensearch container: %w", err)
+	}
+
+	host, err := container.Host(ctx)
+	if err != nil {
+		return "", fmt.Errorf("opensearch host: %w", err)
+	}
+	port, err := container.MappedPort(ctx, "9200/tcp")
+	if err != nil {
+		return "", fmt.Errorf("opensearch port: %w", err)
+	}
+	return fmt.Sprintf("%s:%s", host, port.Port()), nil
 }
