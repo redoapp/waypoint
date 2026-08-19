@@ -553,3 +553,38 @@ func TestBucketSize(t *testing.T) {
 		}
 	}
 }
+
+func TestRedisStore_Credential(t *testing.T) {
+	store, mr := setupRedis(t)
+	ctx := context.Background()
+
+	// Absent credential reads as empty, not an error.
+	got, err := store.GetCredential(ctx, "wp_alice_redo")
+	if err != nil {
+		t.Fatalf("get missing credential: %v", err)
+	}
+	if got != "" {
+		t.Fatalf("want empty for missing credential, got %q", got)
+	}
+
+	if err := store.SetCredential(ctx, "wp_alice_redo", "s3cret", time.Minute); err != nil {
+		t.Fatalf("set credential: %v", err)
+	}
+	got, err = store.GetCredential(ctx, "wp_alice_redo")
+	if err != nil {
+		t.Fatalf("get credential: %v", err)
+	}
+	if got != "s3cret" {
+		t.Fatalf("got %q, want %q", got, "s3cret")
+	}
+
+	// It must expire so a leaked password has a bounded life.
+	mr.FastForward(2 * time.Minute)
+	got, err = store.GetCredential(ctx, "wp_alice_redo")
+	if err != nil {
+		t.Fatalf("get expired credential: %v", err)
+	}
+	if got != "" {
+		t.Fatalf("credential should have expired, got %q", got)
+	}
+}

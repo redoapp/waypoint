@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -18,10 +19,23 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
+	"golang.org/x/sync/singleflight"
 
 	"github.com/redoapp/waypoint/internal/auth"
 	"github.com/redoapp/waypoint/internal/restrict"
 )
+
+// provisionBudget bounds a coalesced provisioning round: lock wait plus the
+// admin DB interaction. It is applied to the detached context that outlives
+// the caller which initiated the round.
+const provisionBudget = 2 * time.Minute
+
+// pgCredentialTTL is how long a provisioned role's password stays in effect
+// before the next connection rotates it. It is longer than the MongoDB and
+// OpenSearch equivalents because this cache lives in Redis, so every instance
+// agrees on the current password; those keep theirs per-process, where a long
+// window would let two replicas disagree about what the password is.
+const pgCredentialTTL = 30 * time.Minute
 
 // Provisioner manages dynamic PostgreSQL user lifecycle.
 type Provisioner struct {
@@ -33,6 +47,20 @@ type Provisioner struct {
 	logger       *slog.Logger
 	dialFunc     func(ctx context.Context, network, addr string) (net.Conn, error)
 	lookupFunc   func(ctx context.Context, host string) ([]string, error)
+
+	// flight coalesces concurrent provisioning of the same role within this
+	// process, so a burst of simultaneous connections costs one round.
+	flight singleflight.Group
+
+	// credTTL is how long a role's password stays in effect before the next
+	// connection rotates it. Zero rotates on every connection.
+	credTTL time.Duration
+}
+
+// provisionedRole is the shared result of one coalesced provisioning round.
+type provisionedRole struct {
+	user     string
+	password string
 }
 
 // NewProvisioner creates a new Provisioner.
@@ -60,7 +88,15 @@ func NewProvisioner(adminUser, adminPassword, adminDatabase, backend, userPrefix
 		logger:       logger,
 		dialFunc:     dialFunc,
 		lookupFunc:   lookupFunc,
+		credTTL:      pgCredentialTTL,
 	}
+}
+
+// SetCredentialTTL overrides how long a provisioned role's password stays in
+// effect before the next connection rotates it. Zero restores rotate-on-every-
+// connection. Intended for tests.
+func (p *Provisioner) SetCredentialTTL(d time.Duration) {
+	p.credTTL = d
 }
 
 // EnsureUser creates or updates a dynamic PG role for the given identity,
@@ -92,50 +128,95 @@ func (p *Provisioner) ensureUser(ctx context.Context, loginName, nodeName, datab
 	pgUser := p.formatUsernameWithScope(loginName, nodeName, database, roleScope)
 	p.logger.DebugContext(ctx, "ensuring user", "login", loginName, "database", database, "role_scope", roleScope)
 
-	// Acquire a distributed lock via Redis to serialize concurrent EnsureUser
-	// calls for the same role. This works with both PostgreSQL and CockroachDB.
-	const lockTTL = 30 * time.Second
-	const maxRetries = 10
-	const retryDelay = 100 * time.Millisecond
+	// A busy lock means another connection is provisioning this same role, not
+	// that anything is wrong. Wait a beat and start a fresh round rather than
+	// failing the connection; only give up once the client has waited longer
+	// than it is worth hanging on for.
+	deadline := time.Now().Add(lockTotalBudget)
+	for attempt := 0; ; attempt++ {
+		// Coalesce concurrent provisioning of the same role. A client opening a
+		// burst of connections needs one CREATE/ALTER ROLE and one grant
+		// reconcile for all of them, not one per connection. Sharing the result
+		// also means every caller in the burst receives the password that is
+		// actually set on the role — previously each connection rotated it out
+		// from under the ones still authenticating.
+		lockBudget := min(lockAttemptBudget, time.Until(deadline))
+		ch := p.flight.DoChan(pgUser, func() (any, error) {
+			// Detach from the initiating caller's cancellation: if that client
+			// hangs up mid-round, the others waiting on this same result still
+			// need a usable role.
+			workCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), provisionBudget)
+			defer cancel()
 
-	ctx, lockSpan := tracer.Start(ctx, "waypoint.provision.acquire_lock")
-	var lockToken string
-	for i := 0; i < maxRetries; i++ {
-		token, err := p.store.AcquireLock(ctx, "role:"+pgUser, lockTTL)
-		if err != nil {
-			lockSpan.RecordError(err)
-			lockSpan.SetStatus(codes.Error, "acquire lock failed")
-			lockSpan.End()
-			span.RecordError(err)
-			return "", "", fmt.Errorf("acquire lock: %w", err)
-		}
-		if token != "" {
-			lockToken = token
-			break
-		}
+			password, err := p.provisionRole(workCtx, pgUser, database, perms, lockBudget)
+			if err != nil {
+				return nil, err
+			}
+			return provisionedRole{user: pgUser, password: password}, nil
+		})
+
+		var res singleflight.Result
 		select {
 		case <-ctx.Done():
-			lockSpan.End()
+			span.RecordError(ctx.Err())
 			return "", "", ctx.Err()
-		case <-time.After(retryDelay):
+		case res = <-ch:
 		}
+
+		if errors.Is(res.Err, ErrLockBusy) && time.Until(deadline) > lockBusyRetryDelay {
+			p.logger.DebugContext(ctx, "role lock busy, retrying",
+				"role", pgUser, "attempt", attempt+1)
+			select {
+			case <-ctx.Done():
+				span.RecordError(ctx.Err())
+				return "", "", ctx.Err()
+			case <-time.After(lockBusyRetryDelay):
+			}
+			continue
+		}
+		if res.Err != nil {
+			span.RecordError(res.Err)
+			return "", "", res.Err
+		}
+
+		role := res.Val.(provisionedRole)
+		span.SetAttributes(
+			attribute.Bool("waypoint.provision.coalesced", res.Shared),
+			attribute.Int("waypoint.provision.lock_attempts", attempt+1),
+		)
+		return role.user, role.password, nil
 	}
-	if lockToken == "" {
-		err := fmt.Errorf("could not acquire lock for role %q", pgUser)
+}
+
+// provisionRole performs one provisioning round for pgUser under the Redis
+// role lock, returning the password it set. Callers reach it through the
+// singleflight group in ensureUser.
+func (p *Provisioner) provisionRole(ctx context.Context, pgUser, database string, perms *auth.DBPermissions, lockBudget time.Duration) (string, error) {
+	tracer := otel.Tracer("waypoint")
+
+	// Serialize against other processes via Redis. This works with both
+	// PostgreSQL and CockroachDB.
+	ctx, lockSpan := tracer.Start(ctx, "waypoint.provision.acquire_lock")
+	release, err := acquireRoleLock(ctx, p.store, "role:"+pgUser, lockBudget)
+	if err != nil {
 		lockSpan.RecordError(err)
-		lockSpan.SetStatus(codes.Error, "lock timeout")
+		lockSpan.SetStatus(codes.Error, "acquire lock failed")
 		lockSpan.End()
-		span.RecordError(err)
-		return "", "", err
+		return "", err
 	}
 	lockSpan.End()
-	defer p.store.ReleaseLock(ctx, "role:"+pgUser, lockToken)
+	defer release()
 	p.logger.DebugContext(ctx, "acquired lock", "role", pgUser)
+
+	ctx, span := tracer.Start(ctx, "waypoint.provision.role",
+		trace.WithAttributes(attribute.String("waypoint.pg_user", pgUser)),
+	)
+	defer span.End()
 
 	connCfg, err := pgx.ParseConfig(p.adminConnStr)
 	if err != nil {
 		span.RecordError(err)
-		return "", "", fmt.Errorf("parse admin conn config: %w", err)
+		return "", fmt.Errorf("parse admin conn config: %w", err)
 	}
 	if p.dialFunc != nil {
 		connCfg.DialFunc = p.dialFunc
@@ -167,7 +248,7 @@ func (p *Provisioner) ensureUser(ctx context.Context, loginName, nodeName, datab
 		connectSpan.SetStatus(codes.Error, "connect failed")
 		connectSpan.End()
 		span.RecordError(err)
-		return "", "", fmt.Errorf("admin connect: %w", err)
+		return "", fmt.Errorf("admin connect: %w", err)
 	}
 	connectSpan.End()
 	defer conn.Close(ctx)
@@ -180,7 +261,7 @@ func (p *Provisioner) ensureUser(ctx context.Context, loginName, nodeName, datab
 	tx, err := conn.Begin(ctx)
 	if err != nil {
 		span.RecordError(err)
-		return "", "", fmt.Errorf("begin transaction: %w", err)
+		return "", fmt.Errorf("begin transaction: %w", err)
 	}
 	txCommitted := false
 	defer func() {
@@ -194,19 +275,39 @@ func (p *Provisioner) ensureUser(ctx context.Context, loginName, nodeName, datab
 	err = tx.QueryRow(ctx, roleExistsQuery(dialect), pgUser).Scan(&exists)
 	if err != nil {
 		span.RecordError(err)
-		return "", "", fmt.Errorf("check role: %w", err)
+		return "", fmt.Errorf("check role: %w", err)
 	}
 
 	targetDatabaseExists, err := databaseExists(ctx, tx, database)
 	if err != nil {
 		span.RecordError(err)
-		return "", "", fmt.Errorf("check database: %w", err)
+		return "", fmt.Errorf("check database: %w", err)
 	}
 
-	password := generatePassword()
+	// Reuse the password already in effect when it is still fresh. Rotating on
+	// every connection is what let one connection invalidate the credentials
+	// another was still authenticating with: the role lock is released when
+	// provisioning returns, but the client only uses the password afterwards.
+	// We hold the role lock here, so nothing can rotate it underneath us.
+	password := ""
+	if exists && p.credTTL > 0 {
+		cached, credErr := p.store.GetCredential(ctx, pgUser)
+		if credErr != nil {
+			// Not fatal — fall through and rotate.
+			p.logger.DebugContext(ctx, "credential cache read failed", "role", pgUser, "error", credErr)
+		}
+		password = cached
+	}
+	rotated := password == ""
+	if rotated {
+		password = generatePassword()
+	}
 
 	_, roleSpan := tracer.Start(ctx, "waypoint.provision.create_role",
-		trace.WithAttributes(attribute.Bool("waypoint.role_exists", exists)),
+		trace.WithAttributes(
+			attribute.Bool("waypoint.role_exists", exists),
+			attribute.Bool("waypoint.password_rotated", rotated),
+		),
 	)
 	if !exists {
 		// CREATE ROLE with LOGIN.
@@ -221,11 +322,12 @@ func (p *Provisioner) ensureUser(ctx context.Context, loginName, nodeName, datab
 			roleSpan.SetStatus(codes.Error, "create role failed")
 			roleSpan.End()
 			span.RecordError(err)
-			return "", "", fmt.Errorf("create role: %w", err)
+			return "", fmt.Errorf("create role: %w", err)
 		}
 		p.logger.InfoContext(ctx, "created PG role", "role", pgUser)
-	} else {
-		// Update password on every connection.
+	} else if rotated {
+		// Only write when the password actually changed; within the cache
+		// window the role already has this password.
 		_, err = tx.Exec(ctx, fmt.Sprintf(
 			"ALTER ROLE %s WITH PASSWORD %s",
 			pgx.Identifier{pgUser}.Sanitize(),
@@ -236,7 +338,7 @@ func (p *Provisioner) ensureUser(ctx context.Context, loginName, nodeName, datab
 			roleSpan.SetStatus(codes.Error, "alter role failed")
 			roleSpan.End()
 			span.RecordError(err)
-			return "", "", fmt.Errorf("alter role password: %w", err)
+			return "", fmt.Errorf("alter role password: %w", err)
 		}
 	}
 	roleSpan.End()
@@ -245,20 +347,28 @@ func (p *Provisioner) ensureUser(ctx context.Context, loginName, nodeName, datab
 	if err := p.reconcileUserGroups(ctx, tx, dialect, pgUser, database, targetDatabaseExists, perms); err != nil {
 		grantSpan.End()
 		span.RecordError(err)
-		return "", "", err
+		return "", err
 	}
 	grantSpan.End()
 
 	if err := tx.Commit(ctx); err != nil {
 		span.RecordError(err)
-		return "", "", fmt.Errorf("commit transaction: %w", err)
+		return "", fmt.Errorf("commit transaction: %w", err)
 	}
 	txCommitted = true
+
+	if rotated && p.credTTL > 0 {
+		if err := p.store.SetCredential(ctx, pgUser, password, p.credTTL); err != nil {
+			// The role is provisioned and the password works; failing to cache
+			// it only costs the next connection a rotation.
+			p.logger.WarnContext(ctx, "credential cache write failed", "role", pgUser, "error", err)
+		}
+	}
 
 	// Touch last-used timestamp.
 	p.store.TouchLastUsed(ctx, pgUser)
 
-	return pgUser, password, nil
+	return password, nil
 }
 
 // ReconcileRole updates privileges for an existing backend role without
@@ -273,42 +383,47 @@ func (p *Provisioner) ReconcileRole(ctx context.Context, pgUser, database string
 	)
 	defer span.End()
 
-	const lockTTL = 30 * time.Second
-	const maxRetries = 10
-	const retryDelay = 100 * time.Millisecond
+	// Every live session for a role revalidates on its own timer, so a user
+	// with many open connections reconciles the same role over and over.
+	// Coalesce those into one round per role+database.
+	ch := p.flight.DoChan("reconcile:"+pgUser+":"+database, func() (any, error) {
+		workCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), provisionBudget)
+		defer cancel()
+		return nil, p.reconcileRole(workCtx, pgUser, database, perms)
+	})
+
+	select {
+	case <-ctx.Done():
+		span.RecordError(ctx.Err())
+		return ctx.Err()
+	case res := <-ch:
+		if res.Err != nil {
+			span.RecordError(res.Err)
+			return res.Err
+		}
+		span.SetAttributes(attribute.Bool("waypoint.provision.coalesced", res.Shared))
+		return nil
+	}
+}
+
+// reconcileRole performs one privilege reconciliation round under the Redis
+// role lock. Callers reach it through the singleflight group in ReconcileRole.
+func (p *Provisioner) reconcileRole(ctx context.Context, pgUser, database string, perms *auth.DBPermissions) error {
+	tracer := otel.Tracer("waypoint")
 
 	ctx, lockSpan := tracer.Start(ctx, "waypoint.provision.acquire_lock")
-	var lockToken string
-	for i := 0; i < maxRetries; i++ {
-		token, err := p.store.AcquireLock(ctx, "role:"+pgUser, lockTTL)
-		if err != nil {
-			lockSpan.RecordError(err)
-			lockSpan.SetStatus(codes.Error, "acquire lock failed")
-			lockSpan.End()
-			span.RecordError(err)
-			return fmt.Errorf("acquire lock: %w", err)
-		}
-		if token != "" {
-			lockToken = token
-			break
-		}
-		select {
-		case <-ctx.Done():
-			lockSpan.End()
-			return ctx.Err()
-		case <-time.After(retryDelay):
-		}
-	}
-	if lockToken == "" {
-		err := fmt.Errorf("could not acquire lock for role %q", pgUser)
+	release, err := acquireRoleLock(ctx, p.store, "role:"+pgUser, lockTotalBudget)
+	if err != nil {
 		lockSpan.RecordError(err)
-		lockSpan.SetStatus(codes.Error, "lock timeout")
+		lockSpan.SetStatus(codes.Error, "acquire lock failed")
 		lockSpan.End()
-		span.RecordError(err)
 		return err
 	}
 	lockSpan.End()
-	defer p.store.ReleaseLock(ctx, "role:"+pgUser, lockToken)
+	defer release()
+
+	ctx, span := tracer.Start(ctx, "waypoint.provision.reconcile")
+	defer span.End()
 
 	connCfg, err := pgx.ParseConfig(p.adminConnStr)
 	if err != nil {

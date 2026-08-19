@@ -141,7 +141,11 @@ func TestIntegration_EnsureUser_CanLogin(t *testing.T) {
 	}
 }
 
-func TestIntegration_EnsureUser_UpdatesPassword(t *testing.T) {
+// TestIntegration_EnsureUser_ReusesPasswordWithinTTL covers the common case:
+// reconnects inside the credential window get the password already in effect
+// rather than rotating it, so a connection that is still authenticating does
+// not have its credentials pulled out from under it.
+func TestIntegration_EnsureUser_ReusesPasswordWithinTTL(t *testing.T) {
 	for _, db := range testBackends(t) {
 		t.Run(db.name, func(t *testing.T) {
 			p := setupProvisionerFor(t, db)
@@ -158,13 +162,47 @@ func TestIntegration_EnsureUser_UpdatesPassword(t *testing.T) {
 				t.Fatal(err)
 			}
 
+			if password1 != password2 {
+				t.Fatal("password should be reused within the credential TTL, not rotated")
+			}
+
+			connStr := fmt.Sprintf("postgres://%s:%s@%s/waypoint_test?sslmode=disable", pgUser, password2, db.backend)
+			conn, err := pgx.Connect(ctx, connStr)
+			if err != nil {
+				t.Fatalf("reused password should work: %v", err)
+			}
+			conn.Close(ctx)
+		})
+	}
+}
+
+// TestIntegration_EnsureUser_RotatesPasswordAfterTTL covers the other half:
+// once the window lapses the password is replaced and the previous one stops
+// working, so a leaked credential has a bounded life.
+func TestIntegration_EnsureUser_RotatesPasswordAfterTTL(t *testing.T) {
+	for _, db := range testBackends(t) {
+		t.Run(db.name, func(t *testing.T) {
+			p := setupProvisionerFor(t, db)
+			p.SetCredentialTTL(0) // rotate on every connection
+			ctx := context.Background()
+
+			pgUser, password1, err := p.EnsureUser(ctx, "carol2@example.com", "carol-laptop", "waypoint_test", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { cleanupRoleFor(t, db, pgUser) })
+
+			_, password2, err := p.EnsureUser(ctx, "carol2@example.com", "carol-laptop", "waypoint_test", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+
 			if password1 == password2 {
-				t.Fatal("expected different passwords on second EnsureUser call")
+				t.Fatal("expected a different password once the credential TTL lapsed")
 			}
 
 			oldConnStr := fmt.Sprintf("postgres://%s:%s@%s/waypoint_test?sslmode=disable", pgUser, password1, db.backend)
-			_, err = pgx.Connect(ctx, oldConnStr)
-			if err == nil {
+			if _, err := pgx.Connect(ctx, oldConnStr); err == nil {
 				t.Fatal("old password should not work after rotation")
 			}
 
@@ -248,6 +286,60 @@ func TestIntegration_EnsureUser_ConcurrentPasswordRotation(t *testing.T) {
 			}
 			if working == 0 {
 				t.Fatal("neither password works after concurrent rotation")
+			}
+		})
+	}
+}
+
+// TestIntegration_EnsureUser_ConnectionBurst reproduces the failure mode where
+// a client opens many connections at once: every one of them provisions the
+// same role, and all but the lock winner used to fail with "could not acquire
+// lock". They must now all succeed, and every password handed out must work,
+// since the burst shares a single provisioning round.
+func TestIntegration_EnsureUser_ConnectionBurst(t *testing.T) {
+	for _, db := range testBackends(t) {
+		t.Run(db.name, func(t *testing.T) {
+			p := setupProvisionerFor(t, db)
+			ctx := context.Background()
+
+			pgUser, _, err := p.EnsureUser(ctx, "burst@example.com", "burst-node", "waypoint_test", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { cleanupRoleFor(t, db, pgUser) })
+
+			const burst = 10
+			type result struct {
+				password string
+				err      error
+			}
+			ch := make(chan result, burst)
+			start := make(chan struct{})
+			for i := 0; i < burst; i++ {
+				go func() {
+					<-start
+					_, pw, err := p.EnsureUser(ctx, "burst@example.com", "burst-node", "waypoint_test", nil)
+					ch <- result{pw, err}
+				}()
+			}
+			close(start)
+
+			var passwords []string
+			for i := 0; i < burst; i++ {
+				r := <-ch
+				if r.err != nil {
+					t.Fatalf("connection %d of a %d-connection burst failed to provision: %v", i, burst, r.err)
+				}
+				passwords = append(passwords, r.password)
+			}
+
+			for i, pw := range passwords {
+				connStr := fmt.Sprintf("postgres://%s:%s@%s/waypoint_test?sslmode=disable", pgUser, pw, db.backend)
+				conn, err := pgx.Connect(ctx, connStr)
+				if err != nil {
+					t.Fatalf("password handed to connection %d does not work: %v", i, err)
+				}
+				conn.Close(ctx)
 			}
 		})
 	}
