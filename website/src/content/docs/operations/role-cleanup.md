@@ -65,12 +65,15 @@ listener leads the name rather than trailing it so that it survives truncation.
 
 MongoDB users are named the same way, minus the database component.
 
-:::caution[Renaming orphans existing roles]
-Waypoint 0.x releases before this change named roles without the listener
-component. Upgrading does not rename existing roles — new connections simply
-provision new ones, and the old roles remain until dropped. Since the cleanup
-loop below is not yet implemented, they will not age out on their own. To find
-and remove them:
+:::caution[Upgrading orphans existing roles]
+Releases before this change named roles without the listener component, and
+truncated over-long names differently. Upgrading does not rename existing
+roles — new connections simply provision new ones, and the old roles remain
+until dropped. Since the cleanup loop below is not yet implemented, they will
+not age out on their own.
+
+Stale roles keep whatever privileges they were granted, so this is worth doing
+rather than leaving. To find and remove them:
 
 ```sql
 -- roles under the prefix that do not name a current listener
