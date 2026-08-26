@@ -17,6 +17,7 @@ import (
 
 	"github.com/exaring/otelpgx"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
@@ -41,16 +42,17 @@ const pgCredentialTTL = 30 * time.Minute
 
 // Provisioner manages dynamic PostgreSQL user lifecycle.
 type Provisioner struct {
-	adminConnStr string
-	listener     string
-	truncations  truncationLog
-	userPrefix   string
-	allowRawSQL  bool
-	peerService  string
-	store        *restrict.RedisStore
-	logger       *slog.Logger
-	dialFunc     func(ctx context.Context, network, addr string) (net.Conn, error)
-	lookupFunc   func(ctx context.Context, host string) ([]string, error)
+	adminConnStr  string
+	adminDatabase string
+	listener      string
+	truncations   truncationLog
+	userPrefix    string
+	allowRawSQL   bool
+	peerService   string
+	store         *restrict.RedisStore
+	logger        *slog.Logger
+	dialFunc      func(ctx context.Context, network, addr string) (net.Conn, error)
+	lookupFunc    func(ctx context.Context, host string) ([]string, error)
 
 	// flight coalesces concurrent provisioning of the same role within this
 	// process, so a burst of simultaneous connections costs one round.
@@ -67,7 +69,6 @@ type provisionedRole struct {
 	password string
 }
 
-// NewProvisioner creates a new Provisioner.
 // NewProvisioner creates a new Provisioner.
 //
 // listener is the name of the listener this provisioner serves. It becomes
@@ -91,16 +92,17 @@ func NewProvisioner(adminUser, adminPassword, adminDatabase, backend, listener, 
 		userPrefix = "wp_"
 	}
 	return &Provisioner{
-		adminConnStr: connStr,
-		listener:     listener,
-		userPrefix:   userPrefix,
-		allowRawSQL:  allowRawSQL,
-		peerService:  peerService,
-		store:        store,
-		logger:       logger,
-		dialFunc:     dialFunc,
-		lookupFunc:   lookupFunc,
-		credTTL:      pgCredentialTTL,
+		adminConnStr:  connStr,
+		adminDatabase: adminDatabase,
+		listener:      listener,
+		userPrefix:    userPrefix,
+		allowRawSQL:   allowRawSQL,
+		peerService:   peerService,
+		store:         store,
+		logger:        logger,
+		dialFunc:      dialFunc,
+		lookupFunc:    lookupFunc,
+		credTTL:       pgCredentialTTL,
 	}
 }
 
@@ -109,6 +111,113 @@ func NewProvisioner(adminUser, adminPassword, adminDatabase, backend, listener, 
 // connection. Intended for tests.
 func (p *Provisioner) SetCredentialTTL(d time.Duration) {
 	p.credTTL = d
+}
+
+// connectTo opens an admin connection to a specific database.
+//
+// Which database matters. Role creation, membership grants and GRANT CONNECT
+// all act on shared catalogs and work from anywhere, but privileges on
+// schemas, tables and sequences are stored per database — as is REASSIGN
+// OWNED. Running those over a connection to admin_database silently applied
+// them to the wrong database, leaving the role with no usable privileges in
+// the one it was provisioned for.
+//
+// Connecting to the target database instead keeps the whole operation in a
+// single transaction and puts every statement where it belongs.
+func (p *Provisioner) connectTo(ctx context.Context, database string) (*pgx.Conn, string, error) {
+	if database == "" {
+		database = p.adminDatabase
+	}
+
+	connCfg, err := pgx.ParseConfig(p.adminConnStr)
+	if err != nil {
+		return nil, "", fmt.Errorf("parse admin conn config: %w", err)
+	}
+	connCfg.Database = database
+	if p.dialFunc != nil {
+		connCfg.DialFunc = p.dialFunc
+	}
+	if p.lookupFunc != nil {
+		connCfg.LookupFunc = p.lookupFunc
+	}
+
+	tracerOpts := []otelpgx.Option{otelpgx.WithTrimSQLInSpanName()}
+	if p.peerService != "" {
+		tracerOpts = append(tracerOpts, otelpgx.WithTracerAttributes(
+			attribute.String("peer.service", p.peerService),
+		))
+	}
+	connCfg.Tracer = otelpgx.NewTracer(tracerOpts...)
+
+	// Bound the entire provisioning DB interaction (DNS + connect + SQL).
+	const provisionTimeout = 90 * time.Second
+	connCtx, connCancel := context.WithTimeout(ctx, provisionTimeout)
+	defer connCancel()
+
+	conn, err := pgx.ConnectConfig(connCtx, connCfg)
+	if err != nil {
+		return nil, database, err
+	}
+	return conn, database, nil
+}
+
+// connectToTarget opens a connection to the database being provisioned for,
+// falling back to admin_database when that database does not exist. The bool
+// reports whether the target database was reached.
+func (p *Provisioner) connectToTarget(ctx context.Context, database string) (*pgx.Conn, bool, error) {
+	if database == "" || database == p.adminDatabase {
+		conn, _, err := p.connectTo(ctx, database)
+		if err != nil {
+			return nil, false, err
+		}
+		return conn, database != "", nil
+	}
+
+	conn, _, err := p.connectTo(ctx, database)
+	if err == nil {
+		// Postgres refuses the connection outright when the database is
+		// missing, but CockroachDB accepts it — even `SELECT 1` succeeds —
+		// and only fails once a catalog is touched. Probe the catalog so
+		// both backends reach the same conclusion here rather than failing
+		// later inside the provisioning transaction.
+		if probeErr := probeDatabaseExists(ctx, conn); probeErr == nil {
+			return conn, true, nil
+		} else if !isInvalidCatalogName(probeErr) {
+			conn.Close(ctx)
+			return nil, false, probeErr
+		}
+		conn.Close(ctx)
+	} else if !isInvalidCatalogName(err) {
+		return nil, false, err
+	}
+
+	// The database does not exist. Provisioning still creates the role so
+	// the caller gets a clear error from the backend rather than a
+	// provisioning failure, but no database-scoped grant can be applied.
+	p.logger.WarnContext(ctx, "target database does not exist; provisioning without database-scoped grants",
+		"database", database)
+	conn, _, err = p.connectTo(ctx, p.adminDatabase)
+	if err != nil {
+		return nil, false, err
+	}
+	return conn, false, nil
+}
+
+// probeDatabaseExists issues a catalog read, which is what distinguishes a
+// live database from a missing one on backends that connect regardless.
+func probeDatabaseExists(ctx context.Context, conn *pgx.Conn) error {
+	var n int
+	return conn.QueryRow(ctx, "SELECT count(*) FROM pg_database").Scan(&n)
+}
+
+// isInvalidCatalogName reports SQLSTATE 3D000, which Postgres returns when the
+// requested database does not exist.
+func isInvalidCatalogName(err error) bool {
+	var pe *pgconn.PgError
+	if errors.As(err, &pe) {
+		return pe.Code == "3D000"
+	}
+	return false
 }
 
 // EnsureUser creates or updates a dynamic PG role for the given identity,
@@ -225,36 +334,11 @@ func (p *Provisioner) provisionRole(ctx context.Context, pgUser, database string
 	)
 	defer span.End()
 
-	connCfg, err := pgx.ParseConfig(p.adminConnStr)
-	if err != nil {
-		span.RecordError(err)
-		return "", fmt.Errorf("parse admin conn config: %w", err)
-	}
-	if p.dialFunc != nil {
-		connCfg.DialFunc = p.dialFunc
-	}
-	if p.lookupFunc != nil {
-		connCfg.LookupFunc = p.lookupFunc
-	}
-
-	tracerOpts := []otelpgx.Option{
-		otelpgx.WithTrimSQLInSpanName(),
-	}
-	if p.peerService != "" {
-		tracerOpts = append(tracerOpts, otelpgx.WithTracerAttributes(
-			attribute.String("peer.service", p.peerService),
-		))
-	}
-	connCfg.Tracer = otelpgx.NewTracer(tracerOpts...)
-
-	// Bound the entire provisioning DB interaction (DNS + connect + SQL).
-	const provisionTimeout = 90 * time.Second
-	connCtx, connCancel := context.WithTimeout(ctx, provisionTimeout)
-	defer connCancel()
-
-	p.logger.DebugContext(ctx, "connecting to admin db", "host", connCfg.Host, "database", connCfg.Database)
+	// Connect to the database being provisioned for, so that schema and
+	// table grants land in it rather than in admin_database.
+	p.logger.DebugContext(ctx, "connecting for provisioning", "database", database)
 	ctx, connectSpan := tracer.Start(ctx, "waypoint.provision.connect")
-	conn, err := pgx.ConnectConfig(connCtx, connCfg)
+	conn, targetDatabaseExists, err := p.connectToTarget(ctx, database)
 	if err != nil {
 		connectSpan.RecordError(err)
 		connectSpan.SetStatus(codes.Error, "connect failed")
@@ -288,12 +372,6 @@ func (p *Provisioner) provisionRole(ctx context.Context, pgUser, database string
 	if err != nil {
 		span.RecordError(err)
 		return "", fmt.Errorf("check role: %w", err)
-	}
-
-	targetDatabaseExists, err := databaseExists(ctx, tx, database)
-	if err != nil {
-		span.RecordError(err)
-		return "", fmt.Errorf("check database: %w", err)
 	}
 
 	// Reuse the password already in effect when it is still fresh. Rotating on
@@ -437,33 +515,9 @@ func (p *Provisioner) reconcileRole(ctx context.Context, pgUser, database string
 	ctx, span := tracer.Start(ctx, "waypoint.provision.reconcile")
 	defer span.End()
 
-	connCfg, err := pgx.ParseConfig(p.adminConnStr)
-	if err != nil {
-		span.RecordError(err)
-		return fmt.Errorf("parse admin conn config: %w", err)
-	}
-	if p.dialFunc != nil {
-		connCfg.DialFunc = p.dialFunc
-	}
-	if p.lookupFunc != nil {
-		connCfg.LookupFunc = p.lookupFunc
-	}
-
-	tracerOpts := []otelpgx.Option{
-		otelpgx.WithTrimSQLInSpanName(),
-	}
-	if p.peerService != "" {
-		tracerOpts = append(tracerOpts, otelpgx.WithTracerAttributes(
-			attribute.String("peer.service", p.peerService),
-		))
-	}
-	connCfg.Tracer = otelpgx.NewTracer(tracerOpts...)
-
-	const provisionTimeout = 90 * time.Second
-	connCtx, connCancel := context.WithTimeout(ctx, provisionTimeout)
-	defer connCancel()
-
-	conn, err := pgx.ConnectConfig(connCtx, connCfg)
+	// Same reasoning as ensureUser: the grants this reapplies are stored per
+	// database, so they have to be issued over a connection to that database.
+	conn, targetDatabaseExists, err := p.connectToTarget(ctx, database)
 	if err != nil {
 		span.RecordError(err)
 		return fmt.Errorf("admin connect: %w", err)
@@ -493,12 +547,6 @@ func (p *Provisioner) reconcileRole(ctx context.Context, pgUser, database string
 		err := fmt.Errorf("role %q does not exist", pgUser)
 		span.RecordError(err)
 		return err
-	}
-
-	targetDatabaseExists, err := databaseExists(ctx, tx, database)
-	if err != nil {
-		span.RecordError(err)
-		return fmt.Errorf("check database: %w", err)
 	}
 
 	if err := p.reconcileUserGroups(ctx, tx, dialect, pgUser, database, targetDatabaseExists, perms); err != nil {
@@ -638,12 +686,6 @@ func (p *Provisioner) bootstrapGroupsForPerms(ctx context.Context, tx pgx.Tx, di
 		}
 	}
 	return names, nil
-}
-
-func databaseExists(ctx context.Context, tx pgx.Tx, database string) (bool, error) {
-	var exists bool
-	err := tx.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)", database).Scan(&exists)
-	return exists, err
 }
 
 // formatUsername builds: {prefix}{login_sanitized}_{node}_{database}

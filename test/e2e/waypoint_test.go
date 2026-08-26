@@ -1217,6 +1217,42 @@ func TestE2E_WebConsole_RealTailscaleIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatalf("admin connect: %v", err)
 	}
+	// A second database, so the console's database picker is exercised.
+	// Provisioning has to grant in each target database for this to work.
+	for _, stmt := range []string{
+		`DROP DATABASE IF EXISTS analytics WITH (FORCE)`,
+		`CREATE DATABASE analytics`,
+	} {
+		if _, err := adminConn.Exec(ctx, stmt); err != nil {
+			adminConn.Close(ctx)
+			t.Fatalf("create analytics: %v", err)
+		}
+	}
+	t.Cleanup(func() {
+		c, err := pgx.Connect(context.Background(), pgConnStr)
+		if err != nil {
+			return
+		}
+		defer c.Close(context.Background())
+		_, _ = c.Exec(context.Background(), `DROP DATABASE IF EXISTS analytics WITH (FORCE)`)
+	})
+	analyticsConn, err := pgx.Connect(ctx, strings.Replace(pgConnStr, "/waypoint_test", "/analytics", 1))
+	if err != nil {
+		adminConn.Close(ctx)
+		t.Fatalf("connect to analytics: %v", err)
+	}
+	for _, stmt := range []string{
+		`CREATE TABLE events (id bigserial PRIMARY KEY, kind text)`,
+		`INSERT INTO events (kind) SELECT 'click' FROM generate_series(1, 7)`,
+	} {
+		if _, err := analyticsConn.Exec(ctx, stmt); err != nil {
+			analyticsConn.Close(ctx)
+			adminConn.Close(ctx)
+			t.Fatalf("seed analytics: %v", err)
+		}
+	}
+	analyticsConn.Close(ctx)
+
 	for _, stmt := range []string{
 		`DROP TABLE IF EXISTS shipments, orders, customers CASCADE`,
 		`CREATE TABLE customers (id bigserial PRIMARY KEY, email text, name text)`,
@@ -1260,6 +1296,10 @@ func TestE2E_WebConsole_RealTailscaleIdentity(t *testing.T) {
 				PG: &auth.PGCap{
 					Databases: map[string]auth.DBPermissions{
 						"waypoint_test": {
+							Permissions: []string{"readonly"},
+							Schemas:     []string{"public"},
+						},
+						"analytics": {
 							Permissions: []string{"readonly"},
 							Schemas:     []string{"public"},
 						},
@@ -1308,7 +1348,7 @@ admin_database = "waypoint_test"
 user_prefix = "wp_"
 
 [listeners.web]
-databases = ["waypoint_test"]
+databases = ["waypoint_test", "analytics"]
 max_rows = 2
 statement_timeout = "20s"
 `, controlURL, stateDir, rdb.Options().Addr, pgBackend)
@@ -1702,6 +1742,102 @@ statement_timeout = "20s"
 					t.Errorf("status = %d, want 403", res.StatusCode)
 				}
 			})
+		}
+	})
+
+	t.Run("a second database is fully usable", func(t *testing.T) {
+		// The regression this guards: provisioning used to apply its GRANTs
+		// over a connection to admin_database, so a role for any other
+		// database had its privileges in the wrong one and every query was
+		// refused with 42501.
+		res := get(t, "/api/v1/schema?database=analytics")
+		defer res.Body.Close()
+		if res.StatusCode != http.StatusOK {
+			b, _ := io.ReadAll(res.Body)
+			t.Fatalf("schema for analytics: status %d: %s", res.StatusCode, b)
+		}
+		var cat struct {
+			Tables []struct {
+				Name   string `json:"name"`
+				Select bool   `json:"select"`
+			} `json:"tables"`
+		}
+		if err := json.NewDecoder(res.Body).Decode(&cat); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		var found bool
+		for _, tb := range cat.Tables {
+			if tb.Name == "events" {
+				found = true
+				if !tb.Select {
+					t.Error("events is visible but not selectable in analytics")
+				}
+			}
+			// The other database's relations must not leak into this one.
+			if tb.Name == "customers" || tb.Name == "orders" {
+				t.Errorf("analytics catalog contains %q from waypoint_test", tb.Name)
+			}
+		}
+		if !found {
+			t.Fatalf("events not in the analytics catalog; got %+v", cat.Tables)
+		}
+
+		// And the query actually runs.
+		qres := post(t, "/api/v1/query", map[string]any{
+			"database": "analytics", "sql": "SELECT count(*) FROM events",
+		}, nil)
+		defer qres.Body.Close()
+		var rows int
+		var failure string
+		scanner := bufio.NewScanner(qres.Body)
+		for scanner.Scan() {
+			var f map[string]any
+			if json.Unmarshal(scanner.Bytes(), &f) != nil {
+				continue
+			}
+			if f["type"] == "error" {
+				failure = fmt.Sprint(f["code"], " ", f["message"])
+			}
+			if f["type"] == "rows" {
+				rows++
+			}
+		}
+		if failure != "" {
+			t.Fatalf("query against analytics failed: %s", failure)
+		}
+		if rows == 0 {
+			t.Error("query against analytics returned no rows")
+		}
+	})
+
+	t.Run("each database gets its own role", func(t *testing.T) {
+		roleFor := func(db string) string {
+			res := post(t, "/api/v1/query", map[string]any{
+				"database": db, "sql": "SELECT current_user",
+			}, nil)
+			defer res.Body.Close()
+			scanner := bufio.NewScanner(res.Body)
+			for scanner.Scan() {
+				var f map[string]any
+				if json.Unmarshal(scanner.Bytes(), &f) != nil {
+					continue
+				}
+				if f["type"] == "rows" {
+					if r, ok := f["rows"].([]any); ok && len(r) > 0 {
+						if c, ok := r[0].([]any); ok && len(c) > 0 {
+							return fmt.Sprint(c[0])
+						}
+					}
+				}
+			}
+			return ""
+		}
+		a, b := roleFor("waypoint_test"), roleFor("analytics")
+		if a == "" || b == "" {
+			t.Fatalf("no role reported: %q %q", a, b)
+		}
+		if a == b {
+			t.Errorf("both databases resolved to the role %q; their grants would collide", a)
 		}
 	})
 

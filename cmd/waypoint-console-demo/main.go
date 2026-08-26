@@ -36,6 +36,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -58,7 +59,7 @@ func main() {
 		pgBackend = flag.String("backend", "127.0.0.1:55432", "postgres backend host:port")
 		pgUser    = flag.String("admin-user", "postgres", "postgres admin user")
 		pgPass    = flag.String("admin-password", "demopw", "postgres admin password")
-		database  = flag.String("database", "appdb", "database to expose in the console")
+		database  = flag.String("database", "appdb", "comma-separated databases to expose; the first is the default")
 		redisAddr = flag.String("redis", "127.0.0.1:56379", "redis address")
 		preset    = flag.String("preset", "readwrite", "capability preset: readonly, readwrite, or admin")
 		localAddr = flag.String("addr", "127.0.0.1:8080", "local address to serve the console on")
@@ -66,6 +67,11 @@ func main() {
 		verbose   = flag.Bool("v", false, "verbose waypoint logs")
 	)
 	flag.Parse()
+
+	databases := strings.Split(*database, ",")
+	for i := range databases {
+		databases[i] = strings.TrimSpace(databases[i])
+	}
 
 	logLevel := slog.LevelWarn
 	if *verbose {
@@ -96,18 +102,18 @@ func main() {
 
 	// The capability grant. This is the same shape a real tailnet ACL uses;
 	// change -preset to see the console's permission handling shift.
+	grantedDBs := map[string]auth.DBPermissions{}
+	for _, db := range databases {
+		grantedDBs[db] = auth.DBPermissions{
+			Permissions: []string{*preset},
+			Schemas:     []string{"public"},
+		}
+	}
 	capRule := auth.CapRule{
 		Limits: &auth.LimitsCap{MaxConns: 20},
 		Backends: map[string]auth.BackendCap{
 			"console": {
-				PG: &auth.PGCap{
-					Databases: map[string]auth.DBPermissions{
-						*database: {
-							Permissions: []string{*preset},
-							Schemas:     []string{"public"},
-						},
-					},
-				},
+				PG: &auth.PGCap{Databases: grantedDBs},
 			},
 		},
 	}
@@ -157,7 +163,7 @@ user_prefix = "wp_"
 user_ttl = "1h"
 
 [listeners.web]
-databases = [%q]
+databases = [%s]
 max_rows = %d
 statement_timeout = "30s"
 
@@ -165,7 +171,7 @@ statement_timeout = "30s"
 level = "normalized"
 max_level = "full"
 `, control.HTTPTestServer.URL, filepath.Join(tmp, "state"),
-		*redisAddr, *pgBackend, *pgUser, *pgPass, *database, *database, *maxRows)
+		*redisAddr, *pgBackend, *pgUser, *pgPass, databases[0], quotedList(databases), *maxRows)
 
 	if err := os.WriteFile(configPath, []byte(configBody), 0o600); err != nil {
 		fatal("write config: %v", err)
@@ -238,7 +244,7 @@ max_level = "full"
 		_ = local.Shutdown(shutdownCtx)
 	}()
 
-	banner(*localAddr, *preset, *database, *pgBackend)
+	banner(*localAddr, *preset, strings.Join(databases, ", "), *pgBackend)
 
 	if err := local.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		fatal("local listener: %v", err)
@@ -253,6 +259,15 @@ max_level = "full"
 	case <-time.After(15 * time.Second):
 	}
 	fmt.Fprintln(os.Stderr, "shut down.")
+}
+
+// quotedList renders a TOML string array body.
+func quotedList(items []string) string {
+	quoted := make([]string, 0, len(items))
+	for _, s := range items {
+		quoted = append(quoted, fmt.Sprintf("%q", s))
+	}
+	return strings.Join(quoted, ", ")
 }
 
 func waitForPeer(ctx context.Context, node *tsnet.Server, hostname string) (string, error) {

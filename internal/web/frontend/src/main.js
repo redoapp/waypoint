@@ -82,6 +82,12 @@ const state = {
 
 const el = (id) => document.getElementById(id);
 
+// The database the active tab is pointed at. Falls back to the session
+// default before any tab exists.
+function activeDatabase() {
+  return activeTab()?.database || state.database;
+}
+
 function activeTab() {
   return state.tabs.find((t) => t.id === state.activeId) || null;
 }
@@ -90,6 +96,10 @@ function newTab(name, doc = "") {
   const tab = {
     id: state.seq++,
     name: name || `query ${state.seq - 1}`,
+    // Per tab, not per page: with several databases offered, repointing
+    // every open tab because the picker moved would be surprising, and a
+    // tab would keep showing results from the database it no longer names.
+    database: state.database,
     editorState: null,
     doc,
     result: null,
@@ -138,7 +148,7 @@ async function completionSource(context) {
   let res;
   try {
     res = await api("/api/v1/complete", {
-      database: state.database,
+      database: activeDatabase(),
       sql: doc,
       cursorPos,
     });
@@ -188,7 +198,7 @@ async function diagnosticsSource(v) {
   if (!doc.trim()) return [];
   let res;
   try {
-    res = await api("/api/v1/diagnostics", { database: state.database, sql: doc });
+    res = await api("/api/v1/diagnostics", { database: activeDatabase(), sql: doc });
   } catch {
     return [];
   }
@@ -285,19 +295,34 @@ function switchTab(id) {
     cur.editorState = view.state;
     cur.doc = view.state.doc.toString();
   }
+  const previousDatabase = activeDatabase();
   state.activeId = id;
   const next = activeTab();
   if (!next) return;
   view.setState(next.editorState || makeState(next.doc));
   renderTabs();
   renderResult(next);
+  renderStatus();
   updateRunButton();
+  // The schema tree follows the tab, so it only reloads when the tab being
+  // switched to points somewhere else.
+  if (next.database !== previousDatabase) {
+    syncPicker();
+    state.openTable = null;
+    loadSchema();
+  }
   view.focus();
 }
 
 // ---------------------------------------------------------------------------
 // tabs
 // ---------------------------------------------------------------------------
+
+// syncPicker points the database selector at the active tab.
+function syncPicker() {
+  const picker = el("db-picker");
+  if (picker && activeDatabase()) picker.value = activeDatabase();
+}
 
 function renderTabs() {
   const host = el("tabs");
@@ -318,6 +343,13 @@ function renderTabs() {
     const label = document.createElement("span");
     label.textContent = tab.name;
     node.appendChild(label);
+
+    if ((state.session?.databases?.length || 0) > 1) {
+      const db = document.createElement("span");
+      db.className = "tab-db";
+      db.textContent = tab.database;
+      node.appendChild(db);
+    }
 
     if (state.tabs.length > 1) {
       const close = document.createElement("span");
@@ -355,6 +387,8 @@ function addTab(doc = "", name = null) {
   const tab = newTab(name, doc);
   state.activeId = tab.id;
   view.setState(makeState(doc));
+  syncPicker();
+  renderStatus();
   renderTabs();
   renderResult(tab);
   view.focus();
@@ -436,7 +470,7 @@ async function runQuery(runAll) {
     const res = await fetch("/api/v1/query", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ database: state.database, sql: doc, cursorPos, runAll }),
+      body: JSON.stringify({ database: activeDatabase(), sql: doc, cursorPos, runAll }),
       signal: controller.signal,
     });
 
@@ -538,7 +572,7 @@ async function cancelQuery() {
     return;
   }
   try {
-    await api("/api/v1/cancel", { database: state.database, pid: tab.pid });
+    await api("/api/v1/cancel", { database: tab.database, pid: tab.pid });
     toast("Query cancelled", "ok");
   } catch (err) {
     toast(`Cancel failed: ${err.message}`, "err");
@@ -827,7 +861,7 @@ async function toggleTable(t, qualified) {
 async function loadColumns(t, host) {
   try {
     const res = await api("/api/v1/columns", {
-      database: state.database, schema: t.schema, table: t.name,
+      database: activeDatabase(), schema: t.schema, table: t.name,
     });
     host.replaceChildren();
     for (const c of res.columns) {
@@ -968,7 +1002,7 @@ function renderStatus() {
   const s = state.session;
   if (!s) return;
   el("status-identity").textContent = `${s.user}@${s.node}`;
-  el("status-listener").textContent = `${s.listener} → ${state.database}`;
+  el("status-listener").textContent = `${s.listener} → ${activeDatabase()}`;
 
   // Showing the resolved grant is something only this console can do: no
   // other SQL client knows who you are or what your capability grant says.
@@ -984,7 +1018,7 @@ function renderStatus() {
 
 async function loadSchema(force = false) {
   try {
-    const q = new URLSearchParams({ database: state.database });
+    const q = new URLSearchParams({ database: activeDatabase() });
     if (force) q.set("refresh", "1");
     state.catalog = await api(`/api/v1/schema?${q}`);
     renderTree();
@@ -1027,9 +1061,12 @@ async function boot() {
   }
   picker.value = state.database;
   picker.addEventListener("change", () => {
-    state.database = picker.value;
+    const tab = activeTab();
+    if (tab) tab.database = picker.value;
+    state.database = picker.value; // the default for tabs opened next
     state.openTable = null;
     renderStatus();
+    renderTabs();
     loadSchema();
   });
 

@@ -160,6 +160,15 @@ body {
 }
 .tab:hover { background: var(--bg-hover); }
 .tab.active { background: var(--bg); color: var(--fg); box-shadow: inset 0 -2px 0 var(--accent); }
+.tab .tab-db {
+  color: var(--fg-faint);
+  font-size: 10px;
+  padding: 0 4px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+}
+.tab.active .tab-db { color: var(--fg-muted); border-color: var(--border-strong); }
+
 .tab .close { color: var(--fg-faint); border-radius: 3px; padding: 0 3px; }
 .tab .close:hover { background: var(--bg-active); color: var(--fg); }
 .tab .spin { color: var(--accent); }

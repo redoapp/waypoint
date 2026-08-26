@@ -211,6 +211,24 @@ SQL
 
   # Real counts, not pg_stat_user_tables.n_live_tup, which is an estimate and
   # overcounts after a bulk load.
+  # A second database, so the console's picker has more than one entry.
+  $RUNTIME exec "$PG_CONTAINER" psql -U postgres -q -c "DROP DATABASE IF EXISTS analytics WITH (FORCE)" >/dev/null 2>&1 || true
+  $RUNTIME exec "$PG_CONTAINER" psql -U postgres -q -c "CREATE DATABASE analytics" >/dev/null 2>&1 || true
+  $RUNTIME exec -i "$PG_CONTAINER" psql -U postgres -d analytics -q <<'ASQL'
+DROP TABLE IF EXISTS page_views, sessions CASCADE;
+CREATE TABLE sessions (id bigserial PRIMARY KEY, visitor text, started_at timestamptz DEFAULT now());
+CREATE TABLE page_views (
+    id         bigserial PRIMARY KEY,
+    session_id bigint NOT NULL REFERENCES sessions(id),
+    path       text,
+    viewed_at  timestamptz DEFAULT now()
+);
+INSERT INTO sessions (visitor) SELECT 'visitor-' || g FROM generate_series(1, 60) g;
+INSERT INTO page_views (session_id, path)
+SELECT 1 + (g % 60), (ARRAY['/','/pricing','/docs','/blog'])[1 + (g % 4)]
+FROM generate_series(1, 400) g;
+ASQL
+
   echo "seeded:"
   $RUNTIME exec -i "$PG_CONTAINER" psql -U postgres -d appdb -tAc "
     SELECT '  ' || t.relname || ': ' || c.n
@@ -249,7 +267,7 @@ exec go run -tags demo ./cmd/waypoint-console-demo \
   -backend "127.0.0.1:$PG_PORT" \
   -admin-user postgres \
   -admin-password demopw \
-  -database appdb \
+  -database "appdb,analytics" \
   -redis "127.0.0.1:$REDIS_PORT" \
   -preset "$PRESET" \
   "$@"

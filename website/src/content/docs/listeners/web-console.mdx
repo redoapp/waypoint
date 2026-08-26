@@ -23,19 +23,16 @@ admin_password = "${PG_ADMIN_PASSWORD}"
 admin_database = "postgres"
 
 [listeners.web]
-databases = ["appdb"]
+databases = ["appdb", "analytics"]
 max_rows = 1000
 statement_timeout = "30s"
 ```
 
-:::caution[One database per listener, for now]
-`databases` may currently only name the listener's `admin_database`; anything
-else is rejected at config load. Provisioning applies its `GRANT`s over a
-single admin connection, and grants in Postgres are database-local, so a role
-provisioned for another database receives its privileges in the admin database
-and every query it runs is refused. Run a second web listener to expose a
-second database until provisioning grants per target database.
-:::
+`databases` is the menu shown in the console's picker. Each entry gets its own
+provisioned role and its own connection pool, and capability grants still
+decide which of them a given user can reach — an entry the caller has no grant
+for is refused. They need not include `admin_database`: provisioning connects
+to each target database to apply its grants.
 
 Open `https://<node>.<tailnet>.ts.net:8443` from any device on the tailnet.
 

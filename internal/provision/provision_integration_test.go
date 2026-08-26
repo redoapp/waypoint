@@ -969,3 +969,206 @@ func TestIntegration_EnsureUser_MultiSchemaGroupMemberships(t *testing.T) {
 
 // Ensure the redis import is used (it's needed for the RedisClient call via testutil).
 var _ *redis.Client
+
+// TestIntegrationEnsureUser_GrantsLandInTheTargetDatabase is the regression
+// test for grants being applied to the wrong database.
+//
+// Privileges on schemas, tables and sequences are stored per database in
+// Postgres. Provisioning used to issue them over a connection to
+// admin_database regardless of which database the role was for, so a role
+// provisioned for any other database ended up with its privileges in
+// admin_database and every query it ran was refused.
+func TestIntegrationEnsureUser_GrantsLandInTheTargetDatabase(t *testing.T) {
+	ctx := context.Background()
+	connStr, backend := testutil.PostgresBackend(t)
+
+	admin, err := pgx.Connect(ctx, connStr)
+	if err != nil {
+		t.Fatalf("admin connect: %v", err)
+	}
+	defer admin.Close(ctx)
+
+	// A second database with a table of its own. The admin database keeps a
+	// differently-named table so the two are never confused.
+	const otherDB = "wp_other_db"
+	for _, stmt := range []string{
+		"DROP DATABASE IF EXISTS " + otherDB,
+		"CREATE DATABASE " + otherDB,
+		"DROP TABLE IF EXISTS in_admin_db",
+		"CREATE TABLE in_admin_db (id int)",
+	} {
+		if _, err := admin.Exec(ctx, stmt); err != nil {
+			t.Fatalf("setup %q: %v", stmt, err)
+		}
+	}
+	t.Cleanup(func() {
+		c, err := pgx.Connect(context.Background(), connStr)
+		if err != nil {
+			return
+		}
+		defer c.Close(context.Background())
+		_, _ = c.Exec(context.Background(), "DROP DATABASE IF EXISTS "+otherDB+" WITH (FORCE)")
+	})
+
+	otherConnStr := strings.Replace(connStr, "/waypoint_test", "/"+otherDB, 1)
+	other, err := pgx.Connect(ctx, otherConnStr)
+	if err != nil {
+		t.Fatalf("connect to %s: %v", otherDB, err)
+	}
+	defer other.Close(ctx)
+	if _, err := other.Exec(ctx, "CREATE TABLE in_other_db (id int)"); err != nil {
+		t.Fatalf("create table in %s: %v", otherDB, err)
+	}
+
+	// admin_database is waypoint_test; provision for the other one.
+	rdb := testutil.RedisClient(t)
+	store := restrict.NewRedisStore(rdb, "granttest:", metrics.Noop())
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	p := NewProvisioner("admin", "adminpass", "waypoint_test", backend, "grant-test", "wp_gt_",
+		false, true, "test", store, logger, nil, nil)
+
+	role, _, err := p.EnsureUser(ctx, "alice@example.com", "laptop", otherDB,
+		&auth.DBPermissions{Permissions: []string{"readonly"}, Schemas: []string{"public"}})
+	if err != nil {
+		t.Fatalf("EnsureUser: %v", err)
+	}
+	t.Cleanup(func() {
+		c, err := pgx.Connect(context.Background(), otherConnStr)
+		if err == nil {
+			_, _ = c.Exec(context.Background(), "DROP OWNED BY "+pgx.Identifier{role}.Sanitize())
+			c.Close(context.Background())
+		}
+		c, err = pgx.Connect(context.Background(), connStr)
+		if err == nil {
+			_, _ = c.Exec(context.Background(), "DROP OWNED BY "+pgx.Identifier{role}.Sanitize())
+			_, _ = c.Exec(context.Background(), "DROP ROLE IF EXISTS "+pgx.Identifier{role}.Sanitize())
+			c.Close(context.Background())
+		}
+	})
+
+	// The privilege must exist in the database the role was provisioned for.
+	var canReadOther bool
+	if err := other.QueryRow(ctx,
+		"SELECT has_table_privilege($1, 'public.in_other_db', 'SELECT')", role).Scan(&canReadOther); err != nil {
+		t.Fatalf("privilege check in %s: %v", otherDB, err)
+	}
+	if !canReadOther {
+		t.Errorf("role %q cannot read %s.public.in_other_db — grants did not land in the target database", role, otherDB)
+	}
+
+	// And must not have been applied to the admin database instead.
+	var canReadAdmin bool
+	if err := admin.QueryRow(ctx,
+		"SELECT has_table_privilege($1, 'public.in_admin_db', 'SELECT')", role).Scan(&canReadAdmin); err != nil {
+		t.Fatalf("privilege check in admin db: %v", err)
+	}
+	if canReadAdmin {
+		t.Errorf("role %q holds privileges in admin_database it was never granted for", role)
+	}
+
+	// The end-to-end proof: connect as the role and read the table.
+	roleConn, err := pgx.Connect(ctx, strings.Replace(otherConnStr, "admin:adminpass", role+":"+mustPassword(t, p, role, otherDB), 1))
+	if err == nil {
+		defer roleConn.Close(ctx)
+		var n int
+		if err := roleConn.QueryRow(ctx, "SELECT count(*) FROM in_other_db").Scan(&n); err != nil {
+			t.Errorf("role could not query the table it was granted: %v", err)
+		}
+	}
+}
+
+// mustPassword re-provisions to obtain a usable password for the role.
+func mustPassword(t *testing.T, p *Provisioner, role, database string) string {
+	t.Helper()
+	_, pw, err := p.EnsureUser(context.Background(), "alice@example.com", "laptop", database,
+		&auth.DBPermissions{Permissions: []string{"readonly"}, Schemas: []string{"public"}})
+	if err != nil {
+		t.Fatalf("re-provision for password: %v", err)
+	}
+	return pw
+}
+
+func TestIntegrationEnsureUser_MissingTargetDatabaseStillCreatesRole(t *testing.T) {
+	ctx := context.Background()
+	_, backend := testutil.PostgresBackend(t)
+
+	rdb := testutil.RedisClient(t)
+	store := restrict.NewRedisStore(rdb, "granttest2:", metrics.Noop())
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	p := NewProvisioner("admin", "adminpass", "waypoint_test", backend, "missing-db", "wp_md_",
+		false, true, "test", store, logger, nil, nil)
+
+	// Provisioning for a database that does not exist must not fail outright:
+	// the role is still created so the backend, not waypoint, reports the
+	// missing database to the client.
+	role, _, err := p.EnsureUser(ctx, "bob@example.com", "laptop", "no_such_database_here",
+		&auth.DBPermissions{Permissions: []string{"readonly"}})
+	if err != nil {
+		t.Fatalf("EnsureUser against a missing database: %v", err)
+	}
+	if role == "" {
+		t.Error("no role name returned")
+	}
+}
+
+// TestIntegrationConnectToTarget_MissingDatabaseAcrossBackends pins the
+// behaviour the two backends disagree on.
+//
+// Postgres refuses a connection to a database that does not exist. CockroachDB
+// accepts it, and even answers SELECT 1, failing only when a catalog is read.
+// Provisioning has to reach the same conclusion on both, or the missing
+// database surfaces as a failure partway through the provisioning transaction
+// instead of a clean fallback.
+func TestIntegrationConnectToTarget_MissingDatabaseAcrossBackends(t *testing.T) {
+	for _, db := range testBackends(t) {
+		t.Run(db.name, func(t *testing.T) {
+			ctx := context.Background()
+			p := setupProvisionerFor(t, db)
+
+			conn, exists, err := p.connectToTarget(ctx, "definitely_not_a_database")
+			if err != nil {
+				t.Fatalf("connectToTarget should fall back, not fail: %v", err)
+			}
+			defer conn.Close(ctx)
+
+			if exists {
+				t.Error("reported a missing database as present")
+			}
+
+			// The fallback connection must be usable — it is what the rest of
+			// provisioning runs on.
+			var n int
+			if err := conn.QueryRow(ctx, "SELECT count(*) FROM pg_database").Scan(&n); err != nil {
+				t.Errorf("fallback connection cannot read the catalog: %v", err)
+			}
+		})
+	}
+}
+
+func TestIntegrationConnectToTarget_ExistingDatabaseIsReached(t *testing.T) {
+	for _, db := range testBackends(t) {
+		t.Run(db.name, func(t *testing.T) {
+			ctx := context.Background()
+			p := setupProvisionerFor(t, db)
+
+			conn, exists, err := p.connectToTarget(ctx, "waypoint_test")
+			if err != nil {
+				t.Fatalf("connectToTarget: %v", err)
+			}
+			defer conn.Close(ctx)
+
+			if !exists {
+				t.Error("existing database reported as missing")
+			}
+			// Crucially, the connection is to that database — this is what
+			// puts schema and table grants in the right place.
+			var current string
+			if err := conn.QueryRow(ctx, "SELECT current_database()").Scan(&current); err != nil {
+				t.Fatalf("current_database: %v", err)
+			}
+			if current != "waypoint_test" {
+				t.Errorf("connected to %q, want waypoint_test", current)
+			}
+		})
+	}
+}

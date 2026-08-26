@@ -569,22 +569,6 @@ func validate(cfg *Config) error {
 		if l.Web != nil && mode != "web" {
 			return fmt.Errorf("listeners[%d]: [listeners.web] is only supported for mode %q, got %q", i, "web", l.Mode)
 		}
-		// Provisioning applies GRANTs over a single admin connection, and
-		// grants in Postgres are database-local — so a role provisioned for
-		// any database other than admin_database ends up with its privileges
-		// applied in the wrong one, and every query it runs is refused.
-		// Rejecting the configuration is better than serving a picker whose
-		// other entries return an empty schema.
-		if mode == "web" && l.Web != nil && l.Postgres != nil {
-			for _, db := range l.Web.Databases {
-				if db != l.Postgres.AdminDatabase {
-					return fmt.Errorf(
-						"listeners[%d]: [listeners.web].databases may currently only contain admin_database (%q), got %q; "+
-							"serving additional databases needs provisioning to grant in each of them",
-						i, l.Postgres.AdminDatabase, db)
-				}
-			}
-		}
 		if mode == "web" && l.EffectiveTLSMode() == TLSOptional && strings.TrimSpace(l.PostgresTLSMode) != "" {
 			return fmt.Errorf("listeners[%d]: mode %q has no TLS negotiation, so tls_mode must be %q or %q, got %q",
 				i, "web", TLSRequire, TLSOff, l.PostgresTLSMode)
