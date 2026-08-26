@@ -594,7 +594,7 @@ func (p *Provisioner) reconcileUserGroups(ctx context.Context, tx pgx.Tx, dialec
 		return err
 	}
 
-	current, err := currentGroupMemberships(ctx, tx, pgUser)
+	current, err := p.currentGroupMemberships(ctx, tx, pgUser)
 	if err != nil {
 		return err
 	}

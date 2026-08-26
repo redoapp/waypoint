@@ -625,9 +625,12 @@ func TestIntegration_EnsureUser_SQLStatements(t *testing.T) {
 	}
 }
 
-// memberOfPresetGroups returns the wp_grp_ memberships of pgUser, used by
-// integration tests that assert on group-membership reconciliation.
-func memberOfPresetGroups(t *testing.T, db dbBackend, pgUser string) []string {
+// memberOfPresetGroups returns pgUser's memberships in groups under
+// groupPrefix, used by integration tests that assert on group-membership
+// reconciliation. The prefix comes from the provisioner under test rather
+// than a literal, since it carries that provisioner's user_prefix and
+// listener.
+func memberOfPresetGroups(t *testing.T, db dbBackend, pgUser, groupPrefix string) []string {
 	t.Helper()
 	conn := adminConnFor(t, db)
 	rows, err := conn.Query(context.Background(), `
@@ -647,7 +650,7 @@ ORDER BY r.rolname`, pgUser)
 		if err := rows.Scan(&name); err != nil {
 			t.Fatalf("scan: %v", err)
 		}
-		if strings.HasPrefix(name, "wp_grp_") {
+		if strings.HasPrefix(name, groupPrefix) {
 			out = append(out, name)
 		}
 	}
@@ -670,8 +673,9 @@ func TestIntegration_EnsureUser_GroupMembershipsForPureReadonly(t *testing.T) {
 			}
 			t.Cleanup(func() { cleanupRoleFor(t, db, pgUser) })
 
-			got := memberOfPresetGroups(t, db, pgUser)
-			if len(got) != 1 || got[0] != "wp_grp_readonly_public_waypoint_test" {
+			got := memberOfPresetGroups(t, db, pgUser, p.groupPrefix())
+			want := p.presetGroupName("readonly", "public", "waypoint_test")
+			if len(got) != 1 || got[0] != want {
 				t.Fatalf("expected single membership wp_grp_readonly_public_waypoint_test, got %v", got)
 			}
 		})
@@ -691,7 +695,7 @@ func TestIntegration_EnsureUser_GroupMembershipsAreStableAcrossReconnects(t *tes
 			}
 			t.Cleanup(func() { cleanupRoleFor(t, db, pgUser) })
 
-			before := memberOfPresetGroups(t, db, pgUser)
+			before := memberOfPresetGroups(t, db, pgUser, p.groupPrefix())
 
 			// Second EnsureUser with identical perms should be a no-op for
 			// membership state — the steady-state path that needs to be cheap.
@@ -699,7 +703,7 @@ func TestIntegration_EnsureUser_GroupMembershipsAreStableAcrossReconnects(t *tes
 				t.Fatalf("second EnsureUser: %v", err)
 			}
 
-			after := memberOfPresetGroups(t, db, pgUser)
+			after := memberOfPresetGroups(t, db, pgUser, p.groupPrefix())
 			if len(before) != len(after) {
 				t.Fatalf("membership count changed: before=%v after=%v", before, after)
 			}
@@ -725,8 +729,9 @@ func TestIntegration_EnsureUser_GroupMembershipsTrackPresetChange(t *testing.T) 
 			}
 			t.Cleanup(func() { cleanupRoleFor(t, db, pgUser) })
 
-			before := memberOfPresetGroups(t, db, pgUser)
-			if len(before) != 1 || before[0] != "wp_grp_readwrite_public_waypoint_test" {
+			before := memberOfPresetGroups(t, db, pgUser, p.groupPrefix())
+			wantBefore := p.presetGroupName("readwrite", "public", "waypoint_test")
+			if len(before) != 1 || before[0] != wantBefore {
 				t.Fatalf("expected wp_grp_readwrite_public_waypoint_test, got %v", before)
 			}
 
@@ -735,8 +740,9 @@ func TestIntegration_EnsureUser_GroupMembershipsTrackPresetChange(t *testing.T) 
 				t.Fatal(err)
 			}
 
-			after := memberOfPresetGroups(t, db, pgUser)
-			if len(after) != 1 || after[0] != "wp_grp_readonly_public_waypoint_test" {
+			after := memberOfPresetGroups(t, db, pgUser, p.groupPrefix())
+			wantAfter := p.presetGroupName("readonly", "public", "waypoint_test")
+			if len(after) != 1 || after[0] != wantAfter {
 				t.Fatalf("expected single readonly membership, got %v", after)
 			}
 		})
@@ -767,11 +773,11 @@ func TestIntegration_EnsureUser_SQLFragmentUsesCompositeGroup(t *testing.T) {
 			}
 			t.Cleanup(func() { cleanupRoleFor(t, db, pgUser) })
 
-			groups := memberOfPresetGroups(t, db, pgUser)
+			groups := memberOfPresetGroups(t, db, pgUser, p.groupPrefix())
 			if len(groups) != 1 {
 				t.Fatalf("expected exactly 1 group membership, got %v", groups)
 			}
-			if !strings.HasPrefix(groups[0], "wp_grp_perms_") {
+			if !strings.HasPrefix(groups[0], p.groupPrefix()+"perms_") {
 				t.Fatalf("expected composite group prefix, got %q", groups[0])
 			}
 		})
@@ -800,8 +806,8 @@ func TestIntegration_EnsureUser_SwitchPurePresetToComposite(t *testing.T) {
 			}
 			t.Cleanup(func() { cleanupRoleFor(t, db, pgUser) })
 
-			before := memberOfPresetGroups(t, db, pgUser)
-			if len(before) != 1 || !strings.HasPrefix(before[0], "wp_grp_readonly_") {
+			before := memberOfPresetGroups(t, db, pgUser, p.groupPrefix())
+			if len(before) != 1 || !strings.HasPrefix(before[0], p.groupPrefix()+"readonly_") {
 				t.Fatalf("expected initial readonly group, got %v", before)
 			}
 
@@ -813,8 +819,8 @@ func TestIntegration_EnsureUser_SwitchPurePresetToComposite(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			after := memberOfPresetGroups(t, db, pgUser)
-			if len(after) != 1 || !strings.HasPrefix(after[0], "wp_grp_perms_") {
+			after := memberOfPresetGroups(t, db, pgUser, p.groupPrefix())
+			if len(after) != 1 || !strings.HasPrefix(after[0], p.groupPrefix()+"perms_") {
 				t.Fatalf("expected composite group after switch, got %v", after)
 			}
 		})
@@ -950,10 +956,10 @@ func TestIntegration_EnsureUser_MultiSchemaGroupMemberships(t *testing.T) {
 			}
 			t.Cleanup(func() { cleanupRoleFor(t, db, pgUser) })
 
-			groups := memberOfPresetGroups(t, db, pgUser)
+			groups := memberOfPresetGroups(t, db, pgUser, p.groupPrefix())
 			want := map[string]bool{
-				"wp_grp_readonly_public_waypoint_test":      true,
-				"wp_grp_readonly_multi_audit_waypoint_test": true,
+				p.presetGroupName("readonly", "public", "waypoint_test"):      true,
+				p.presetGroupName("readonly", "multi_audit", "waypoint_test"): true,
 			}
 			if len(groups) != len(want) {
 				t.Fatalf("expected %d memberships, got %v", len(want), groups)
@@ -1008,6 +1014,9 @@ func TestIntegrationEnsureUser_GrantsLandInTheTargetDatabase(t *testing.T) {
 		}
 		defer c.Close(context.Background())
 		_, _ = c.Exec(context.Background(), "DROP DATABASE IF EXISTS "+otherDB+" WITH (FORCE)")
+		// Leaving this behind makes any later test that grants on ALL TABLES
+		// IN SCHEMA public depend on the order tests happen to run in.
+		_, _ = c.Exec(context.Background(), "DROP TABLE IF EXISTS in_admin_db")
 	})
 
 	otherConnStr := strings.Replace(connStr, "/waypoint_test", "/"+otherDB, 1)
@@ -1170,5 +1179,112 @@ func TestIntegrationConnectToTarget_ExistingDatabaseIsReached(t *testing.T) {
 				t.Errorf("connected to %q, want waypoint_test", current)
 			}
 		})
+	}
+}
+
+// TestIntegrationTwoAdmins_ShareABackendWithoutColliding is the regression
+// test for group roles being shared across listeners.
+//
+// A group role is owned by the admin that created it, and Postgres 16 grants
+// ADMIN OPTION only to that creator. Group names used to be
+// wp_grp_<preset>_<schema>_<database> — no listener, and not even the
+// user_prefix — so two listeners over one backend derived the same group and
+// the second admin could not grant it:
+//
+//	permission denied to grant role "wp_grp_readonly_public_waypoint_test"
+func TestIntegrationTwoAdmins_ShareABackendWithoutColliding(t *testing.T) {
+	ctx := context.Background()
+	connStr, backend := testutil.PostgresBackend(t)
+
+	su, err := pgx.Connect(ctx, connStr)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer su.Close(ctx)
+
+	for _, stmt := range []string{
+		`DROP SCHEMA IF EXISTS two_admin CASCADE`,
+		`CREATE SCHEMA two_admin`,
+		`CREATE TABLE two_admin.tbl (id int)`,
+		`DROP ROLE IF EXISTS wp_admin_a`,
+		`DROP ROLE IF EXISTS wp_admin_b`,
+		// Deliberately non-superuser: a superuser bypasses ADMIN OPTION and
+		// would not exercise the collision at all.
+		`CREATE ROLE wp_admin_a LOGIN PASSWORD 'p' CREATEROLE`,
+		`CREATE ROLE wp_admin_b LOGIN PASSWORD 'p' CREATEROLE`,
+		`GRANT SELECT ON two_admin.tbl TO wp_admin_a WITH GRANT OPTION`,
+		`GRANT SELECT ON two_admin.tbl TO wp_admin_b WITH GRANT OPTION`,
+		`GRANT USAGE ON SCHEMA two_admin TO wp_admin_a WITH GRANT OPTION`,
+		`GRANT USAGE ON SCHEMA two_admin TO wp_admin_b WITH GRANT OPTION`,
+	} {
+		if _, err := su.Exec(ctx, stmt); err != nil {
+			t.Fatalf("setup %q: %v", stmt, err)
+		}
+	}
+	t.Cleanup(func() {
+		c, err := pgx.Connect(context.Background(), connStr)
+		if err != nil {
+			return
+		}
+		defer c.Close(context.Background())
+		_, _ = c.Exec(context.Background(), "DROP SCHEMA IF EXISTS two_admin CASCADE")
+		for _, r := range []string{"wp_admin_a", "wp_admin_b"} {
+			_, _ = c.Exec(context.Background(), "REASSIGN OWNED BY "+r+" TO admin")
+			_, _ = c.Exec(context.Background(), "DROP OWNED BY "+r)
+			_, _ = c.Exec(context.Background(), "DROP ROLE IF EXISTS "+r)
+		}
+	})
+
+	newProvisioner := func(adminUser, listener string) *Provisioner {
+		rdb := testutil.RedisClient(t)
+		store := restrict.NewRedisStore(rdb, "twoadmin:"+listener+":", metrics.Noop())
+		logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+		return NewProvisioner(adminUser, "p", "waypoint_test", backend, listener, "wp_ta_",
+			false, true, "test", store, logger, nil, nil)
+	}
+
+	// A schema of its own, so the grants here cover only this test's table
+	// and the result does not depend on what other tests left in public.
+	perms := &auth.DBPermissions{Permissions: []string{"readonly"}, Schemas: []string{"two_admin"}}
+
+	roleA, _, err := newProvisioner("wp_admin_a", "listener-a").
+		EnsureUser(ctx, "user@example.com", "laptop", "waypoint_test", perms)
+	if err != nil {
+		t.Fatalf("listener A provisioning: %v", err)
+	}
+
+	// The second listener, with a different admin, must not trip over the
+	// first one's group.
+	roleB, _, err := newProvisioner("wp_admin_b", "listener-b").
+		EnsureUser(ctx, "user@example.com", "laptop", "waypoint_test", perms)
+	if err != nil {
+		t.Fatalf("listener B provisioning failed against a shared backend: %v", err)
+	}
+
+	if roleA == roleB {
+		t.Fatalf("both listeners provisioned the role %q", roleA)
+	}
+
+	// Each listener's groups are its own, and each user really does hold the
+	// privilege its grant describes.
+	for _, role := range []string{roleA, roleB} {
+		var canRead bool
+		if err := su.QueryRow(ctx,
+			"SELECT has_table_privilege($1, 'two_admin.tbl', 'SELECT')", role).Scan(&canRead); err != nil {
+			t.Fatalf("privilege check for %s: %v", role, err)
+		}
+		if !canRead {
+			t.Errorf("role %q did not receive the readonly grant", role)
+		}
+	}
+
+	// And the group roles themselves are distinct, each owned by its own admin.
+	var groupCount int
+	if err := su.QueryRow(ctx,
+		`SELECT count(*) FROM pg_roles WHERE rolname LIKE 'wp_ta_grp_%'`).Scan(&groupCount); err != nil {
+		t.Fatalf("count groups: %v", err)
+	}
+	if groupCount < 2 {
+		t.Errorf("expected a group per listener, found %d", groupCount)
 	}
 }

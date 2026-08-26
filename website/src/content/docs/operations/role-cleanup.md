@@ -63,7 +63,21 @@ sit on one backend with different access and no interference — and it makes a
 role in `pg_stat_activity` attributable to the listener that created it. The
 listener leads the name rather than trailing it so that it survives truncation.
 
-MongoDB users are named the same way, minus the database component.
+Group roles — the shared roles the presets grant through — follow the same
+scheme:
+
+```
+<user_prefix>grp_<listener>_<preset>_<schema>_<database>
+```
+
+They carry the prefix and listener for the same reason. A group role is owned
+by the admin that created it, and Postgres 16 grants `ADMIN OPTION` only to
+that creator, so two listeners over one backend that shared a group name would
+break: the second listener's admin could not grant a group the first one made,
+failing with `permission denied to grant role`. Scoping the name means each
+provisioner owns its own groups.
+
+MongoDB users are named the same way as roles, minus the database component.
 
 :::caution[Upgrading orphans existing roles]
 Releases before this change named roles without the listener component, and

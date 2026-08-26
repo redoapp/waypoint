@@ -23,6 +23,11 @@ A superuser satisfies all of this and is the simplest option for a backend
 Waypoint fully manages. For a shared cluster, a non-superuser with
 `CREATEROLE` works provided it can connect to each target database.
 
+Listeners may each use their own admin credentials — `[listeners.postgres]` is
+per-listener — including different admins against the same backend. Role and
+group names carry the listener, so two listeners never contend over the same
+roles.
+
 :::caution[CONNECT on each target database]
 Databases grant `CONNECT` to `PUBLIC` by default, so this is usually already
 true. If your deployment revokes that, grant it explicitly:
