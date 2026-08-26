@@ -1,0 +1,163 @@
+---
+title: Query Logging
+description: Per-statement audit logging for Postgres and MongoDB listeners, with per-listener and per-ACL verbosity.
+sidebar:
+  order: 4
+---
+
+import TestRef from '../../../components/TestRef.astro';
+
+Waypoint already records *who* connected and *how many bytes* they moved. Query logging adds the other half: *what they ran*. Each statement produces a structured log record naming the user, the tables it touched, how many rows came back, and how long it took.
+
+It is off by default and enabled per listener.
+
+```toml
+[[listeners]]
+name = "pg-prod"
+mode = "postgres"
+
+[listeners.query_log]
+level = "metadata"
+```
+
+Records are ordinary `slog` output on the process log stream, so they land wherever your logs already go. Every record carries `component=querylog` for filtering, and the `trace_id` of the connection that produced it.
+
+```json
+{
+  "time": "2026-08-19T14:02:11Z",
+  "level": "INFO",
+  "msg": "query",
+  "component": "querylog",
+  "conn_id": "9f3c1a77b2e04d18",
+  "listener": "pg-prod",
+  "user": "alice@example.com",
+  "mode": "postgres",
+  "database": "app",
+  "op": "SELECT",
+  "kind": "dml_read",
+  "tables": ["orders", "users"],
+  "fingerprint": "ec6c4badc0395fed",
+  "statement": "SELECT o.* FROM orders AS o JOIN users AS u ON u.id = o.user_id WHERE o.id = _",
+  "rows": 3,
+  "resp_bytes": 412,
+  "duration_ms": 2.5,
+  "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736"
+}
+```
+
+Only `postgres` and `mongodb` listeners support it. TCP mode is an opaque L4 relay with no protocol to parse, and a `query_log` block on a TCP listener is rejected at config load rather than silently ignored. <TestRef name="TestLoad_QueryLogRejectedOnTCPMode" />
+
+## Levels
+
+| Level | What is logged |
+| --- | --- |
+| `off` | Nothing. No tap is installed. This is the default. |
+| `metadata` | Statement shape only — verb, kind, tables, fingerprint, row count, duration. No statement text. |
+| `normalized` | The above plus the statement with its constants elided. |
+| `full` | The above plus the verbatim statement and its bind parameter values. |
+
+<TestRef name="TestEmitter_LevelControlsStatementText" />
+
+At `normalized`, `SELECT * FROM orders WHERE id = 42` is logged as `SELECT * FROM orders WHERE id = _`. The shape is preserved so you can group and count statements; the value is not, so row data stays out of the log. Bind parameters appear only at `full`. <TestRef name="TestPGTap_ParamsOnlyAtFullLevel" />
+
+## Statement metadata
+
+Postgres statements are parsed into an AST, so the metadata reflects the real structure of the query rather than a guess from pattern matching:
+
+- **`op`** — the statement tag: `SELECT`, `INSERT`, `CREATE TABLE`.
+- **`kind`** — `dml_read`, `dml_write`, `ddl`, `dcl`, `tcl`, or `utility`. This is what lets you alert on "anyone ran DDL in production" without reading statement text. <TestRef name="TestAnalyze_VerbAndKind" />
+- **`tables`** — every relation the statement references, including ones inside subqueries and CTE bodies. CTE aliases are excluded, since they are not real relations. <TestRef name="TestAnalyze_Tables" />
+- **`write_target`** — the relation an `INSERT`/`UPDATE`/`DELETE`/`TRUNCATE` mutates.
+- **`fingerprint`** — a stable hash of the normalized statement. Identical shapes share a fingerprint across connections and instances regardless of their literals, which is what makes "top statements by user" a group-by rather than a text search. <TestRef name="TestAnalyze_FingerprintStableAcrossLiterals" />
+
+Table names are logged **as written**. An unqualified `orders` is logged as `orders`, not `public.orders` — waypoint does not know the session's `search_path`, so qualifying it would be a guess presented as a fact.
+
+MongoDB commands get the equivalent treatment: `op` is the command name, `collection` is its target, and at `normalized` the command document is logged with its values replaced by type placeholders (`?string`, `?int`) while keys are kept. <TestRef name="TestMongoTap_ShapeHidesValues" />
+
+## Response metadata
+
+Each record is emitted when the backend responds, so it carries the outcome as well as the request:
+
+- **`rows`** — for Postgres, taken from the `CommandComplete` tag, which is authoritative for writes where counting returned rows would report zero. <TestRef name="TestPGTap_RowCountFromCommandTag" /> For MongoDB, the size of `cursor.firstBatch`/`nextBatch`, or `n`/`nModified` for writes.
+- **`resp_bytes`** — bytes the backend sent in response.
+- **`duration_ms`** — time from the statement reaching the proxy to its response completing.
+- **`error`** — the backend's error, when there was one. A rejected statement is still logged. <TestRef name="TestPGTap_ErrorResponseIsAttributed" />
+
+## Per-ACL levels
+
+The listener config sets the default and the **ceiling**. A capability grant can move a user within that range:
+
+```toml
+[listeners.query_log]
+level     = "metadata"   # applies when no grant says otherwise
+max_level = "full"       # the most a grant may ask for
+```
+
+```json
+{
+  "logging": { "queries": "metadata" },
+  "backends": {
+    "pg-prod": {
+      "pg": { "databases": { "app": { "permissions": ["readonly"] } } },
+      "logging": { "queries": "full" }
+    }
+  }
+}
+```
+
+A backend-scoped `logging` block overrides the top-level one, the same way endpoint limits override global limits. When several grants match, the **most verbose** level wins — adding a grant must never be able to quiet the record of what a user did. <TestRef name="TestMergeRules_QueryLogMostVerboseWins" />
+
+The listener ceiling is absolute. A grant asking for `full` against a listener capped at `normalized` gets `normalized`. <TestRef name="TestIntegration_Proxy_QueryLogCeilingClampsACL" /> This split is deliberate: the operator who runs the proxy owns the upper bound on how much data can reach the logs, and the tailnet admin decides where each user sits beneath it.
+
+If `max_level` is omitted it equals `level`, so turning query logging on never implicitly grants the ability to escalate past what you asked for. <TestRef name="TestLoad_QueryLogMaxLevelDefaultsToLevel" />
+
+## Unparseable statements are logged in full
+
+When the parser rejects a statement, the record carries `parse_error: true` and **the raw statement text — at every level, including `metadata`**.
+
+This is a deliberate trade. A statement waypoint could not understand is the one most worth seeing, both to audit what ran and to find the parser gap that hid it; dropping it would leave a hole in the audit trail exactly where something unusual happened. The consequence is worth stating plainly:
+
+:::caution
+**No level except `off` is a hard guarantee that literals stay out of your logs.** At `metadata` and `normalized`, a statement that fails to parse is logged verbatim, constants included.
+:::
+
+Watch `waypoint.querylog.parse_errors` to see how often this happens. Waypoint parses with the CockroachDB grammar — the same parser it already uses to validate ACL-supplied SQL — which covers PostgreSQL and CockroachDB but is not byte-identical to PostgreSQL's own.
+
+Against a 45-statement sample of real-world PostgreSQL syntax, **5 fail to parse (about 11%)**. <TestRef name="TestAnalyze_ParseFailureRateStaysBounded" /> The known gaps are `TABLESAMPLE`, `EXPLAIN` with a parenthesized option list, `GROUPING SETS`, `LISTEN`, and `VACUUM`. <TestRef name="TestAnalyze_KnownUnsupportedDegradesGracefully" /> Common syntax parses fine — upserts, `RETURNING`, `DISTINCT ON`, `jsonb` operators, window functions, `LATERAL`, recursive CTEs, and array operators are all covered. <TestRef name="TestAnalyze_PostgresCorpusParses" />
+
+That sample is not your traffic, so treat 11% as a shape rather than a prediction, and measure the counter against your own workload. Note that the statements in the known-gap list are mostly DDL and utility commands that carry few literals — but `TABLESAMPLE` is a `SELECT`, so the exposure is not zero.
+
+## Cost and back-pressure
+
+Query logging is designed so it cannot slow down or stall a connection:
+
+- **Nothing is parsed on the relay path.** The taps capture the statement and timestamps; a background goroutine does the AST work and formatting. Analysis is memoized, so repeated statements and re-executed prepared statements cost a map lookup.
+- **The queue is bounded and never blocks.** If the log consumer falls behind, records are dropped and counted rather than backing up into the data path. A drop summary is logged at shutdown.
+- **Large messages are never buffered.** A message over 1 MiB — a `COPY` payload, a bulk insert — streams straight through and is noted rather than decoded.
+- **Statement text is truncated** to `max_statement_bytes` (default 4096), and truncated records are marked `truncated: true`.
+
+The taps are byte-transparent: they hand on exactly the bytes they received. This matters beyond correctness, because the same byte stream feeds the accounting that enforces per-user bandwidth limits. <TestRef name="TestPGTap_BytesPassThroughUnchanged" /> <TestRef name="TestIntegration_Proxy_QueryLogPreservesByteAccounting" />
+
+With `level = "off"` no tap is constructed at all, so the relay path is identical to a build without the feature. <TestRef name="TestIntegration_Proxy_QueryLogOffEmitsNothing" />
+
+## Metrics
+
+Three opt-in counters, tagged by listener:
+
+```toml
+[metrics.enable]
+"waypoint.querylog.emitted" = ["listener"]
+"waypoint.querylog.dropped" = ["listener"]
+"waypoint.querylog.parse_errors" = ["listener"]
+```
+
+`parse_errors` is the one to alert on — it tells you both that metadata quality has degraded and that more raw statement text is reaching your logs than the configured level implies.
+
+## Full options
+
+```toml
+[listeners.query_log]
+level               = "metadata"   # off | metadata | normalized | full  (default: off)
+max_level           = "full"       # ceiling for ACL grants (default: same as level)
+max_statement_bytes = 4096         # statement truncation limit (default: 4096)
+```

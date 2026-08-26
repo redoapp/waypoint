@@ -19,6 +19,7 @@ Waypoint reads a single TOML file (default: `waypoint.toml`, override with `-con
 [metrics.enable] # opt-in per metric name + tag allow-list
 
 [[listeners]]    # one block per port
+[listeners.query_log]  # optional: per-statement audit logging
 ```
 
 ## Environment variable interpolation
@@ -43,3 +44,4 @@ See [`examples/waypoint.toml`](https://github.com/redoapp/waypoint/blob/main/exa
 - [TLS](/waypoint/configuration/tls/) — `tls_mode`, Tailscale-managed certs, custom certs.
 - [Revalidation](/waypoint/configuration/revalidation/) — mid-session re-checks.
 - [Provisioning](/waypoint/configuration/provisioning/) — `allow_raw_sql`, default limits.
+- [Query Logging](/waypoint/observability/query-logging/) — per-statement audit logging, levels, and ACL overrides.

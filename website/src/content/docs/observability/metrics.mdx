@@ -58,6 +58,11 @@ Unknown tag names in the allow-list are flagged at load time. <TestRef name="Tes
 | `waypoint.redis.op_duration` | histogram | `operation` |
 | `waypoint.redis.errors` | counter | `operation` |
 | `waypoint.system.listeners` | gauge | — |
+| `waypoint.querylog.emitted` | counter | `listener` |
+| `waypoint.querylog.dropped` | counter | `listener` |
+| `waypoint.querylog.parse_errors` | counter | `listener` |
+
+The `waypoint.querylog.*` counters only move on listeners with [query logging](/waypoint/observability/query-logging/) enabled. `parse_errors` is worth an alert rather than just a dashboard: a statement the parser rejects is logged with its raw text, so a rising rate means both weaker statement metadata and more literal content reaching your logs than the configured level implies.
 
 ## Temporality
 

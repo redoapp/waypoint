@@ -9,14 +9,28 @@ const WaypointCap = "redo.com/cap/waypoint"
 // Each backend entry in Backends carries its own PG and Limits (per-endpoint).
 type CapRule struct {
 	Limits   *LimitsCap            `json:"limits,omitempty"`
+	Logging  *LoggingCap           `json:"logging,omitempty"`
 	Backends map[string]BackendCap `json:"backends"`
 }
 
 // BackendCap holds per-backend capabilities and limits.
 type BackendCap struct {
-	PG     *PGCap     `json:"pg,omitempty"`
-	Mongo  *MongoCap  `json:"mongo,omitempty"`
-	Limits *LimitsCap `json:"limits,omitempty"`
+	PG      *PGCap      `json:"pg,omitempty"`
+	Mongo   *MongoCap   `json:"mongo,omitempty"`
+	Limits  *LimitsCap  `json:"limits,omitempty"`
+	Logging *LoggingCap `json:"logging,omitempty"`
+}
+
+// LoggingCap lets an ACL grant choose how much query detail is logged for the
+// users it covers. A backend-scoped LoggingCap overrides the top-level one,
+// the same way endpoint limits override global limits.
+//
+// The listener's query_log.max_level caps whatever a grant asks for, so a
+// grant can move a user within the range the operator allowed but cannot
+// escalate past it.
+type LoggingCap struct {
+	// Queries is one of "off", "metadata", "normalized", or "full".
+	Queries string `json:"queries,omitempty"`
 }
 
 // PGCap holds postgres-specific capabilities.
