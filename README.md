@@ -10,9 +10,21 @@ Waypoint is a Tailscale-aware database proxy that authenticates connections usin
 - **Postgres mode** — intercepts the PG wire protocol, dynamically provisions per-user database roles with scoped `GRANT` permissions, and cleans up expired users
 - **MongoDB mode** — provisions scoped MongoDB users or uses static backend users, and rewrites replica-set topology so clients stay on the proxy, including TLS-terminated clients
 - **TCP mode** — transparent L4 proxy for any TCP backend (MySQL, Redis, etc.)
+- **Web console** — a browser SQL console on the tailnet with no login: schema-aware completion, foreign-key join assistance, permission warnings before you run, and nothing preserved between visits
 - **Connection tracking** — per-user limits on concurrent connections, bytes transferred, connection duration, and bandwidth budgets, all stored in Redis/Valkey
 - **Mid-session revalidation** — periodically re-checks Tailscale identity during long-lived connections
 - **Graceful shutdown** — drains active connections on `SIGINT`/`SIGTERM`
+
+## Try the web console
+
+No tailnet required — the demo runs a mock Tailscale control plane and a seeded
+throwaway Postgres:
+
+```sh
+console-demo                    # or: bash scripts/console-demo.sh
+console-demo -preset readonly   # see the permission warnings
+console-demo --stop             # remove the containers
+```
 
 ## Configuration
 
@@ -276,6 +288,53 @@ tracing_sample_rate = 1.0                # 0 = disabled, 1.0 = trace all request
 - Connection close (final byte counts, duration)
 
 Long-lived connections use linked spans rather than holding a single span open — the setup span ends once the relay begins, and revalidation/close events link back for correlation.
+
+## Query Logging
+
+Postgres and MongoDB listeners can log every statement they proxy. It is off by default and enabled per listener:
+
+```toml
+[listeners.query_log]
+level     = "metadata"   # off (default) | metadata | normalized | full
+max_level = "full"       # ceiling an ACL grant may raise to (default: same as level)
+```
+
+Records are structured `slog` output tagged `component=querylog`, carrying the connection's `trace_id`:
+
+```json
+{
+  "msg": "query", "component": "querylog",
+  "user": "alice@example.com", "database": "app",
+  "op": "SELECT", "kind": "dml_read", "tables": ["orders", "users"],
+  "fingerprint": "ec6c4badc0395fed",
+  "statement": "SELECT o.* FROM orders AS o JOIN users AS u ON u.id = o.user_id WHERE o.id = _",
+  "rows": 3, "duration_ms": 2.5
+}
+```
+
+The levels are:
+
+| Level | Logged |
+|---|---|
+| `off` | Nothing; no tap is installed |
+| `metadata` | Verb, kind, tables, fingerprint, rows, duration — no statement text |
+| `normalized` | The above plus the statement with constants elided |
+| `full` | The above plus the verbatim statement and bind parameters |
+
+Postgres statements are parsed into an AST (reusing the CockroachDB parser already vendored for ACL SQL validation), so `tables` covers subqueries and CTE bodies, and `fingerprint` groups identical statement shapes regardless of their literals.
+
+A capability grant can set a per-user level with a `logging` block, bounded by the listener's `max_level`:
+
+```json
+{ "backends": { "pg-prod": { "logging": { "queries": "full" } } } }
+```
+
+Two caveats worth knowing before you enable it:
+
+- **A statement the parser rejects is logged verbatim at every level, including `metadata`.** Losing the text of statements waypoint could not understand would leave a hole in the audit trail exactly where something unusual happened. The trade-off is that only `off` guarantees literals stay out of the logs. Against a 45-statement sample of real PostgreSQL syntax, about 11% fail to parse (`TABLESAMPLE`, parenthesized `EXPLAIN`, `GROUPING SETS`, `LISTEN`, `VACUUM`); measure `waypoint.querylog.parse_errors` against your own traffic.
+- **Logging never blocks the relay.** Parsing happens on a background goroutine, the queue is bounded, and records are dropped and counted rather than backing up into the data path.
+
+See the [query logging docs](https://redoapp.github.io/waypoint/observability/query-logging/) for the full reference.
 
 ## Usage
 

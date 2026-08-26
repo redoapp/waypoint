@@ -181,3 +181,22 @@ func TestExpandMongoPresets_CaseInsensitive(t *testing.T) {
 		t.Errorf("unexpected: %+v", roles)
 	}
 }
+
+func TestMongoFormatUsername_IncludesListener(t *testing.T) {
+	p := &MongoProvisioner{userPrefix: "wp_", listener: "mongo-main"}
+	got := p.formatUsername("alice@example.com", "alice-laptop")
+
+	if want := "wp_mongo_main_alice_example_com_alice_laptop"; got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestMongoFormatUsername_ListenersGetDistinctUsers(t *testing.T) {
+	a := (&MongoProvisioner{userPrefix: "wp_", listener: "mongo-a"}).
+		formatUsername("alice@example.com", "laptop")
+	b := (&MongoProvisioner{userPrefix: "wp_", listener: "mongo-b"}).
+		formatUsername("alice@example.com", "laptop")
+	if a == b {
+		t.Fatalf("both listeners resolved to %q", a)
+	}
+}

@@ -59,22 +59,24 @@ type DefaultLimitsConfig struct {
 }
 
 type ListenerConfig struct {
-	Name                string         `toml:"name"`
-	Listen              string         `toml:"listen"`
-	Mode                string         `toml:"mode"`
-	Backend             string         `toml:"backend"`
-	Advertise           string         `toml:"advertise"`
-	BackendViaTailscale bool           `toml:"backend_via_tailscale"`
-	BackendTLS          bool           `toml:"tls"`
-	PostgresTLSMode     string         `toml:"tls_mode"`
-	UseTailscaleTLS     *bool          `toml:"use_tailscale_tls"`
-	CertFile            string         `toml:"cert_file"`
-	KeyFile             string         `toml:"key_file"`
-	Service             string         `toml:"service"`
-	Postgres            *PostgresAdmin `toml:"postgres"`
-	MongoDB             *MongoDBAdmin  `toml:"mongodb"`
-	PortMap             map[int]int    `toml:"-"`
-	RawPortMap          map[string]int `toml:"port_map,omitempty"`
+	Name                string          `toml:"name"`
+	Listen              string          `toml:"listen"`
+	Mode                string          `toml:"mode"`
+	Backend             string          `toml:"backend"`
+	Advertise           string          `toml:"advertise"`
+	BackendViaTailscale bool            `toml:"backend_via_tailscale"`
+	BackendTLS          bool            `toml:"tls"`
+	PostgresTLSMode     string          `toml:"tls_mode"`
+	UseTailscaleTLS     *bool           `toml:"use_tailscale_tls"`
+	CertFile            string          `toml:"cert_file"`
+	KeyFile             string          `toml:"key_file"`
+	Service             string          `toml:"service"`
+	Postgres            *PostgresAdmin  `toml:"postgres"`
+	MongoDB             *MongoDBAdmin   `toml:"mongodb"`
+	QueryLog            *QueryLogConfig `toml:"query_log"`
+	Web                 *WebConfig      `toml:"web"`
+	PortMap             map[int]int     `toml:"-"`
+	RawPortMap          map[string]int  `toml:"port_map,omitempty"`
 }
 
 type TLSMode string
@@ -110,6 +112,174 @@ func (l ListenerConfig) EffectivePostgresTLSMode() PostgresTLSMode {
 
 func (l ListenerConfig) EffectiveUseTailscaleTLS() bool {
 	return l.UseTailscaleTLS == nil || *l.UseTailscaleTLS
+}
+
+// EffectiveWebTLSMode resolves TLS for a web console listener.
+//
+// The shared default of "optional" is a Postgres wire-protocol concept: the
+// client asks and the server may decline. HTTP has no such negotiation, so a
+// web listener is either TLS or it is not. Unset means "require", because a
+// database console defaulting to plaintext would be the wrong way round;
+// "optional" is rejected at load rather than being quietly read as one of the
+// two real answers.
+func (l ListenerConfig) EffectiveWebTLSMode() TLSMode {
+	if strings.TrimSpace(l.PostgresTLSMode) == "" {
+		return TLSRequire
+	}
+	return l.EffectiveTLSMode()
+}
+
+// QueryLogConfig controls per-statement logging for a listener.
+//
+// Level is what applies when an ACL grant says nothing. MaxLevel is the
+// ceiling a grant may raise verbosity to: the operator owns the upper bound on
+// how much statement content can reach the logs, while the tailnet admin
+// decides where within that bound a given user sits. This mirrors how
+// AllowRawSQLResolved lets the operator gate what ACL grants are permitted to
+// ask for.
+type QueryLogConfig struct {
+	Level             string `toml:"level"`
+	MaxLevel          string `toml:"max_level"`
+	MaxStatementBytes int    `toml:"max_statement_bytes"`
+}
+
+// Query log levels, in increasing order of verbosity.
+const (
+	QueryLogOff        = "off"
+	QueryLogMetadata   = "metadata"
+	QueryLogNormalized = "normalized"
+	QueryLogFull       = "full"
+)
+
+// DefaultMaxStatementBytes caps logged statement text when unset.
+const DefaultMaxStatementBytes = 4096
+
+// EffectiveLevel returns the configured default level, "off" when unset.
+func (q *QueryLogConfig) EffectiveLevel() string {
+	if q == nil || strings.TrimSpace(q.Level) == "" {
+		return QueryLogOff
+	}
+	return strings.ToLower(strings.TrimSpace(q.Level))
+}
+
+// EffectiveMaxLevel returns the ceiling an ACL grant may raise to. When unset
+// it equals the configured level, so enabling query logging never implicitly
+// hands grants the ability to escalate past what the operator asked for.
+func (q *QueryLogConfig) EffectiveMaxLevel() string {
+	if q == nil || strings.TrimSpace(q.MaxLevel) == "" {
+		return q.EffectiveLevel()
+	}
+	return strings.ToLower(strings.TrimSpace(q.MaxLevel))
+}
+
+// EffectiveMaxStatementBytes returns the statement truncation limit.
+func (q *QueryLogConfig) EffectiveMaxStatementBytes() int {
+	if q == nil || q.MaxStatementBytes <= 0 {
+		return DefaultMaxStatementBytes
+	}
+	return q.MaxStatementBytes
+}
+
+// queryLogRank orders the levels so max_level can be compared against level.
+// It returns -1 for an unrecognized name.
+func queryLogRank(level string) int {
+	switch level {
+	case QueryLogOff:
+		return 0
+	case QueryLogMetadata:
+		return 1
+	case QueryLogNormalized:
+		return 2
+	case QueryLogFull:
+		return 3
+	default:
+		return -1
+	}
+}
+
+// WebConfig configures a browser-facing SQL console listener (mode = "web").
+// The console reuses the listener's [listeners.postgres] admin credentials to
+// provision per-user roles, exactly as the wire-protocol postgres mode does.
+type WebConfig struct {
+	// Databases lists the databases offered in the console's picker. The
+	// first entry is the default. Capability grants still decide what the
+	// user may actually reach; this only bounds the menu.
+	Databases []string `toml:"databases"`
+
+	// MaxRows caps rows returned to the browser for a single statement.
+	MaxRows int `toml:"max_rows"`
+
+	// StatementTimeout bounds a single statement server-side.
+	StatementTimeout string `toml:"statement_timeout"`
+
+	// MaxPoolConns caps pooled connections per (user, database).
+	MaxPoolConns int `toml:"max_pool_conns"`
+
+	// IdlePoolTimeout is how long an unused per-user pool is kept before
+	// it is closed. Pools are a cache, never session state.
+	IdlePoolTimeout string `toml:"idle_pool_timeout"`
+}
+
+// Web console defaults, applied when the config leaves a field at zero.
+const (
+	DefaultWebMaxRows          = 1000
+	DefaultWebStatementTimeout = 30 * time.Second
+	DefaultWebMaxPoolConns     = 4
+	DefaultWebIdlePoolTimeout  = 10 * time.Minute
+)
+
+func (w *WebConfig) EffectiveMaxRows() int {
+	if w == nil || w.MaxRows <= 0 {
+		return DefaultWebMaxRows
+	}
+	return w.MaxRows
+}
+
+func (w *WebConfig) EffectiveStatementTimeout() time.Duration {
+	if w == nil || strings.TrimSpace(w.StatementTimeout) == "" {
+		return DefaultWebStatementTimeout
+	}
+	d, err := time.ParseDuration(w.StatementTimeout)
+	if err != nil || d <= 0 {
+		return DefaultWebStatementTimeout
+	}
+	return d
+}
+
+func (w *WebConfig) EffectiveMaxPoolConns() int32 {
+	if w == nil || w.MaxPoolConns <= 0 {
+		return DefaultWebMaxPoolConns
+	}
+	return int32(w.MaxPoolConns)
+}
+
+func (w *WebConfig) EffectiveIdlePoolTimeout() time.Duration {
+	if w == nil || strings.TrimSpace(w.IdlePoolTimeout) == "" {
+		return DefaultWebIdlePoolTimeout
+	}
+	d, err := time.ParseDuration(w.IdlePoolTimeout)
+	if err != nil || d <= 0 {
+		return DefaultWebIdlePoolTimeout
+	}
+	return d
+}
+
+// EffectiveDatabases returns the database menu, defaulting to the listener's
+// admin database when the operator did not list any.
+func (w *WebConfig) EffectiveDatabases(adminDatabase string) []string {
+	if w != nil && len(w.Databases) > 0 {
+		return w.Databases
+	}
+	if strings.TrimSpace(adminDatabase) != "" {
+		return []string{adminDatabase}
+	}
+	return []string{"postgres"}
+}
+
+// supportsQueryLog reports whether a listener mode can parse its protocol.
+// TCP mode is an opaque L4 relay, so there is nothing to log.
+func supportsQueryLog(mode string) bool {
+	return mode == "postgres" || mode == "mongodb" || mode == "web"
 }
 
 // BackendPair holds a resolved listen address and backend address.
@@ -390,8 +560,18 @@ func validate(cfg *Config) error {
 		names[l.Name] = true
 
 		mode := strings.ToLower(l.Mode)
-		if mode != "tcp" && mode != "postgres" && mode != "mongodb" {
-			return fmt.Errorf("listeners[%d].mode must be 'tcp', 'postgres', or 'mongodb', got %q", i, l.Mode)
+		if mode != "tcp" && mode != "postgres" && mode != "mongodb" && mode != "web" {
+			return fmt.Errorf("listeners[%d].mode must be 'tcp', 'postgres', 'mongodb', or 'web', got %q", i, l.Mode)
+		}
+		if mode == "web" && l.Postgres == nil {
+			return fmt.Errorf("listeners[%d]: mode %q requires a [listeners.postgres] block for admin credentials", i, "web")
+		}
+		if l.Web != nil && mode != "web" {
+			return fmt.Errorf("listeners[%d]: [listeners.web] is only supported for mode %q, got %q", i, "web", l.Mode)
+		}
+		if mode == "web" && l.EffectiveTLSMode() == TLSOptional && strings.TrimSpace(l.PostgresTLSMode) != "" {
+			return fmt.Errorf("listeners[%d]: mode %q has no TLS negotiation, so tls_mode must be %q or %q, got %q",
+				i, "web", TLSRequire, TLSOff, l.PostgresTLSMode)
 		}
 		if l.MongoDB.HasSRV() && mode != "mongodb" {
 			return fmt.Errorf("listeners[%d]: mongodb.srv is only supported for mode %q, got %q", i, "mongodb", l.Mode)
@@ -568,6 +748,39 @@ func validate(cfg *Config) error {
 		if l.UseTailscaleTLS != nil && !supportsClientTLS(mode) {
 			return fmt.Errorf("listeners[%d].use_tailscale_tls is only supported for mode \"postgres\" or \"mongodb\"", i)
 		}
+		if err := validateQueryLog(i, mode, l.QueryLog); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateQueryLog checks a listener's [listeners.query_log] block.
+func validateQueryLog(listenerIndex int, mode string, q *QueryLogConfig) error {
+	if q == nil {
+		return nil
+	}
+	if !supportsQueryLog(mode) {
+		return fmt.Errorf("listeners[%d].query_log is only supported for mode \"postgres\" or \"mongodb\"", listenerIndex)
+	}
+
+	level := q.EffectiveLevel()
+	levelRank := queryLogRank(level)
+	if levelRank < 0 {
+		return fmt.Errorf("listeners[%d].query_log.level must be one of %q, %q, %q, or %q, got %q",
+			listenerIndex, QueryLogOff, QueryLogMetadata, QueryLogNormalized, QueryLogFull, q.Level)
+	}
+
+	maxLevel := q.EffectiveMaxLevel()
+	maxRank := queryLogRank(maxLevel)
+	if maxRank < 0 {
+		return fmt.Errorf("listeners[%d].query_log.max_level must be one of %q, %q, %q, or %q, got %q",
+			listenerIndex, QueryLogOff, QueryLogMetadata, QueryLogNormalized, QueryLogFull, q.MaxLevel)
+	}
+
+	if maxRank < levelRank {
+		return fmt.Errorf("listeners[%d].query_log.max_level %q is below level %q — the ceiling cannot sit under the default",
+			listenerIndex, maxLevel, level)
 	}
 	return nil
 }
@@ -632,7 +845,7 @@ func validMongoPreset(preset string) bool {
 }
 
 func supportsClientTLS(mode string) bool {
-	return mode == "postgres" || mode == "mongodb"
+	return mode == "postgres" || mode == "mongodb" || mode == "web"
 }
 
 func validateAdvertiseHostOrAddr(advertise string) error {

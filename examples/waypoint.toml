@@ -66,6 +66,9 @@ max_conns_total = 200
 # "waypoint.redis.op_duration" = ["operation"]
 # "waypoint.redis.errors"     = ["operation"]
 # "waypoint.system.listeners" = []
+# "waypoint.querylog.emitted" = ["listener"]
+# "waypoint.querylog.dropped" = ["listener"]  # records lost because the log queue was full
+# "waypoint.querylog.parse_errors" = ["listener"]  # statements the parser rejected — these log raw text
 
 [[listeners]]
 name = "pg-main"
@@ -84,6 +87,19 @@ admin_database = "postgres"
 user_prefix = "wp_"
 user_ttl = "24h"
 # service_name = "my-prod-db"   # peer.service override for OTel (default: listener name)
+
+# Per-statement audit logging. Off by default; postgres and mongodb modes only.
+# [listeners.query_log]
+# level = "metadata"                    # off (default) | metadata | normalized | full
+#                                       #   metadata   — verb, tables, rows, duration; no statement text
+#                                       #   normalized — statement with constants elided
+#                                       #   full       — verbatim statement and bind parameters
+# max_level = "full"                    # ceiling an ACL grant may raise to (default: same as level)
+# max_statement_bytes = 4096            # statement truncation limit (default: 4096)
+#
+# Note: a statement the parser rejects is logged verbatim at every level,
+# including "metadata". Watch waypoint.querylog.parse_errors for how often
+# that happens.
 
 [[listeners]]
 name = "raw-mysql"
@@ -197,3 +213,43 @@ backend = "10.0.1.5:3306"
 # backend = "10.0.1.10:5432"
 # tls_mode = "require"
 # service = "svc:waypoint-db"
+
+# --- Web console -------------------------------------------------------------
+# A browser-facing SQL console. It reuses the same identity path as the wire
+# protocol modes — Tailscale WhoIs plus capability grants — so there is no
+# login page, no session cookie, and no password to manage.
+#
+# The console is stateless. Every request is authorized on its own, so a
+# revoked grant takes effect on the next request rather than at the next
+# revalidation tick. Nothing the user does is preserved: closing the browser
+# discards the tabs, the buffers, and the results.
+[[listeners]]
+name = "console"
+listen = ":8443"
+mode = "web"
+backend = "10.0.1.10:5432"
+tls_mode = "require"       # web listeners are https unless set to "off"
+use_tailscale_tls = true   # serve https with the node's *.ts.net certificate
+
+# Admin credentials, used exactly as postgres mode uses them: to provision a
+# per-user role. The console connects as that role, so Postgres — not the UI —
+# enforces what the user may read and write.
+[listeners.postgres]
+admin_user = "waypoint_admin"
+admin_password = "${PG_ADMIN_PASSWORD}"
+admin_database = "postgres"
+user_prefix = "wp_"
+user_ttl = "24h"
+
+[listeners.web]
+databases = ["appdb", "analytics"]   # the picker's menu; grants still decide access
+max_rows = 1000                      # hard cap on rows returned to the browser
+statement_timeout = "30s"            # bounds a single statement server-side
+max_pool_conns = 4                   # pooled connections per (user, database)
+idle_pool_timeout = "10m"            # pools are a cache, never session state
+
+# Queries run in the browser land in the same audit stream as those run
+# through psql.
+[listeners.query_log]
+level = "metadata"
+max_level = "normalized"

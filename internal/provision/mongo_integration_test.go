@@ -27,7 +27,7 @@ func setupMongoProvisioner(t *testing.T) (*MongoProvisioner, string, string) {
 	store := restrict.NewRedisStore(rdb, "mongointtest:", metrics.Noop())
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	connStr, backend := testutil.MongoDBBackend(t)
-	p := NewMongoProvisioner("admin", "adminpass", backend, "admin", "wp_", "test", false, store, logger, nil)
+	p := NewMongoProvisioner("admin", "adminpass", backend, "test-listener", "admin", "wp_", "test", false, store, logger, nil)
 	return p, connStr, backend
 }
 
@@ -154,7 +154,7 @@ func TestIntegration_MongoProvisioner_PasswordRotationAfterCacheExpiry(t *testin
 	store := restrict.NewRedisStore(rdb, "mongointtest:", metrics.Noop())
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	connStr, backend := testutil.MongoDBBackend(t)
-	p := NewMongoProvisioner("admin", "adminpass", backend, "admin", "wp_", "test", false, store, logger, nil)
+	p := NewMongoProvisioner("admin", "adminpass", backend, "test-listener", "admin", "wp_", "test", false, store, logger, nil)
 
 	client := mongoAdminClient(t, connStr)
 	roles := []MongoRole{{Role: "read", DB: "rotatedb"}}

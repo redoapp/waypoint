@@ -1,0 +1,24 @@
+{
+  "name": "waypoint-console",
+  "private": true,
+  "version": "0.0.1",
+  "type": "module",
+  "description": "Source for the Waypoint web console. The built bundle is committed to internal/web/assets/app.js so the release build stays pure Go.",
+  "scripts": {
+    "build": "esbuild src/main.js --bundle --minify --format=esm --target=es2022 --outfile=../assets/app.js --legal-comments=none"
+  },
+  "dependencies": {
+    "@codemirror/autocomplete": "^6.20.3",
+    "@codemirror/commands": "^6.9.0",
+    "@codemirror/lang-sql": "^6.10.0",
+    "@codemirror/language": "^6.11.0",
+    "@codemirror/lint": "^6.9.7",
+    "@codemirror/search": "^6.5.0",
+    "@codemirror/state": "^6.5.0",
+    "@codemirror/theme-one-dark": "^6.1.3",
+    "@codemirror/view": "^6.43.9"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0"
+  }
+}

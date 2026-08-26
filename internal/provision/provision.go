@@ -11,7 +11,9 @@ import (
 	"net"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/exaring/otelpgx"
 	"github.com/jackc/pgx/v5"
@@ -40,6 +42,8 @@ const pgCredentialTTL = 30 * time.Minute
 // Provisioner manages dynamic PostgreSQL user lifecycle.
 type Provisioner struct {
 	adminConnStr string
+	listener     string
+	truncations  truncationLog
 	userPrefix   string
 	allowRawSQL  bool
 	peerService  string
@@ -64,7 +68,14 @@ type provisionedRole struct {
 }
 
 // NewProvisioner creates a new Provisioner.
-func NewProvisioner(adminUser, adminPassword, adminDatabase, backend, userPrefix string, backendTLS, allowRawSQL bool, peerService string, store *restrict.RedisStore, logger *slog.Logger, dialFunc func(ctx context.Context, network, addr string) (net.Conn, error), lookupFunc func(ctx context.Context, host string) ([]string, error)) *Provisioner {
+// NewProvisioner creates a new Provisioner.
+//
+// listener is the name of the listener this provisioner serves. It becomes
+// part of every role name, so two listeners over the same backend never share
+// a role even when they share a user prefix — which matters because their
+// capability grants can differ, and a shared role would mean whichever
+// provisioned last set the privileges for both.
+func NewProvisioner(adminUser, adminPassword, adminDatabase, backend, listener, userPrefix string, backendTLS, allowRawSQL bool, peerService string, store *restrict.RedisStore, logger *slog.Logger, dialFunc func(ctx context.Context, network, addr string) (net.Conn, error), lookupFunc func(ctx context.Context, host string) ([]string, error)) *Provisioner {
 	sslmode := "disable"
 	if backendTLS {
 		sslmode = "require"
@@ -81,6 +92,7 @@ func NewProvisioner(adminUser, adminPassword, adminDatabase, backend, userPrefix
 	}
 	return &Provisioner{
 		adminConnStr: connStr,
+		listener:     listener,
 		userPrefix:   userPrefix,
 		allowRawSQL:  allowRawSQL,
 		peerService:  peerService,
@@ -643,26 +655,118 @@ func (p *Provisioner) formatUsername(loginName, nodeName, database string) strin
 // formatUsernameWithScope builds:
 // {prefix}{login_sanitized}_{node}_{database}_{scope}
 // The scope is optional and keeps intentionally different grant sets isolated.
+// formatUsernameWithScope derives the role name.
+//
+// The listener is part of the name so that two listeners over the same backend
+// get distinct roles even under a shared user_prefix. Without it, their
+// capability grants would fight: both would resolve to one role and whichever
+// provisioned most recently would set its privileges for both.
 func (p *Provisioner) formatUsernameWithScope(loginName, nodeName, database, roleScope string) string {
 	sanitized := sanitize(loginName)
 	node := strings.Split(nodeName, ".")[0]
 	node = sanitize(node)
 	db := sanitize(database)
+	listener := sanitize(p.listener)
 	scope := sanitize(roleScope)
 
-	name := fmt.Sprintf("%s%s_%s_%s", p.userPrefix, sanitized, node, db)
+	// The listener goes directly after the prefix, not at the end. Long
+	// logins and hostnames push these names past the 63-byte identifier
+	// limit and the tail is what gets truncated away — so a trailing
+	// listener would vanish from exactly the names where telling listeners
+	// apart matters. Listener names are short and operator-chosen, so
+	// leading with one costs little and always survives.
+	name := p.userPrefix
+	if listener != "" {
+		name += listener + "_"
+	}
+	name += fmt.Sprintf("%s_%s_%s", sanitized, node, db)
 	if scope != "" {
 		name += "_" + scope
 	}
 
-	if len(name) <= 63 {
+	truncated := truncateWithHash(name, maxPGIdentifier)
+	if truncated != name {
+		p.truncations.record(p.logger, "role", name, truncated, maxPGIdentifier)
+	}
+	return truncated
+}
+
+// Identifier limits. Postgres truncates anything longer than NAMEDATALEN-1
+// silently, which would collapse distinct users onto one role, so names are
+// bounded here instead.
+const (
+	maxPGIdentifier    = 63
+	maxMongoIdentifier = 128
+
+	// truncationHashLen is how many hex characters of the digest are kept.
+	// Ten gives 40 bits, which is ample for distinguishing the handful of
+	// names that share a truncated prefix.
+	truncationHashLen = 10
+)
+
+// truncateWithHash bounds an identifier to limit bytes, keeping as much of the
+// readable name as possible and encoding the rest in a hash suffix. The result
+// is <kept>_<10 hex characters>, filling the limit exactly.
+//
+// Only the discarded remainder is hashed, not the whole name. That is enough
+// for uniqueness: two names that survive to the same kept prefix can differ
+// only in the remainder, so their digests differ; two names with different
+// kept prefixes are already distinct. It also means the suffix says something
+// specific — it identifies what was dropped.
+//
+// The kept portion may itself end in an underscore, yielding a doubled one
+// before the hash. That is a legal identifier and leaving it alone keeps the
+// rule simple: the name is always exactly limit bytes, cut at a fixed offset.
+// truncationLog records identifier truncations, once per distinct original
+// name, so a truncated identifier seen later — in pg_stat_activity, in an
+// audit log, in a permissions listing — can be traced back to the name it was
+// derived from. Without this the hash suffix is opaque: it identifies what was
+// dropped without saying what that was.
+//
+// Keyed on the original rather than the result: two different originals
+// collapsing onto one identifier is the collision worth seeing, so both should
+// be logged rather than the second silently suppressed.
+type truncationLog struct {
+	seen sync.Map
+}
+
+func (t *truncationLog) record(logger *slog.Logger, kind, original, truncated string, limit int) {
+	if logger == nil {
+		return
+	}
+	if _, dup := t.seen.LoadOrStore(original, struct{}{}); dup {
+		return
+	}
+	// truncated is kept + "_" + hash, so the readable portion is everything
+	// before those trailing bytes.
+	kept := truncated[:len(truncated)-truncationHashLen-1]
+	logger.Info(kind+" name truncated to fit",
+		"name", truncated,
+		"original", original,
+		"original_bytes", len(original),
+		"limit", limit,
+		// The hash suffix is the digest of exactly this text, so the log
+		// carries everything needed to reproduce the name.
+		"dropped", strings.TrimPrefix(original, kept),
+	)
+}
+
+func truncateWithHash(name string, limit int) string {
+	if len(name) <= limit {
 		return name
 	}
 
-	// Truncate with hash suffix for uniqueness.
-	hash := sha256.Sum256([]byte(name))
-	suffix := hex.EncodeToString(hash[:4])
-	return name[:63-9] + "_" + suffix
+	// One byte of the budget goes to the separator.
+	keep := limit - truncationHashLen - 1
+	// user_prefix reaches this unsanitized from config, so it can in
+	// principle carry multi-byte runes. Back off to a rune boundary rather
+	// than slicing one in half.
+	for keep > 0 && !utf8.RuneStart(name[keep]) {
+		keep--
+	}
+
+	sum := sha256.Sum256([]byte(name[keep:]))
+	return name[:keep] + "_" + hex.EncodeToString(sum[:])[:truncationHashLen]
 }
 
 func sanitize(s string) string {
