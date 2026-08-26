@@ -1719,3 +1719,43 @@ func TestQueryLogRank(t *testing.T) {
 		})
 	}
 }
+
+func TestValidate_WebDatabasesLimitedToAdminDatabase(t *testing.T) {
+	cfg := func(databases string) string {
+		return `
+[tailscale]
+hostname = "waypoint-test"
+
+[[listeners]]
+name = "console"
+listen = ":8080"
+mode = "web"
+backend = "10.0.0.1:5432"
+
+[listeners.postgres]
+admin_user = "admin"
+admin_password = "pw"
+admin_database = "appdb"
+
+[listeners.web]
+` + databases
+	}
+
+	// Unset is fine: the menu falls back to admin_database.
+	if _, err := Load(writeTestConfig(t, cfg(""))); err != nil {
+		t.Errorf("unset databases rejected: %v", err)
+	}
+	if _, err := Load(writeTestConfig(t, cfg(`databases = ["appdb"]`))); err != nil {
+		t.Errorf("admin_database rejected: %v", err)
+	}
+
+	// Anything else would provision roles whose grants land in the admin
+	// database, leaving every query against them refused.
+	_, err := Load(writeTestConfig(t, cfg(`databases = ["appdb", "analytics"]`)))
+	if err == nil {
+		t.Fatal("expected a second database to be rejected")
+	}
+	if !strings.Contains(err.Error(), "admin_database") {
+		t.Errorf("error should explain the constraint, got: %v", err)
+	}
+}

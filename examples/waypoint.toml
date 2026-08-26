@@ -237,12 +237,18 @@ use_tailscale_tls = true   # serve https with the node's *.ts.net certificate
 [listeners.postgres]
 admin_user = "waypoint_admin"
 admin_password = "${PG_ADMIN_PASSWORD}"
-admin_database = "postgres"
+# The console serves this database, so the admin connection has to target it:
+# provisioning applies its GRANTs over this connection and grants are
+# database-local in Postgres.
+admin_database = "appdb"
 user_prefix = "wp_"
 user_ttl = "24h"
 
 [listeners.web]
-databases = ["appdb", "analytics"]   # the picker's menu; grants still decide access
+# Currently limited to admin_database — anything else is rejected at config
+# load. Leave unset to default to it. Run a second web listener to expose a
+# second database.
+databases = ["appdb"]
 max_rows = 1000                      # hard cap on rows returned to the browser
 statement_timeout = "30s"            # bounds a single statement server-side
 max_pool_conns = 4                   # pooled connections per (user, database)
