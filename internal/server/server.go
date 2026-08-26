@@ -4,9 +4,11 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
+	"net/http"
 	"net/netip"
 	"os"
 	"sort"
@@ -28,8 +30,10 @@ import (
 	"github.com/redoapp/waypoint/internal/metrics"
 	"github.com/redoapp/waypoint/internal/provision"
 	"github.com/redoapp/waypoint/internal/proxy"
+	"github.com/redoapp/waypoint/internal/querylog"
 	"github.com/redoapp/waypoint/internal/restrict"
 	"github.com/redoapp/waypoint/internal/tsdns"
+	"github.com/redoapp/waypoint/internal/web"
 	"tailscale.com/client/local"
 	"tailscale.com/ipn"
 	"tailscale.com/tsnet"
@@ -117,6 +121,27 @@ func RunServer(ctx context.Context, configPath string, logger *slog.Logger, leve
 
 	store := restrict.NewRedisStore(rdb, cfg.Redis.KeyPrefix, m)
 	tracker := restrict.NewTracker(store, m, logger)
+
+	// One query log emitter for the whole process. It parses and formats on
+	// its own goroutine so the relay never waits on logging; listeners that
+	// leave query logging off never hand it an event.
+	queryLogger := querylog.NewEmitter(
+		logger.With("component", "querylog"),
+		querylog.DefaultQueueSize,
+		querylog.Counters{
+			Emitted: func(ctx context.Context, n int64) {
+				m.QueryLogEmitted.Add(ctx, n, m.Attrs("waypoint.querylog.emitted"))
+			},
+			Dropped: func(ctx context.Context, n int64, listener string) {
+				m.QueryLogDropped.Add(ctx, n,
+					m.Attrs("waypoint.querylog.dropped", metrics.AttrListener.String(listener)))
+			},
+			ParseErrors: func(ctx context.Context, n int64, listener string) {
+				m.QueryLogParseErrors.Add(ctx, n,
+					m.Attrs("waypoint.querylog.parse_errors", metrics.AttrListener.String(listener)))
+			},
+		},
+	)
 
 	// Heartbeat publisher.
 	instanceID := uuid.New().String()
@@ -330,6 +355,7 @@ func RunServer(ctx context.Context, configPath string, logger *slog.Logger, leve
 						lCfg.MongoDB.AdminUser,
 						lCfg.MongoDB.AdminPassword,
 						mongoProvisionBackends(lCfg, backends),
+						lCfg.Name,
 						lCfg.MongoDB.AuthDatabase,
 						lCfg.MongoDB.UserPrefix,
 						mongoPeerService,
@@ -344,6 +370,7 @@ func RunServer(ctx context.Context, configPath string, logger *slog.Logger, leve
 						lCfg.MongoDB.AdminPassword,
 						mongoProvisionBackends(lCfg, backends),
 						lCfg.MongoDB.ReplicaSet,
+						lCfg.Name,
 						lCfg.MongoDB.AuthDatabase,
 						lCfg.MongoDB.UserPrefix,
 						mongoPeerService,
@@ -433,6 +460,7 @@ func RunServer(ctx context.Context, configPath string, logger *slog.Logger, leve
 					lCfg.Postgres.AdminPassword,
 					lCfg.Postgres.AdminDatabase,
 					be.Backend,
+					lCfg.Name,
 					lCfg.Postgres.UserPrefix,
 					lCfg.BackendTLS,
 					config.AllowRawSQLResolved(lCfg.Postgres, &cfg.Provisioning),
@@ -444,21 +472,23 @@ func RunServer(ctx context.Context, configPath string, logger *slog.Logger, leve
 				)
 
 				p := &proxy.PostgresProxy{
-					Backend:       be.Backend,
-					Name:          lCfg.Name,
-					Auth:          &proxy.TailscaleAuthorizer{LC: lc, Logger: logger.With("listener", lCfg.Name)},
-					Tracker:       tracker,
-					Provisioner:   provisioner,
-					Metrics:       m,
-					PGConfig:      lCfg.Postgres,
-					ClientTLSMode: clientTLSMode,
-					ClientTLS:     clientTLSConfig,
-					BackendTLS:    lCfg.BackendTLS,
-					RevalInterval: revalInterval,
-					Logger:        logger.With("listener", lCfg.Name),
-					Dialer:        dialer,
-					BytesRead:     &bytesRead,
-					BytesWritten:  &bytesWritten,
+					QueryLog:       queryLogger,
+					QueryLogConfig: lCfg.QueryLog,
+					Backend:        be.Backend,
+					Name:           lCfg.Name,
+					Auth:           &proxy.TailscaleAuthorizer{LC: lc, Logger: logger.With("listener", lCfg.Name)},
+					Tracker:        tracker,
+					Provisioner:    provisioner,
+					Metrics:        m,
+					PGConfig:       lCfg.Postgres,
+					ClientTLSMode:  clientTLSMode,
+					ClientTLS:      clientTLSConfig,
+					BackendTLS:     lCfg.BackendTLS,
+					RevalInterval:  revalInterval,
+					Logger:         logger.With("listener", lCfg.Name),
+					Dialer:         dialer,
+					BytesRead:      &bytesRead,
+					BytesWritten:   &bytesWritten,
 				}
 				go acceptLoop(ctx, &wg, ln, p.HandleConn, logger.With("listener", lCfg.Name))
 
@@ -469,25 +499,118 @@ func RunServer(ctx context.Context, configPath string, logger *slog.Logger, leve
 				}
 
 				mp := &proxy.MongoDBProxy{
-					Backend:       be.Backend,
-					Name:          lCfg.Name,
-					ListenAddr:    proxyAddr,
-					Auth:          &proxy.TailscaleAuthorizer{LC: lc, Logger: logger.With("listener", lCfg.Name)},
-					Tracker:       tracker,
-					Provisioner:   mongoProvisioner,
-					Metrics:       m,
-					MongoConfig:   lCfg.MongoDB,
-					ClientTLSMode: mongoClientTLSMode,
-					ClientTLS:     mongoClientTLSConfig,
-					BackendTLS:    lCfg.BackendTLS,
-					TopologyMap:   mongoTopologyMap,
-					RevalInterval: revalInterval,
-					Logger:        logger.With("listener", lCfg.Name),
-					Dialer:        dialer,
-					BytesRead:     &bytesRead,
-					BytesWritten:  &bytesWritten,
+					QueryLog:       queryLogger,
+					QueryLogConfig: lCfg.QueryLog,
+					Backend:        be.Backend,
+					Name:           lCfg.Name,
+					ListenAddr:     proxyAddr,
+					Auth:           &proxy.TailscaleAuthorizer{LC: lc, Logger: logger.With("listener", lCfg.Name)},
+					Tracker:        tracker,
+					Provisioner:    mongoProvisioner,
+					Metrics:        m,
+					MongoConfig:    lCfg.MongoDB,
+					ClientTLSMode:  mongoClientTLSMode,
+					ClientTLS:      mongoClientTLSConfig,
+					BackendTLS:     lCfg.BackendTLS,
+					TopologyMap:    mongoTopologyMap,
+					RevalInterval:  revalInterval,
+					Logger:         logger.With("listener", lCfg.Name),
+					Dialer:         dialer,
+					BytesRead:      &bytesRead,
+					BytesWritten:   &bytesWritten,
 				}
 				go acceptLoop(ctx, &wg, ln, mp.HandleConn, logger.With("listener", lCfg.Name))
+
+			case "web":
+				if lCfg.Postgres == nil {
+					return fmt.Errorf("web listener %s requires [listeners.postgres] config", lCfg.Name)
+				}
+				// Unset means require: a console serving production data
+				// should not fall back to plaintext by omission.
+				webTLSMode := lCfg.EffectiveWebTLSMode()
+				var webTLSConfig *tls.Config
+				if webTLSMode != config.TLSOff {
+					_, webTLSConfig, err = resolveClientTLS(lCfg, srv, lc, logger.With("listener", lCfg.Name))
+					if err != nil {
+						return fmt.Errorf("configure TLS for listener %s: %w", lCfg.Name, err)
+					}
+				}
+
+				webPeerService := lCfg.Name
+				if lCfg.Postgres.ServiceName != "" {
+					webPeerService = lCfg.Postgres.ServiceName
+				}
+
+				webProvisioner := provision.NewProvisioner(
+					lCfg.Postgres.AdminUser,
+					lCfg.Postgres.AdminPassword,
+					lCfg.Postgres.AdminDatabase,
+					be.Backend,
+					lCfg.Name,
+					lCfg.Postgres.UserPrefix,
+					lCfg.BackendTLS,
+					config.AllowRawSQLResolved(lCfg.Postgres, &cfg.Provisioning),
+					webPeerService,
+					store,
+					logger.With("component", "provisioner", "listener", lCfg.Name),
+					dialer,
+					lookupFunc,
+				)
+
+				webCfg := lCfg.Web
+				if webCfg == nil {
+					webCfg = &config.WebConfig{}
+				}
+
+				console := web.New(web.Options{
+					Name:        lCfg.Name,
+					Backend:     be.Backend,
+					LC:          lc,
+					Tracker:     tracker,
+					Provisioner: webProvisioner,
+					PGConfig:    lCfg.Postgres,
+					WebConfig:   webCfg,
+					QueryLog:    queryLogger,
+					QueryLogCfg: lCfg.QueryLog,
+					Metrics:     m,
+					Logger:      logger.With("listener", lCfg.Name),
+					BackendTLS:  lCfg.BackendTLS,
+					PeerService: webPeerService,
+					DialFunc:    dialer,
+					LookupFunc:  lookupFunc,
+				})
+				go console.Run(ctx)
+
+				// The console terminates TLS itself when configured, so the
+				// browser gets a real https origin rather than a warning.
+				webLn := ln
+				scheme := "http"
+				if webTLSConfig != nil {
+					webLn = tls.NewListener(ln, webTLSConfig)
+					scheme = "https"
+				}
+				logger.Info("web console listening",
+					"listener", lCfg.Name, "addr", be.Listen, "scheme", scheme)
+
+				httpSrv := &http.Server{
+					Handler:           console.Handler(),
+					ReadHeaderTimeout: 10 * time.Second,
+					IdleTimeout:       120 * time.Second,
+					BaseContext:       func(net.Listener) context.Context { return ctx },
+				}
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					if err := httpSrv.Serve(webLn); err != nil && !errors.Is(err, http.ErrServerClosed) && ctx.Err() == nil {
+						logger.Error("web console server stopped", "listener", lCfg.Name, "error", err)
+					}
+				}()
+				go func() {
+					<-ctx.Done()
+					shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+					defer cancel()
+					_ = httpSrv.Shutdown(shutdownCtx)
+				}()
 			}
 
 			m.SystemListeners.Add(ctx, 1, m.Attrs("waypoint.system.listeners"))
@@ -505,6 +628,11 @@ func RunServer(ctx context.Context, configPath string, logger *slog.Logger, leve
 
 	// Wait for active connections to finish.
 	wg.Wait()
+
+	// Drain query log records only after the connections that produce them
+	// have gone; closing earlier would discard their final statements.
+	queryLogger.Close()
+
 	logger.Info("shutdown complete")
 	return nil
 }

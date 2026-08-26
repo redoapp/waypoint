@@ -19,6 +19,7 @@ Access to Waypoint is controlled entirely by Tailscale ACL capability grants und
     "cap": {
       "redo.com/cap/waypoint": [{
         "limits":   { /* optional per-user limits */ },
+        "logging":  { /* optional query log level */ },
         "backends": { /* per-listener grants */ }
       }]
     }
@@ -37,6 +38,33 @@ Access to Waypoint is controlled entirely by Tailscale ACL capability grants und
 | `max_bytes_per_conn` | Byte budget per connection (e.g. `"10GB"`) |
 
 Missing fields fall back to `[defaults.limits]` from the server config. <TestRef name="TestMergeLimits_FirstValueSetsBaseline" /> <TestRef name="TestMergeLimits_ZeroDoesNotOverride" /> Bandwidth tiers stack across rules but deduplicate by period and pick the strictest byte budget per period. <TestRef name="TestMergeLimits_BandwidthMostRestrictive" /> <TestRef name="TestMergeLimits_BandwidthMultipleTiers_DedupByPeriod" /> See [Provisioning & Defaults](/waypoint/configuration/provisioning/).
+
+## `logging`
+
+Sets how much query detail is logged for the users a grant covers. It can appear at the top level or inside a `backends` entry, where it overrides the top-level value for that listener.
+
+```json
+{
+  "logging": { "queries": "metadata" },
+  "backends": {
+    "pg-prod": {
+      "pg": { "databases": { "app": { "permissions": ["readonly"] } } },
+      "logging": { "queries": "full" }
+    }
+  }
+}
+```
+
+`queries` is one of `off`, `metadata`, `normalized`, or `full`. <TestRef name="TestMergeRules_QueryLogFromBackendCap" /> <TestRef name="TestMergeRules_QueryLogBackendOverridesTopLevel" />
+
+Two rules govern how it resolves, and they differ from `limits` on purpose:
+
+- When several grants match, the **most verbose** level wins — the opposite of `limits`, where the strictest value wins. Adding a grant must never be able to quiet the record of what a user did. <TestRef name="TestMergeRules_QueryLogMostVerboseWins" />
+- The listener's `query_log.max_level` is an absolute ceiling. A grant asking for `full` against a listener capped at `normalized` gets `normalized`. <TestRef name="TestIntegration_Proxy_QueryLogCeilingClampsACL" />
+
+Omitting `logging` leaves the listener's configured default in place. <TestRef name="TestMergeRules_QueryLogUnsetWhenNoGrantMentionsIt" /> An unrecognized value is ignored with a warning rather than failing the connection, so an ACL typo cannot lock a user out of their database. <TestRef name="TestMergeRules_QueryLogInvalidValueIgnored" />
+
+Query logging must be enabled on the listener first — a grant cannot turn it on where the operator left it `off`. See [Query Logging](/waypoint/observability/query-logging/).
 
 ## `backends`
 

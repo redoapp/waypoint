@@ -71,6 +71,14 @@ type Metrics struct {
 
 	// System metrics.
 	SystemListeners metric.Int64UpDownCounter
+
+	// Query logging. QueryLogParseErrors matters beyond volume tracking: a
+	// statement the parser rejects is logged with its raw text, so this
+	// counter is how an operator notices that more literal content is
+	// reaching the logs than the configured level would suggest.
+	QueryLogEmitted     metric.Int64Counter
+	QueryLogDropped     metric.Int64Counter
+	QueryLogParseErrors metric.Int64Counter
 }
 
 // Config mirrors the TOML [metrics] section.
@@ -274,6 +282,15 @@ func (m *Metrics) init() (*Metrics, error) {
 		return nil, err
 	}
 	if m.SystemListeners, err = meter("waypoint.system.listeners").Int64UpDownCounter("waypoint.system.listeners"); err != nil {
+		return nil, err
+	}
+	if m.QueryLogEmitted, err = meter("waypoint.querylog.emitted").Int64Counter("waypoint.querylog.emitted"); err != nil {
+		return nil, err
+	}
+	if m.QueryLogDropped, err = meter("waypoint.querylog.dropped").Int64Counter("waypoint.querylog.dropped"); err != nil {
+		return nil, err
+	}
+	if m.QueryLogParseErrors, err = meter("waypoint.querylog.parse_errors").Int64Counter("waypoint.querylog.parse_errors"); err != nil {
 		return nil, err
 	}
 

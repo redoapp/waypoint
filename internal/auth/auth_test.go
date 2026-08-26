@@ -1,8 +1,11 @@
 package auth
 
 import (
+	"encoding/json"
 	"testing"
 	"time"
+
+	"github.com/redoapp/waypoint/internal/querylog"
 )
 
 func TestMergeRules_SingleRuleWithPG(t *testing.T) {
@@ -19,7 +22,7 @@ func TestMergeRules_SingleRuleWithPG(t *testing.T) {
 		},
 	}}
 
-	perms, limits := mergeRules(rules, "pg-main")
+	perms, limits, _ := mergeRules(rules, "pg-main", nil)
 
 	if len(perms) != 1 || perms[0] != "SELECT ON ALL TABLES IN SCHEMA public" {
 		t.Errorf("unexpected perms: %v", perms)
@@ -57,7 +60,7 @@ func TestMergeRules_MultipleRulesMergePermissions(t *testing.T) {
 		},
 	}
 
-	perms, limits := mergeRules(rules, "pg-main")
+	perms, limits, _ := mergeRules(rules, "pg-main", nil)
 
 	if len(perms) != 2 {
 		t.Fatalf("expected 2 perms, got %d: %v", len(perms), perms)
@@ -78,7 +81,7 @@ func TestMergeRules_NoLimits(t *testing.T) {
 		},
 	}}
 
-	perms, limits := mergeRules(rules, "raw-tcp")
+	perms, limits, _ := mergeRules(rules, "raw-tcp", nil)
 
 	if len(perms) != 0 {
 		t.Errorf("expected no perms, got %v", perms)
@@ -96,7 +99,7 @@ func TestMergeRules_NoPG(t *testing.T) {
 		},
 	}}
 
-	perms, limits := mergeRules(rules, "raw-tcp")
+	perms, limits, _ := mergeRules(rules, "raw-tcp", nil)
 
 	if len(perms) != 0 {
 		t.Errorf("expected no perms for non-PG rule, got %v", perms)
@@ -534,9 +537,121 @@ func TestMergeRules_MultipleDBs(t *testing.T) {
 		},
 	}}
 
-	perms, _ := mergeRules(rules, "pg-main")
+	perms, _, _ := mergeRules(rules, "pg-main", nil)
 
 	if len(perms) != 3 {
 		t.Errorf("expected 3 total perms across all DBs, got %d: %v", len(perms), perms)
+	}
+}
+
+func TestMergeRules_QueryLogFromBackendCap(t *testing.T) {
+	rules := []CapRule{{
+		Backends: map[string]BackendCap{
+			"pg-main": {Logging: &LoggingCap{Queries: "full"}},
+		},
+	}}
+
+	_, _, level := mergeRules(rules, "pg-main", nil)
+
+	if level == nil {
+		t.Fatal("expected a query log level from the grant")
+	}
+	if *level != querylog.LevelFull {
+		t.Errorf("expected full, got %v", *level)
+	}
+}
+
+func TestMergeRules_QueryLogBackendOverridesTopLevel(t *testing.T) {
+	rules := []CapRule{{
+		Logging: &LoggingCap{Queries: "metadata"},
+		Backends: map[string]BackendCap{
+			"pg-main": {Logging: &LoggingCap{Queries: "full"}},
+		},
+	}}
+
+	_, _, level := mergeRules(rules, "pg-main", nil)
+
+	if level == nil || *level != querylog.LevelFull {
+		t.Errorf("expected the backend-scoped level to win, got %v", level)
+	}
+}
+
+// Unlike limits, where the most restrictive value wins, logging keeps the most
+// verbose: adding a grant must never be able to quiet the audit trail.
+func TestMergeRules_QueryLogMostVerboseWins(t *testing.T) {
+	rules := []CapRule{
+		{Backends: map[string]BackendCap{"pg-main": {Logging: &LoggingCap{Queries: "normalized"}}}},
+		{Backends: map[string]BackendCap{"pg-main": {Logging: &LoggingCap{Queries: "metadata"}}}},
+	}
+
+	_, _, level := mergeRules(rules, "pg-main", nil)
+
+	if level == nil || *level != querylog.LevelNormalized {
+		t.Errorf("expected normalized (most verbose), got %v", level)
+	}
+}
+
+func TestMergeRules_QueryLogUnsetWhenNoGrantMentionsIt(t *testing.T) {
+	rules := []CapRule{{
+		Backends: map[string]BackendCap{"pg-main": {Limits: &LimitsCap{MaxConns: 3}}},
+	}}
+
+	_, _, level := mergeRules(rules, "pg-main", nil)
+
+	if level != nil {
+		t.Errorf("expected nil so the listener default applies, got %v", *level)
+	}
+}
+
+// An ACL typo should not lock a user out of their database.
+func TestMergeRules_QueryLogInvalidValueIgnored(t *testing.T) {
+	rules := []CapRule{{
+		Backends: map[string]BackendCap{"pg-main": {Logging: &LoggingCap{Queries: "verbose"}}},
+	}}
+
+	_, _, level := mergeRules(rules, "pg-main", nil)
+
+	if level != nil {
+		t.Errorf("expected an unparseable level to be ignored, got %v", *level)
+	}
+}
+
+func TestMergeRules_QueryLogOffIsHonored(t *testing.T) {
+	rules := []CapRule{{
+		Backends: map[string]BackendCap{"pg-main": {Logging: &LoggingCap{Queries: "off"}}},
+	}}
+
+	_, _, level := mergeRules(rules, "pg-main", nil)
+
+	if level == nil || *level != querylog.LevelOff {
+		t.Errorf("expected an explicit off to be distinguishable from unset, got %v", level)
+	}
+}
+
+func TestCapRule_LoggingRoundTrip(t *testing.T) {
+	const raw = `{
+		"logging": {"queries": "metadata"},
+		"backends": {
+			"pg-main": {
+				"pg": {"databases": {"app": {"permissions": ["readonly"]}}},
+				"logging": {"queries": "full"}
+			}
+		}
+	}`
+
+	var rule CapRule
+	if err := json.Unmarshal([]byte(raw), &rule); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	if rule.Logging == nil || rule.Logging.Queries != "metadata" {
+		t.Errorf("top-level logging = %v, want metadata", rule.Logging)
+	}
+	bc, ok := rule.Backends["pg-main"]
+	if !ok {
+		t.Fatal("pg-main backend missing")
+	}
+	if bc.Logging == nil || bc.Logging.Queries != "full" {
+		t.Errorf("backend logging = %v, want full", bc.Logging)
 	}
 }

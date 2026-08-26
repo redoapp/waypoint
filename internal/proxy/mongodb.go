@@ -23,6 +23,7 @@ import (
 	"github.com/redoapp/waypoint/internal/metrics"
 	"github.com/redoapp/waypoint/internal/mongowire"
 	"github.com/redoapp/waypoint/internal/provision"
+	"github.com/redoapp/waypoint/internal/querylog"
 	"github.com/redoapp/waypoint/internal/restrict"
 )
 
@@ -46,6 +47,12 @@ type MongoDBProxy struct {
 	Dialer        func(ctx context.Context, network, addr string) (net.Conn, error)
 	BytesRead     *atomic.Int64
 	BytesWritten  *atomic.Int64
+
+	// QueryLog and QueryLogConfig enable per-command logging. Both must be
+	// set for it to run; when the resolved level is off, no tap is installed
+	// and the relay path is unchanged.
+	QueryLog       *querylog.Emitter
+	QueryLogConfig *config.QueryLogConfig
 }
 
 // HandleConn processes a single inbound MongoDB connection.
@@ -321,8 +328,27 @@ func (p *MongoDBProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 
 	log.DebugContext(ctx, "backend auth complete")
 
+	// Step 9a: Set up query logging before the buffered first command is
+	// forwarded — that command bypasses the relay, so a tap alone would miss
+	// it.
+	var qlSession *querylog.MongoSession
+	if level := resolveQueryLogLevel(p.QueryLogConfig, result.QueryLog); level > querylog.LevelOff && p.QueryLog != nil {
+		qlSession = querylog.NewMongoSession(p.QueryLog, querylog.Event{
+			ConnID:            connID,
+			Listener:          p.Name,
+			User:              result.LoginName,
+			Database:          hsResult.AuthDB,
+			Level:             level,
+			MaxStatementBytes: p.QueryLogConfig.EffectiveMaxStatementBytes(),
+		})
+		log.DebugContext(ctx, "query logging enabled", "level", level.String())
+	}
+
 	// Step 9b: Forward buffered first command if client connected without auth.
 	if hsResult.FirstCommand != nil {
+		if qlSession != nil {
+			qlSession.LogCommand(hsResult.FirstCommand)
+		}
 		if err := mongowire.WriteMessage(backendConn, hsResult.FirstCommand); err != nil {
 			setupSpan.RecordError(err)
 			setupSpan.SetStatus(codes.Error, "forward first command failed")
@@ -340,6 +366,9 @@ func (p *MongoDBProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 			setupSpan.End()
 			log.ErrorContext(ctx, "read first response failed", "error", err)
 			return
+		}
+		if qlSession != nil {
+			qlSession.LogReply(resp)
 		}
 		if resp.Header.OpCode == mongowire.OpMsg {
 			resp.Body = mongowire.RewriteTopologyWithMap(resp.Body, proxyAddr, topologyMap)
@@ -373,9 +402,24 @@ func (p *MongoDBProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 		go p.revalidateLoop(revalCtx, setupSpanCtx, connID, clientConn, backendConn, result.LoginName, log)
 	}
 
+	// Wrap both directions so replies can be attributed to the command that
+	// caused them. The backend tap sits outside the topology rewriter, which
+	// already frames messages of its own.
+	relayClient, relayBackend := clientConn, net.Conn(rewrittenBackend)
+	if qlSession != nil {
+		relayClient = qlSession.ClientConn(clientConn)
+		relayBackend = qlSession.BackendConn(rewrittenBackend)
+	}
+
 	log.DebugContext(ctx, "relay started")
 
-	relayResult := restrict.Relay(clientConn, rewrittenBackend, cl)
+	relayResult := restrict.Relay(relayClient, relayBackend, cl)
+
+	// Flush commands still awaiting a reply so a connection that drops
+	// mid-command still leaves a record.
+	if qlSession != nil {
+		qlSession.Close()
+	}
 
 	switch relayResult.Reason {
 	case restrict.CloseLimit:

@@ -5,6 +5,41 @@ sidebar:
   order: 6
 ---
 
+## What the admin role needs
+
+Provisioning connects to the backend as `admin_user` and needs enough
+privilege to manage roles and hand out grants:
+
+- **`CREATEROLE`**, to create the per-user role and the preset group roles.
+- **`CONNECT` on every database it provisions for.** Privileges on schemas,
+  tables and sequences are stored per database in Postgres, so Waypoint
+  connects to the database a role is being provisioned for in order to grant
+  them there. `admin_database` is only the fallback used when the target does
+  not exist.
+- **The ability to grant what the presets ask for** — normally ownership of the
+  schemas involved, or membership in a role that owns them.
+
+A superuser satisfies all of this and is the simplest option for a backend
+Waypoint fully manages. For a shared cluster, a non-superuser with
+`CREATEROLE` works provided it can connect to each target database.
+
+Listeners may each use their own admin credentials — `[listeners.postgres]` is
+per-listener — including different admins against the same backend. Role and
+group names carry the listener, so two listeners never contend over the same
+roles.
+
+:::caution[CONNECT on each target database]
+Databases grant `CONNECT` to `PUBLIC` by default, so this is usually already
+true. If your deployment revokes that, grant it explicitly:
+
+```sql
+GRANT CONNECT ON DATABASE appdb TO waypoint_admin;
+```
+
+Without it, provisioning for that database fails with
+`permission denied for database "appdb"` (SQLSTATE 42501).
+:::
+
 ## `[provisioning]`
 
 ```toml

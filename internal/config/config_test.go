@@ -1579,3 +1579,174 @@ func TestListenerConfig_ListenPort(t *testing.T) {
 		})
 	}
 }
+
+const queryLogConfigTemplate = `
+[tailscale]
+hostname = "waypoint-test"
+
+[[listeners]]
+name = "pg-prod"
+listen = ":5432"
+mode = %q
+backend = "10.0.0.1:5432"
+
+[listeners.query_log]
+%s
+`
+
+func writeQueryLogConfig(t *testing.T, mode, body string) string {
+	t.Helper()
+	return writeTestConfig(t, fmt.Sprintf(queryLogConfigTemplate, mode, body))
+}
+
+func TestLoad_QueryLog(t *testing.T) {
+	path := writeQueryLogConfig(t, "postgres", `level = "normalized"
+max_level = "full"
+max_statement_bytes = 8192`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	q := cfg.Listeners[0].QueryLog
+	if q == nil {
+		t.Fatal("query_log block was not parsed")
+	}
+	if got := q.EffectiveLevel(); got != QueryLogNormalized {
+		t.Errorf("level = %q, want %q", got, QueryLogNormalized)
+	}
+	if got := q.EffectiveMaxLevel(); got != QueryLogFull {
+		t.Errorf("max_level = %q, want %q", got, QueryLogFull)
+	}
+	if got := q.EffectiveMaxStatementBytes(); got != 8192 {
+		t.Errorf("max_statement_bytes = %d, want 8192", got)
+	}
+}
+
+func TestLoad_QueryLogDefaults(t *testing.T) {
+	// An absent block must leave query logging off.
+	path := writeTestConfig(t, validMinimalConfig)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	q := cfg.Listeners[0].QueryLog
+	if got := q.EffectiveLevel(); got != QueryLogOff {
+		t.Errorf("level with no block = %q, want %q", got, QueryLogOff)
+	}
+	if got := q.EffectiveMaxStatementBytes(); got != DefaultMaxStatementBytes {
+		t.Errorf("max_statement_bytes = %d, want %d", got, DefaultMaxStatementBytes)
+	}
+}
+
+// An unset max_level must equal level, so enabling query logging never
+// implicitly lets ACL grants escalate past what the operator asked for.
+func TestLoad_QueryLogMaxLevelDefaultsToLevel(t *testing.T) {
+	path := writeQueryLogConfig(t, "postgres", `level = "metadata"`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	q := cfg.Listeners[0].QueryLog
+	if got := q.EffectiveMaxLevel(); got != QueryLogMetadata {
+		t.Errorf("max_level = %q, want it to default to level %q", got, QueryLogMetadata)
+	}
+}
+
+func TestLoad_QueryLogInvalidLevel(t *testing.T) {
+	tests := []struct {
+		name    string
+		body    string
+		wantErr string
+	}{
+		{"bad level", `level = "verbose"`, "query_log.level"},
+		{"bad max level", `level = "off"` + "\n" + `max_level = "loud"`, "query_log.max_level"},
+		{"ceiling below level", `level = "full"` + "\n" + `max_level = "metadata"`, "cannot sit under the default"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := writeQueryLogConfig(t, "postgres", tt.body)
+			_, err := Load(path)
+			if err == nil {
+				t.Fatal("expected an error")
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("error = %v, want it to mention %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// TCP mode is an opaque L4 relay, so a query_log block there is a mistake
+// worth surfacing rather than silently ignoring.
+func TestLoad_QueryLogRejectedOnTCPMode(t *testing.T) {
+	path := writeQueryLogConfig(t, "tcp", `level = "metadata"`)
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected an error for query_log on a tcp listener")
+	}
+	if !strings.Contains(err.Error(), "query_log is only supported") {
+		t.Errorf("error = %v, want it to explain the mode restriction", err)
+	}
+}
+
+func TestLoad_QueryLogAllowedOnMongoDB(t *testing.T) {
+	path := writeQueryLogConfig(t, "mongodb", `level = "metadata"`)
+	if _, err := Load(path); err != nil {
+		t.Fatalf("query_log should be valid for mongodb listeners: %v", err)
+	}
+}
+
+func TestQueryLogRank(t *testing.T) {
+	tests := []struct {
+		level string
+		want  int
+	}{
+		{QueryLogOff, 0},
+		{QueryLogMetadata, 1},
+		{QueryLogNormalized, 2},
+		{QueryLogFull, 3},
+		{"nonsense", -1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.level, func(t *testing.T) {
+			if got := queryLogRank(tt.level); got != tt.want {
+				t.Errorf("queryLogRank(%q) = %d, want %d", tt.level, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestValidate_WebAcceptsMultipleDatabases(t *testing.T) {
+	// Provisioning connects to each target database, so a console can offer
+	// databases other than admin_database.
+	content := `
+[tailscale]
+hostname = "waypoint-test"
+
+[[listeners]]
+name = "console"
+listen = ":8080"
+mode = "web"
+backend = "10.0.0.1:5432"
+
+[listeners.postgres]
+admin_user = "admin"
+admin_password = "pw"
+admin_database = "postgres"
+
+[listeners.web]
+databases = ["appdb", "analytics"]
+`
+	cfg, err := Load(writeTestConfig(t, content))
+	if err != nil {
+		t.Fatalf("multiple databases rejected: %v", err)
+	}
+	got := cfg.Listeners[0].Web.EffectiveDatabases(cfg.Listeners[0].Postgres.AdminDatabase)
+	if len(got) != 2 || got[0] != "appdb" || got[1] != "analytics" {
+		t.Errorf("databases = %v, want [appdb analytics]", got)
+	}
+}

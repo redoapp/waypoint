@@ -2,8 +2,6 @@ package provision
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"net"
@@ -36,6 +34,8 @@ type cachedCredential struct {
 type MongoProvisioner struct {
 	adminURI    string
 	authDB      string
+	listener    string
+	truncations truncationLog
 	userPrefix  string
 	peerService string
 	store       *restrict.RedisStore
@@ -49,15 +49,15 @@ type MongoProvisioner struct {
 }
 
 // NewMongoProvisioner creates a new MongoProvisioner.
-func NewMongoProvisioner(adminUser, adminPassword, backend, authDatabase, userPrefix, peerService string, backendTLS bool, store *restrict.RedisStore, logger *slog.Logger, dialFunc func(ctx context.Context, network, addr string) (net.Conn, error)) *MongoProvisioner {
-	return NewMongoReplicaSetProvisioner(adminUser, adminPassword, []string{backend}, "", authDatabase, userPrefix, peerService, backendTLS, store, logger, dialFunc)
+func NewMongoProvisioner(adminUser, adminPassword, backend, listener, authDatabase, userPrefix, peerService string, backendTLS bool, store *restrict.RedisStore, logger *slog.Logger, dialFunc func(ctx context.Context, network, addr string) (net.Conn, error)) *MongoProvisioner {
+	return NewMongoReplicaSetProvisioner(adminUser, adminPassword, []string{backend}, "", listener, authDatabase, userPrefix, peerService, backendTLS, store, logger, dialFunc)
 }
 
 // NewMongoReplicaSetProvisioner creates a Mongo provisioner that can discover
 // the primary from a replica set seed list. When replicaSet is empty and a
 // single backend is supplied, it uses directConnection=true for standalone
 // compatibility.
-func NewMongoReplicaSetProvisioner(adminUser, adminPassword string, backends []string, replicaSet, authDatabase, userPrefix, peerService string, backendTLS bool, store *restrict.RedisStore, logger *slog.Logger, dialFunc func(ctx context.Context, network, addr string) (net.Conn, error)) *MongoProvisioner {
+func NewMongoReplicaSetProvisioner(adminUser, adminPassword string, backends []string, replicaSet, listener, authDatabase, userPrefix, peerService string, backendTLS bool, store *restrict.RedisStore, logger *slog.Logger, dialFunc func(ctx context.Context, network, addr string) (net.Conn, error)) *MongoProvisioner {
 	if userPrefix == "" {
 		userPrefix = "wp_"
 	}
@@ -69,6 +69,7 @@ func NewMongoReplicaSetProvisioner(adminUser, adminPassword string, backends []s
 	return &MongoProvisioner{
 		adminURI:    uri,
 		authDB:      authDatabase,
+		listener:    listener,
 		userPrefix:  userPrefix,
 		peerService: peerService,
 		store:       store,
@@ -82,7 +83,7 @@ func NewMongoReplicaSetProvisioner(adminUser, adminPassword string, backends []s
 // provisioner it never sets replicaSet or directConnection, so the driver
 // detects the sharded topology and routes createUser/updateUser through a
 // mongos — which propagates the change to the config servers and all shards.
-func NewMongoShardedProvisioner(adminUser, adminPassword string, mongosBackends []string, authDatabase, userPrefix, peerService string, backendTLS bool, store *restrict.RedisStore, logger *slog.Logger, dialFunc func(ctx context.Context, network, addr string) (net.Conn, error)) *MongoProvisioner {
+func NewMongoShardedProvisioner(adminUser, adminPassword string, mongosBackends []string, listener, authDatabase, userPrefix, peerService string, backendTLS bool, store *restrict.RedisStore, logger *slog.Logger, dialFunc func(ctx context.Context, network, addr string) (net.Conn, error)) *MongoProvisioner {
 	if userPrefix == "" {
 		userPrefix = "wp_"
 	}
@@ -94,6 +95,7 @@ func NewMongoShardedProvisioner(adminUser, adminPassword string, mongosBackends 
 	return &MongoProvisioner{
 		adminURI:    uri,
 		authDB:      authDatabase,
+		listener:    listener,
 		userPrefix:  userPrefix,
 		peerService: peerService,
 		store:       store,
@@ -365,20 +367,29 @@ func (p *MongoProvisioner) updateUserRoles(ctx context.Context, db *mongo.Databa
 // formatUsername builds: {prefix}{login_sanitized}_{node}
 // No database suffix since MongoDB users can have roles across multiple databases.
 // Truncated to 128 chars with hash suffix if needed for uniqueness.
+// formatUsername derives the Mongo user name.
+//
+// As on the Postgres side, the listener is part of the name so two listeners
+// over the same backend never share a user: their capability grants can
+// differ, and a shared user would let whichever provisioned last decide the
+// roles for both.
 func (p *MongoProvisioner) formatUsername(loginName, nodeName string) string {
 	sanitized := sanitize(loginName)
 	node := sanitize(nodeName)
 
-	name := fmt.Sprintf("%s%s_%s", p.userPrefix, sanitized, node)
-
-	if len(name) <= 128 {
-		return name
+	// Leading with the listener, for the same reason as the Postgres side:
+	// the tail is what truncation removes.
+	name := p.userPrefix
+	if listener := sanitize(p.listener); listener != "" {
+		name += listener + "_"
 	}
+	name += fmt.Sprintf("%s_%s", sanitized, node)
 
-	// Truncate with hash suffix for uniqueness (mirrors Postgres provisioner).
-	hash := sha256.Sum256([]byte(name))
-	suffix := hex.EncodeToString(hash[:4])
-	return name[:128-9] + "_" + suffix
+	truncated := truncateWithHash(name, maxMongoIdentifier)
+	if truncated != name {
+		p.truncations.record(p.logger, "user", name, truncated, maxMongoIdentifier)
+	}
+	return truncated
 }
 
 // mongoDialer adapts a dial function to the mongo-driver's Dialer interface.

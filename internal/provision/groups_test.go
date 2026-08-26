@@ -97,12 +97,13 @@ func TestDesiredGroups_PurePresetPath(t *testing.T) {
 		Permissions: []string{"readonly", "readwrite"},
 		Schemas:     []string{"public", "audit"},
 	}
-	got := desiredGroups(perms, "redo")
+	p := &Provisioner{userPrefix: "wp_", listener: "pg-main"}
+	got := p.desiredGroups(perms, "redo")
 	want := map[string]bool{
-		"wp_grp_readonly_public_redo":  true,
-		"wp_grp_readonly_audit_redo":   true,
-		"wp_grp_readwrite_public_redo": true,
-		"wp_grp_readwrite_audit_redo":  true,
+		"wp_grp_pg_main_readonly_public_redo":  true,
+		"wp_grp_pg_main_readonly_audit_redo":   true,
+		"wp_grp_pg_main_readwrite_public_redo": true,
+		"wp_grp_pg_main_readwrite_audit_redo":  true,
 	}
 	if len(got) != len(want) {
 		t.Fatalf("expected %d groups, got %d: %v", len(want), len(got), got)
@@ -120,12 +121,13 @@ func TestDesiredGroups_CompositePathOnSQL(t *testing.T) {
 		Schemas:     []string{"public"},
 		SQL:         []string{"GRANT SELECT ON public.foo TO {{.Role}}"},
 	}
-	got := desiredGroups(perms, "redo")
+	p := &Provisioner{userPrefix: "wp_", listener: "pg-main"}
+	got := p.desiredGroups(perms, "redo")
 	if len(got) != 1 {
 		t.Fatalf("expected 1 composite group, got %v", got)
 	}
-	if !strings.HasPrefix(got[0], "wp_grp_perms_") {
-		t.Errorf("composite group name should start with wp_grp_perms_, got %q", got[0])
+	if !strings.HasPrefix(got[0], "wp_grp_pg_main_perms_") {
+		t.Errorf("composite group name should start with wp_grp_pg_main_perms_, got %q", got[0])
 	}
 	if !strings.HasSuffix(got[0], "_redo") {
 		t.Errorf("composite group name should end with _redo, got %q", got[0])
@@ -133,27 +135,30 @@ func TestDesiredGroups_CompositePathOnSQL(t *testing.T) {
 }
 
 func TestDesiredGroups_NilOrEmpty(t *testing.T) {
-	if g := desiredGroups(nil, "redo"); g != nil {
+	p := &Provisioner{userPrefix: "wp_", listener: "pg-main"}
+	if g := p.desiredGroups(nil, "redo"); g != nil {
 		t.Errorf("nil perms should yield no groups, got %v", g)
 	}
-	if g := desiredGroups(&auth.DBPermissions{}, "redo"); g != nil {
+	if g := p.desiredGroups(&auth.DBPermissions{}, "redo"); g != nil {
 		t.Errorf("empty perms should yield no groups, got %v", g)
 	}
 }
 
 func TestPresetGroupName_FitsIdentifierLimit(t *testing.T) {
-	name := presetGroupName("readwrite", "public", "redo")
+	p := &Provisioner{userPrefix: "wp_", listener: "pg-main"}
+	name := p.presetGroupName("readwrite", "public", "redo")
 	if len(name) > 63 {
 		t.Fatalf("preset group name exceeds 63 chars: %q (%d)", name, len(name))
 	}
-	if name != "wp_grp_readwrite_public_redo" {
+	if name != "wp_grp_pg_main_readwrite_public_redo" {
 		t.Fatalf("got %q", name)
 	}
 }
 
 func TestCompositeGroupName_FitsIdentifierLimit(t *testing.T) {
-	p := &auth.DBPermissions{SQL: []string{"GRANT SELECT ON public.x TO {{.Role}}"}}
-	name := compositeGroupName(p, strings.Repeat("d", 30))
+	perms := &auth.DBPermissions{SQL: []string{"GRANT SELECT ON public.x TO {{.Role}}"}}
+	p := &Provisioner{userPrefix: "wp_", listener: "pg-main"}
+	name := p.compositeGroupName(perms, strings.Repeat("d", 30))
 	if len(name) > 63 {
 		t.Fatalf("composite group name exceeds 63 chars: %q (%d)", name, len(name))
 	}
@@ -168,5 +173,89 @@ func TestUsesCompositePath(t *testing.T) {
 	}
 	if !usesCompositePath(&auth.DBPermissions{SQL: []string{"GRANT SELECT ON x TO {{.Role}}"}}) {
 		t.Error("any SQL fragment forces composite path")
+	}
+}
+
+func TestGroupPrefix_ScopedToPrefixAndListener(t *testing.T) {
+	// A group is owned by the admin that created it, and Postgres 16 grants
+	// ADMIN OPTION only to that creator. Two provisioners must therefore
+	// never derive the same group name unless they are the same provisioner.
+	cases := []struct {
+		name string
+		a, b *Provisioner
+		same bool
+	}{
+		{
+			name: "different listeners",
+			a:    &Provisioner{userPrefix: "wp_", listener: "pg-main"},
+			b:    &Provisioner{userPrefix: "wp_", listener: "console"},
+		},
+		{
+			name: "different user prefixes",
+			a:    &Provisioner{userPrefix: "wire_", listener: "pg-main"},
+			b:    &Provisioner{userPrefix: "console_", listener: "pg-main"},
+		},
+		{
+			name: "identical provisioners share groups",
+			a:    &Provisioner{userPrefix: "wp_", listener: "pg-main"},
+			b:    &Provisioner{userPrefix: "wp_", listener: "pg-main"},
+			same: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			an := tc.a.presetGroupName("readonly", "public", "appdb")
+			bn := tc.b.presetGroupName("readonly", "public", "appdb")
+			if tc.same && an != bn {
+				t.Errorf("expected the same group, got %q and %q", an, bn)
+			}
+			if !tc.same && an == bn {
+				t.Errorf("both provisioners derived the group %q; the second admin could not grant it", an)
+			}
+
+			perms := &auth.DBPermissions{SQL: []string{"GRANT SELECT ON public.x TO {{.Role}}"}}
+			ac := tc.a.compositeGroupName(perms, "appdb")
+			bc := tc.b.compositeGroupName(perms, "appdb")
+			if tc.same && ac != bc {
+				t.Errorf("expected the same composite group, got %q and %q", ac, bc)
+			}
+			if !tc.same && ac == bc {
+				t.Errorf("both provisioners derived the composite group %q", ac)
+			}
+		})
+	}
+}
+
+func TestGroupPrefix_HonoursUserPrefix(t *testing.T) {
+	// user_prefix previously had no effect on group names at all: roles were
+	// named acme_* while their groups were named wp_grp_*.
+	p := &Provisioner{userPrefix: "acme_", listener: "pg-main"}
+	name := p.presetGroupName("readonly", "public", "appdb")
+	if !strings.HasPrefix(name, "acme_grp_") {
+		t.Errorf("group %q does not carry the configured user_prefix", name)
+	}
+}
+
+func TestGroupPrefix_DefaultsWhenPrefixUnset(t *testing.T) {
+	p := &Provisioner{listener: "pg-main"}
+	if name := p.presetGroupName("readonly", "public", "appdb"); !strings.HasPrefix(name, "wp_grp_") {
+		t.Errorf("group %q should fall back to the wp_ prefix", name)
+	}
+}
+
+func TestClampIdentifier_UsesTheRoleTruncationScheme(t *testing.T) {
+	p := &Provisioner{userPrefix: "wp_", listener: strings.Repeat("listener", 8)}
+	name := p.presetGroupName("readwrite", strings.Repeat("schema", 6), strings.Repeat("db", 10))
+
+	if len(name) != maxPGIdentifier {
+		t.Fatalf("len = %d, want %d", len(name), maxPGIdentifier)
+	}
+	// Same shape as role names: 52 kept, an underscore, 10 hex characters.
+	if name[52] != '_' {
+		t.Errorf("separator = %q, want an underscore", string(name[52]))
+	}
+	if got := name[53:]; len(got) != 10 {
+		t.Errorf("hash suffix = %q, want 10 characters", got)
 	}
 }

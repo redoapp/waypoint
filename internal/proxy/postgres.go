@@ -19,6 +19,7 @@ import (
 	"github.com/redoapp/waypoint/internal/metrics"
 	"github.com/redoapp/waypoint/internal/pgwire"
 	"github.com/redoapp/waypoint/internal/provision"
+	"github.com/redoapp/waypoint/internal/querylog"
 	"github.com/redoapp/waypoint/internal/restrict"
 )
 
@@ -40,6 +41,12 @@ type PostgresProxy struct {
 	Dialer        func(ctx context.Context, network, addr string) (net.Conn, error)
 	BytesRead     *atomic.Int64 // optional: aggregate byte counter
 	BytesWritten  *atomic.Int64 // optional: aggregate byte counter
+
+	// QueryLog and QueryLogConfig enable per-statement logging. Both must be
+	// set for it to run; when the resolved level is off, no tap is installed
+	// and the relay path is unchanged.
+	QueryLog       *querylog.Emitter
+	QueryLogConfig *config.QueryLogConfig
 }
 
 // HandleConn processes a single inbound PostgreSQL connection.
@@ -371,9 +378,34 @@ func (p *PostgresProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 		go p.revalidateLoop(revalCtx, setupSpanCtx, connID, clientConn, backendConn, result.LoginName, requestedDB, pgUser, presetLimit, log)
 	}
 
+	// Step 12b: Install the query log taps. Wrapping both directions lets
+	// responses be attributed to the statement that caused them. The taps are
+	// byte-transparent, so cl's accounting is unaffected.
+	relayClient, relayBackend := clientConn, backendConn
+	var qlSession *querylog.PGSession
+	if level := resolveQueryLogLevel(p.QueryLogConfig, result.QueryLog); level > querylog.LevelOff && p.QueryLog != nil {
+		qlSession = querylog.NewPGSession(p.QueryLog, querylog.Event{
+			ConnID:            connID,
+			Listener:          p.Name,
+			User:              result.LoginName,
+			Database:          requestedDB,
+			Level:             level,
+			MaxStatementBytes: p.QueryLogConfig.EffectiveMaxStatementBytes(),
+		})
+		relayClient = qlSession.ClientConn(clientConn)
+		relayBackend = qlSession.BackendConn(backendConn)
+		log.DebugContext(ctx, "query logging enabled", "level", level.String())
+	}
+
 	log.DebugContext(ctx, "relay started")
 
-	relayResult := restrict.Relay(clientConn, backendConn, cl)
+	relayResult := restrict.Relay(relayClient, relayBackend, cl)
+
+	// Flush any statement still awaiting a response so a connection that
+	// drops mid-query still leaves a record.
+	if qlSession != nil {
+		qlSession.Close()
+	}
 
 	switch relayResult.Reason {
 	case restrict.CloseLimit:

@@ -1,0 +1,194 @@
+---
+title: Web console
+description: A browser-based SQL console that authenticates with Tailscale identity and provisions per-user Postgres roles.
+---
+
+The `web` listener mode serves a browser-based SQL console. It reuses the same
+identity path as the wire-protocol modes — Tailscale `WhoIs` plus
+`redo.com/cap/waypoint` capability grants — so there is no login page, no
+session cookie, and no password to manage.
+
+```toml
+[[listeners]]
+name = "console"
+listen = ":8443"
+mode = "web"
+backend = "10.0.1.10:5432"
+tls_mode = "require"       # default for web listeners; "off" serves plain HTTP
+use_tailscale_tls = true
+
+[listeners.postgres]
+admin_user = "waypoint_admin"
+admin_password = "${PG_ADMIN_PASSWORD}"
+admin_database = "postgres"
+
+[listeners.web]
+databases = ["appdb", "analytics"]
+max_rows = 1000
+statement_timeout = "30s"
+```
+
+`databases` is the menu shown in the console's picker. Each entry gets its own
+provisioned role and its own connection pool, and capability grants still
+decide which of them a given user can reach — an entry the caller has no grant
+for is refused. They need not include `admin_database`: provisioning connects
+to each target database to apply its grants.
+
+Open `https://<node>.<tailnet>.ts.net:8443` from any device on the tailnet.
+
+:::note
+Unlike the wire-protocol modes, a web listener has no TLS negotiation — it is
+either HTTPS or it is not. `tls_mode` therefore defaults to `require` rather
+than `optional`, and setting it to `optional` is rejected at config load. Use
+`tls_mode = "off"` only when something in front of the console terminates TLS.
+
+Serving over plain HTTP also costs you a browser secure context, which some
+APIs require. Copying results falls back to a legacy path there rather than
+failing, but HTTPS is the supported configuration.
+:::
+
+## Trying it locally
+
+You do not need a tailnet to try the console. The repository ships a demo that
+runs an in-process mock Tailscale control plane, seeds a throwaway Postgres,
+and joins its own mock tailnet as a second node standing in for your browser:
+
+```sh
+console-demo                      # devenv script
+console-demo -preset readonly     # see the permission warnings
+console-demo --stop               # remove the containers
+```
+
+Open the printed `http://127.0.0.1:8080`. Requests still arrive at the console
+from a real peer address and are still authorized by a real `WhoIs` against a
+real capability grant — only the control plane is fake, so the identity path
+being exercised is the production one.
+
+The seeded schema is built for the editor features: a chain of foreign keys
+from `label_scans` through `labels`, `shipments`, and `orders` to `customers`
+for multi-hop join completion, and a two-column key between `item_returns` and
+`order_items` for composite-key joins.
+
+The demo command is excluded from normal builds by a `demo` build tag, so the
+mock control plane never enters a release binary's dependency graph.
+
+## Nothing is preserved
+
+The console is deliberately stateless on both sides.
+
+In the browser there is no `localStorage`, no `sessionStorage`, and no service
+worker. Closing the tab discards the query buffers, the open tabs, and the
+results. Query text and result rows are production data, and leaving them at
+rest in a browser would outlive the connection that was authorized to produce
+them.
+
+On the server there is no session store. Every request is authorized on its
+own by re-reading the caller's capability grants, which means **a revoked grant
+stops working on the next request** — finer-grained than the timer-based
+[revalidation](/waypoint/configuration/revalidation/) a long-lived wire
+connection has to use. The only server-side state is connection pools and
+catalog caches, both reconstructible at any time.
+
+## Separate access for the console and the wire protocol
+
+Capability grants are keyed by **listener name**, so a web listener and a
+postgres listener are independent entries and can carry different permissions:
+
+```json
+"app": {
+  "redo.com/cap/waypoint": [{
+    "backends": {
+      "pg-main": { "pg": { "databases": { "appdb": { "permissions": ["readwrite"] } } } },
+      "console": { "pg": { "databases": { "appdb": { "permissions": ["readonly"] } } } }
+    }
+  }]
+}
+```
+
+That grant lets a `psql` session write while the browser console is read-only.
+
+That grant works with no other configuration: role names include the listener,
+so the two listeners provision **separate** Postgres roles even when they share
+a `user_prefix`, and their grants cannot clobber one another. See
+[Role naming](/waypoint/operations/role-cleanup/#role-naming).
+
+## Permissions
+
+The console connects as the per-user role that
+[provisioning](/waypoint/configuration/provisioning/) creates, exactly as
+Postgres mode does. **Postgres is the security boundary**, not the UI.
+
+The editor surfaces the same facts before you run a statement:
+
+- Relations you cannot see never appear, because catalog introspection runs
+  through `information_schema` on your own role.
+- A write against a relation you lack the privilege for is flagged inline,
+  naming the relation and the missing privilege. The check uses
+  `has_table_privilege`, which resolves through the group memberships
+  provisioning uses to implement presets, so it reflects your effective
+  privileges rather than inferring them from the preset name.
+
+These annotations are advisory. If the linter and the database ever disagree,
+the database is right.
+
+## Editor assistance
+
+The editor is CodeMirror 6 with completions served by Waypoint rather than by a
+language server.
+
+**Schema-aware completion.** Relations, columns, and aliases resolve against
+the live catalog. Columns load per relation on demand, so the payload does not
+grow with the size of the database.
+
+**Join assistance.** Selecting a relation after `JOIN` inserts the relation, an
+alias, and the full `ON` predicate derived from the foreign key — including
+composite keys, which emit one `AND`-ed predicate per column pair. Relations
+with no direct foreign key are reached by path-finding across the FK graph, and
+the completion inserts every intermediate join.
+
+**Diagnostics.** Syntax errors come from the same SQL parser the query log
+uses, with the caret landing on the offending token. Permission warnings and
+unqualified `UPDATE`/`DELETE` warnings appear in the lint gutter.
+
+## Limits and auditing
+
+Web queries consume the same per-user connection budget as wire connections, so
+the console cannot be used to sidestep
+[limits](/waypoint/acl/capability-grants/). Statements are emitted into the same
+[query log](/waypoint/observability/query-logging/) stream, at whatever level
+the listener and the grant resolve to.
+
+`max_rows` caps what any single statement returns to the browser; results
+beyond it are marked truncated. `statement_timeout` bounds execution
+server-side.
+
+## Cancelling a query
+
+Pressing `Esc` cancels the running statement. The console learns the backend
+PID from the first frame of the result stream, before any rows arrive, and
+cancellation is a separate request carrying that PID — which is why it works
+without the server holding any per-query state. Waypoint verifies the PID
+belongs to your role before signalling it.
+
+## Keyboard
+
+| Shortcut | Action |
+| --- | --- |
+| `⌘↩` / `Ctrl+↩` | Run the statement under the cursor |
+| `⌘⇧↩` | Run the entire buffer |
+| `Esc` | Cancel the running statement |
+| `⌘K` / `⌘P` | Command palette and table jump |
+| `Ctrl+T` | New query tab |
+
+## Building the frontend
+
+The console's assets are committed to the repository, so the release build
+stays pure Go with no Node toolchain. Rebuild them after changing anything
+under `internal/web/frontend/`:
+
+```sh
+build-console   # devenv script; runs npm install && npm run build
+```
+
+The output lands in `internal/web/assets/app.js` and is embedded via
+`go:embed`.

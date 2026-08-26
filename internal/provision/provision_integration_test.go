@@ -45,7 +45,7 @@ func setupProvisionerFor(t *testing.T, db dbBackend) *Provisioner {
 	rdb := testutil.RedisClient(t)
 	store := restrict.NewRedisStore(rdb, "inttest:", metrics.Noop())
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	return NewProvisioner(db.adminUser, db.adminPass, "waypoint_test", db.backend, "wp_", false, true, "test", store, logger, nil, nil)
+	return NewProvisioner(db.adminUser, db.adminPass, "waypoint_test", db.backend, "test-listener", "wp_", false, true, "test", store, logger, nil, nil)
 }
 
 func adminConnFor(t *testing.T, db dbBackend) *pgx.Conn {
@@ -625,9 +625,12 @@ func TestIntegration_EnsureUser_SQLStatements(t *testing.T) {
 	}
 }
 
-// memberOfPresetGroups returns the wp_grp_ memberships of pgUser, used by
-// integration tests that assert on group-membership reconciliation.
-func memberOfPresetGroups(t *testing.T, db dbBackend, pgUser string) []string {
+// memberOfPresetGroups returns pgUser's memberships in groups under
+// groupPrefix, used by integration tests that assert on group-membership
+// reconciliation. The prefix comes from the provisioner under test rather
+// than a literal, since it carries that provisioner's user_prefix and
+// listener.
+func memberOfPresetGroups(t *testing.T, db dbBackend, pgUser, groupPrefix string) []string {
 	t.Helper()
 	conn := adminConnFor(t, db)
 	rows, err := conn.Query(context.Background(), `
@@ -647,7 +650,7 @@ ORDER BY r.rolname`, pgUser)
 		if err := rows.Scan(&name); err != nil {
 			t.Fatalf("scan: %v", err)
 		}
-		if strings.HasPrefix(name, "wp_grp_") {
+		if strings.HasPrefix(name, groupPrefix) {
 			out = append(out, name)
 		}
 	}
@@ -670,8 +673,9 @@ func TestIntegration_EnsureUser_GroupMembershipsForPureReadonly(t *testing.T) {
 			}
 			t.Cleanup(func() { cleanupRoleFor(t, db, pgUser) })
 
-			got := memberOfPresetGroups(t, db, pgUser)
-			if len(got) != 1 || got[0] != "wp_grp_readonly_public_waypoint_test" {
+			got := memberOfPresetGroups(t, db, pgUser, p.groupPrefix())
+			want := p.presetGroupName("readonly", "public", "waypoint_test")
+			if len(got) != 1 || got[0] != want {
 				t.Fatalf("expected single membership wp_grp_readonly_public_waypoint_test, got %v", got)
 			}
 		})
@@ -691,7 +695,7 @@ func TestIntegration_EnsureUser_GroupMembershipsAreStableAcrossReconnects(t *tes
 			}
 			t.Cleanup(func() { cleanupRoleFor(t, db, pgUser) })
 
-			before := memberOfPresetGroups(t, db, pgUser)
+			before := memberOfPresetGroups(t, db, pgUser, p.groupPrefix())
 
 			// Second EnsureUser with identical perms should be a no-op for
 			// membership state — the steady-state path that needs to be cheap.
@@ -699,7 +703,7 @@ func TestIntegration_EnsureUser_GroupMembershipsAreStableAcrossReconnects(t *tes
 				t.Fatalf("second EnsureUser: %v", err)
 			}
 
-			after := memberOfPresetGroups(t, db, pgUser)
+			after := memberOfPresetGroups(t, db, pgUser, p.groupPrefix())
 			if len(before) != len(after) {
 				t.Fatalf("membership count changed: before=%v after=%v", before, after)
 			}
@@ -725,8 +729,9 @@ func TestIntegration_EnsureUser_GroupMembershipsTrackPresetChange(t *testing.T) 
 			}
 			t.Cleanup(func() { cleanupRoleFor(t, db, pgUser) })
 
-			before := memberOfPresetGroups(t, db, pgUser)
-			if len(before) != 1 || before[0] != "wp_grp_readwrite_public_waypoint_test" {
+			before := memberOfPresetGroups(t, db, pgUser, p.groupPrefix())
+			wantBefore := p.presetGroupName("readwrite", "public", "waypoint_test")
+			if len(before) != 1 || before[0] != wantBefore {
 				t.Fatalf("expected wp_grp_readwrite_public_waypoint_test, got %v", before)
 			}
 
@@ -735,8 +740,9 @@ func TestIntegration_EnsureUser_GroupMembershipsTrackPresetChange(t *testing.T) 
 				t.Fatal(err)
 			}
 
-			after := memberOfPresetGroups(t, db, pgUser)
-			if len(after) != 1 || after[0] != "wp_grp_readonly_public_waypoint_test" {
+			after := memberOfPresetGroups(t, db, pgUser, p.groupPrefix())
+			wantAfter := p.presetGroupName("readonly", "public", "waypoint_test")
+			if len(after) != 1 || after[0] != wantAfter {
 				t.Fatalf("expected single readonly membership, got %v", after)
 			}
 		})
@@ -767,11 +773,11 @@ func TestIntegration_EnsureUser_SQLFragmentUsesCompositeGroup(t *testing.T) {
 			}
 			t.Cleanup(func() { cleanupRoleFor(t, db, pgUser) })
 
-			groups := memberOfPresetGroups(t, db, pgUser)
+			groups := memberOfPresetGroups(t, db, pgUser, p.groupPrefix())
 			if len(groups) != 1 {
 				t.Fatalf("expected exactly 1 group membership, got %v", groups)
 			}
-			if !strings.HasPrefix(groups[0], "wp_grp_perms_") {
+			if !strings.HasPrefix(groups[0], p.groupPrefix()+"perms_") {
 				t.Fatalf("expected composite group prefix, got %q", groups[0])
 			}
 		})
@@ -800,8 +806,8 @@ func TestIntegration_EnsureUser_SwitchPurePresetToComposite(t *testing.T) {
 			}
 			t.Cleanup(func() { cleanupRoleFor(t, db, pgUser) })
 
-			before := memberOfPresetGroups(t, db, pgUser)
-			if len(before) != 1 || !strings.HasPrefix(before[0], "wp_grp_readonly_") {
+			before := memberOfPresetGroups(t, db, pgUser, p.groupPrefix())
+			if len(before) != 1 || !strings.HasPrefix(before[0], p.groupPrefix()+"readonly_") {
 				t.Fatalf("expected initial readonly group, got %v", before)
 			}
 
@@ -813,8 +819,8 @@ func TestIntegration_EnsureUser_SwitchPurePresetToComposite(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			after := memberOfPresetGroups(t, db, pgUser)
-			if len(after) != 1 || !strings.HasPrefix(after[0], "wp_grp_perms_") {
+			after := memberOfPresetGroups(t, db, pgUser, p.groupPrefix())
+			if len(after) != 1 || !strings.HasPrefix(after[0], p.groupPrefix()+"perms_") {
 				t.Fatalf("expected composite group after switch, got %v", after)
 			}
 		})
@@ -950,10 +956,10 @@ func TestIntegration_EnsureUser_MultiSchemaGroupMemberships(t *testing.T) {
 			}
 			t.Cleanup(func() { cleanupRoleFor(t, db, pgUser) })
 
-			groups := memberOfPresetGroups(t, db, pgUser)
+			groups := memberOfPresetGroups(t, db, pgUser, p.groupPrefix())
 			want := map[string]bool{
-				"wp_grp_readonly_public_waypoint_test":      true,
-				"wp_grp_readonly_multi_audit_waypoint_test": true,
+				p.presetGroupName("readonly", "public", "waypoint_test"):      true,
+				p.presetGroupName("readonly", "multi_audit", "waypoint_test"): true,
 			}
 			if len(groups) != len(want) {
 				t.Fatalf("expected %d memberships, got %v", len(want), groups)
@@ -969,3 +975,316 @@ func TestIntegration_EnsureUser_MultiSchemaGroupMemberships(t *testing.T) {
 
 // Ensure the redis import is used (it's needed for the RedisClient call via testutil).
 var _ *redis.Client
+
+// TestIntegrationEnsureUser_GrantsLandInTheTargetDatabase is the regression
+// test for grants being applied to the wrong database.
+//
+// Privileges on schemas, tables and sequences are stored per database in
+// Postgres. Provisioning used to issue them over a connection to
+// admin_database regardless of which database the role was for, so a role
+// provisioned for any other database ended up with its privileges in
+// admin_database and every query it ran was refused.
+func TestIntegrationEnsureUser_GrantsLandInTheTargetDatabase(t *testing.T) {
+	ctx := context.Background()
+	connStr, backend := testutil.PostgresBackend(t)
+
+	admin, err := pgx.Connect(ctx, connStr)
+	if err != nil {
+		t.Fatalf("admin connect: %v", err)
+	}
+	defer admin.Close(ctx)
+
+	// A second database with a table of its own. The admin database keeps a
+	// differently-named table so the two are never confused.
+	const otherDB = "wp_other_db"
+	for _, stmt := range []string{
+		"DROP DATABASE IF EXISTS " + otherDB,
+		"CREATE DATABASE " + otherDB,
+		"DROP TABLE IF EXISTS in_admin_db",
+		"CREATE TABLE in_admin_db (id int)",
+	} {
+		if _, err := admin.Exec(ctx, stmt); err != nil {
+			t.Fatalf("setup %q: %v", stmt, err)
+		}
+	}
+	t.Cleanup(func() {
+		c, err := pgx.Connect(context.Background(), connStr)
+		if err != nil {
+			return
+		}
+		defer c.Close(context.Background())
+		_, _ = c.Exec(context.Background(), "DROP DATABASE IF EXISTS "+otherDB+" WITH (FORCE)")
+		// Leaving this behind makes any later test that grants on ALL TABLES
+		// IN SCHEMA public depend on the order tests happen to run in.
+		_, _ = c.Exec(context.Background(), "DROP TABLE IF EXISTS in_admin_db")
+	})
+
+	otherConnStr := strings.Replace(connStr, "/waypoint_test", "/"+otherDB, 1)
+	other, err := pgx.Connect(ctx, otherConnStr)
+	if err != nil {
+		t.Fatalf("connect to %s: %v", otherDB, err)
+	}
+	defer other.Close(ctx)
+	if _, err := other.Exec(ctx, "CREATE TABLE in_other_db (id int)"); err != nil {
+		t.Fatalf("create table in %s: %v", otherDB, err)
+	}
+
+	// admin_database is waypoint_test; provision for the other one.
+	rdb := testutil.RedisClient(t)
+	store := restrict.NewRedisStore(rdb, "granttest:", metrics.Noop())
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	p := NewProvisioner("admin", "adminpass", "waypoint_test", backend, "grant-test", "wp_gt_",
+		false, true, "test", store, logger, nil, nil)
+
+	role, _, err := p.EnsureUser(ctx, "alice@example.com", "laptop", otherDB,
+		&auth.DBPermissions{Permissions: []string{"readonly"}, Schemas: []string{"public"}})
+	if err != nil {
+		t.Fatalf("EnsureUser: %v", err)
+	}
+	t.Cleanup(func() {
+		c, err := pgx.Connect(context.Background(), otherConnStr)
+		if err == nil {
+			_, _ = c.Exec(context.Background(), "DROP OWNED BY "+pgx.Identifier{role}.Sanitize())
+			c.Close(context.Background())
+		}
+		c, err = pgx.Connect(context.Background(), connStr)
+		if err == nil {
+			_, _ = c.Exec(context.Background(), "DROP OWNED BY "+pgx.Identifier{role}.Sanitize())
+			_, _ = c.Exec(context.Background(), "DROP ROLE IF EXISTS "+pgx.Identifier{role}.Sanitize())
+			c.Close(context.Background())
+		}
+	})
+
+	// The privilege must exist in the database the role was provisioned for.
+	var canReadOther bool
+	if err := other.QueryRow(ctx,
+		"SELECT has_table_privilege($1, 'public.in_other_db', 'SELECT')", role).Scan(&canReadOther); err != nil {
+		t.Fatalf("privilege check in %s: %v", otherDB, err)
+	}
+	if !canReadOther {
+		t.Errorf("role %q cannot read %s.public.in_other_db — grants did not land in the target database", role, otherDB)
+	}
+
+	// And must not have been applied to the admin database instead.
+	var canReadAdmin bool
+	if err := admin.QueryRow(ctx,
+		"SELECT has_table_privilege($1, 'public.in_admin_db', 'SELECT')", role).Scan(&canReadAdmin); err != nil {
+		t.Fatalf("privilege check in admin db: %v", err)
+	}
+	if canReadAdmin {
+		t.Errorf("role %q holds privileges in admin_database it was never granted for", role)
+	}
+
+	// The end-to-end proof: connect as the role and read the table.
+	roleConn, err := pgx.Connect(ctx, strings.Replace(otherConnStr, "admin:adminpass", role+":"+mustPassword(t, p, role, otherDB), 1))
+	if err == nil {
+		defer roleConn.Close(ctx)
+		var n int
+		if err := roleConn.QueryRow(ctx, "SELECT count(*) FROM in_other_db").Scan(&n); err != nil {
+			t.Errorf("role could not query the table it was granted: %v", err)
+		}
+	}
+}
+
+// mustPassword re-provisions to obtain a usable password for the role.
+func mustPassword(t *testing.T, p *Provisioner, role, database string) string {
+	t.Helper()
+	_, pw, err := p.EnsureUser(context.Background(), "alice@example.com", "laptop", database,
+		&auth.DBPermissions{Permissions: []string{"readonly"}, Schemas: []string{"public"}})
+	if err != nil {
+		t.Fatalf("re-provision for password: %v", err)
+	}
+	return pw
+}
+
+func TestIntegrationEnsureUser_MissingTargetDatabaseStillCreatesRole(t *testing.T) {
+	ctx := context.Background()
+	_, backend := testutil.PostgresBackend(t)
+
+	rdb := testutil.RedisClient(t)
+	store := restrict.NewRedisStore(rdb, "granttest2:", metrics.Noop())
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	p := NewProvisioner("admin", "adminpass", "waypoint_test", backend, "missing-db", "wp_md_",
+		false, true, "test", store, logger, nil, nil)
+
+	// Provisioning for a database that does not exist must not fail outright:
+	// the role is still created so the backend, not waypoint, reports the
+	// missing database to the client.
+	role, _, err := p.EnsureUser(ctx, "bob@example.com", "laptop", "no_such_database_here",
+		&auth.DBPermissions{Permissions: []string{"readonly"}})
+	if err != nil {
+		t.Fatalf("EnsureUser against a missing database: %v", err)
+	}
+	if role == "" {
+		t.Error("no role name returned")
+	}
+}
+
+// TestIntegrationConnectToTarget_MissingDatabaseAcrossBackends pins the
+// behaviour the two backends disagree on.
+//
+// Postgres refuses a connection to a database that does not exist. CockroachDB
+// accepts it, and even answers SELECT 1, failing only when a catalog is read.
+// Provisioning has to reach the same conclusion on both, or the missing
+// database surfaces as a failure partway through the provisioning transaction
+// instead of a clean fallback.
+func TestIntegrationConnectToTarget_MissingDatabaseAcrossBackends(t *testing.T) {
+	for _, db := range testBackends(t) {
+		t.Run(db.name, func(t *testing.T) {
+			ctx := context.Background()
+			p := setupProvisionerFor(t, db)
+
+			conn, exists, err := p.connectToTarget(ctx, "definitely_not_a_database")
+			if err != nil {
+				t.Fatalf("connectToTarget should fall back, not fail: %v", err)
+			}
+			defer conn.Close(ctx)
+
+			if exists {
+				t.Error("reported a missing database as present")
+			}
+
+			// The fallback connection must be usable — it is what the rest of
+			// provisioning runs on.
+			var n int
+			if err := conn.QueryRow(ctx, "SELECT count(*) FROM pg_database").Scan(&n); err != nil {
+				t.Errorf("fallback connection cannot read the catalog: %v", err)
+			}
+		})
+	}
+}
+
+func TestIntegrationConnectToTarget_ExistingDatabaseIsReached(t *testing.T) {
+	for _, db := range testBackends(t) {
+		t.Run(db.name, func(t *testing.T) {
+			ctx := context.Background()
+			p := setupProvisionerFor(t, db)
+
+			conn, exists, err := p.connectToTarget(ctx, "waypoint_test")
+			if err != nil {
+				t.Fatalf("connectToTarget: %v", err)
+			}
+			defer conn.Close(ctx)
+
+			if !exists {
+				t.Error("existing database reported as missing")
+			}
+			// Crucially, the connection is to that database — this is what
+			// puts schema and table grants in the right place.
+			var current string
+			if err := conn.QueryRow(ctx, "SELECT current_database()").Scan(&current); err != nil {
+				t.Fatalf("current_database: %v", err)
+			}
+			if current != "waypoint_test" {
+				t.Errorf("connected to %q, want waypoint_test", current)
+			}
+		})
+	}
+}
+
+// TestIntegrationTwoAdmins_ShareABackendWithoutColliding is the regression
+// test for group roles being shared across listeners.
+//
+// A group role is owned by the admin that created it, and Postgres 16 grants
+// ADMIN OPTION only to that creator. Group names used to be
+// wp_grp_<preset>_<schema>_<database> — no listener, and not even the
+// user_prefix — so two listeners over one backend derived the same group and
+// the second admin could not grant it:
+//
+//	permission denied to grant role "wp_grp_readonly_public_waypoint_test"
+func TestIntegrationTwoAdmins_ShareABackendWithoutColliding(t *testing.T) {
+	ctx := context.Background()
+	connStr, backend := testutil.PostgresBackend(t)
+
+	su, err := pgx.Connect(ctx, connStr)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer su.Close(ctx)
+
+	for _, stmt := range []string{
+		`DROP SCHEMA IF EXISTS two_admin CASCADE`,
+		`CREATE SCHEMA two_admin`,
+		`CREATE TABLE two_admin.tbl (id int)`,
+		`DROP ROLE IF EXISTS wp_admin_a`,
+		`DROP ROLE IF EXISTS wp_admin_b`,
+		// Deliberately non-superuser: a superuser bypasses ADMIN OPTION and
+		// would not exercise the collision at all.
+		`CREATE ROLE wp_admin_a LOGIN PASSWORD 'p' CREATEROLE`,
+		`CREATE ROLE wp_admin_b LOGIN PASSWORD 'p' CREATEROLE`,
+		`GRANT SELECT ON two_admin.tbl TO wp_admin_a WITH GRANT OPTION`,
+		`GRANT SELECT ON two_admin.tbl TO wp_admin_b WITH GRANT OPTION`,
+		`GRANT USAGE ON SCHEMA two_admin TO wp_admin_a WITH GRANT OPTION`,
+		`GRANT USAGE ON SCHEMA two_admin TO wp_admin_b WITH GRANT OPTION`,
+	} {
+		if _, err := su.Exec(ctx, stmt); err != nil {
+			t.Fatalf("setup %q: %v", stmt, err)
+		}
+	}
+	t.Cleanup(func() {
+		c, err := pgx.Connect(context.Background(), connStr)
+		if err != nil {
+			return
+		}
+		defer c.Close(context.Background())
+		_, _ = c.Exec(context.Background(), "DROP SCHEMA IF EXISTS two_admin CASCADE")
+		for _, r := range []string{"wp_admin_a", "wp_admin_b"} {
+			_, _ = c.Exec(context.Background(), "REASSIGN OWNED BY "+r+" TO admin")
+			_, _ = c.Exec(context.Background(), "DROP OWNED BY "+r)
+			_, _ = c.Exec(context.Background(), "DROP ROLE IF EXISTS "+r)
+		}
+	})
+
+	newProvisioner := func(adminUser, listener string) *Provisioner {
+		rdb := testutil.RedisClient(t)
+		store := restrict.NewRedisStore(rdb, "twoadmin:"+listener+":", metrics.Noop())
+		logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+		return NewProvisioner(adminUser, "p", "waypoint_test", backend, listener, "wp_ta_",
+			false, true, "test", store, logger, nil, nil)
+	}
+
+	// A schema of its own, so the grants here cover only this test's table
+	// and the result does not depend on what other tests left in public.
+	perms := &auth.DBPermissions{Permissions: []string{"readonly"}, Schemas: []string{"two_admin"}}
+
+	roleA, _, err := newProvisioner("wp_admin_a", "listener-a").
+		EnsureUser(ctx, "user@example.com", "laptop", "waypoint_test", perms)
+	if err != nil {
+		t.Fatalf("listener A provisioning: %v", err)
+	}
+
+	// The second listener, with a different admin, must not trip over the
+	// first one's group.
+	roleB, _, err := newProvisioner("wp_admin_b", "listener-b").
+		EnsureUser(ctx, "user@example.com", "laptop", "waypoint_test", perms)
+	if err != nil {
+		t.Fatalf("listener B provisioning failed against a shared backend: %v", err)
+	}
+
+	if roleA == roleB {
+		t.Fatalf("both listeners provisioned the role %q", roleA)
+	}
+
+	// Each listener's groups are its own, and each user really does hold the
+	// privilege its grant describes.
+	for _, role := range []string{roleA, roleB} {
+		var canRead bool
+		if err := su.QueryRow(ctx,
+			"SELECT has_table_privilege($1, 'two_admin.tbl', 'SELECT')", role).Scan(&canRead); err != nil {
+			t.Fatalf("privilege check for %s: %v", role, err)
+		}
+		if !canRead {
+			t.Errorf("role %q did not receive the readonly grant", role)
+		}
+	}
+
+	// And the group roles themselves are distinct, each owned by its own admin.
+	var groupCount int
+	if err := su.QueryRow(ctx,
+		`SELECT count(*) FROM pg_roles WHERE rolname LIKE 'wp_ta_grp_%'`).Scan(&groupCount); err != nil {
+		t.Fatalf("count groups: %v", err)
+	}
+	if groupCount < 2 {
+		t.Errorf("expected a group per listener, found %d", groupCount)
+	}
+}

@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Waypoint Console</title>
+<link rel="stylesheet" href="/styles.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>&#9670;</text></svg>">
+</head>
+<body>
+<div id="app" class="app">
+
+  <aside class="sidebar" id="sidebar">
+    <div class="sidebar-head">
+      <select id="db-picker" class="db-picker" aria-label="Database"></select>
+      <button id="refresh-schema" class="icon-btn" title="Refresh schema">&#8635;</button>
+    </div>
+    <div class="filter-wrap">
+      <input id="schema-filter" class="filter" type="search" placeholder="Filter tables&hellip;" autocomplete="off" spellcheck="false">
+    </div>
+    <div class="tree" id="tree" role="tree" tabindex="0"></div>
+  </aside>
+
+  <div class="divider vertical" id="divider-x" role="separator" aria-orientation="vertical" tabindex="0"></div>
+
+  <main class="main">
+    <div class="tabbar" id="tabbar" role="tablist">
+      <div class="tabs" id="tabs"></div>
+      <button id="new-tab" class="icon-btn" title="New query (Ctrl+T)">+</button>
+    </div>
+
+    <section class="editor-pane" id="editor-pane">
+      <div id="editor" class="editor"></div>
+    </section>
+
+    <div class="divider horizontal" id="divider-y" role="separator" aria-orientation="horizontal" tabindex="0"></div>
+
+    <section class="results-pane" id="results-pane">
+      <div class="results-toolbar">
+        <button id="run-btn" class="run-btn">Run <kbd>&#8984;&#9166;</kbd></button>
+        <button id="cancel-btn" class="cancel-btn" hidden>Cancel <kbd>Esc</kbd></button>
+        <span id="result-meta" class="result-meta"></span>
+        <span class="spacer"></span>
+        <button id="copy-btn" class="ghost-btn" hidden>Copy TSV</button>
+      </div>
+      <div id="results" class="results" tabindex="0"></div>
+    </section>
+  </main>
+
+  <footer class="statusbar" id="statusbar">
+    <span class="status-item" id="status-identity">&nbsp;</span>
+    <span class="status-sep">&middot;</span>
+    <span class="status-item" id="status-listener">&nbsp;</span>
+    <span class="status-sep">&middot;</span>
+    <span class="status-item" id="status-grant">&nbsp;</span>
+    <span class="spacer"></span>
+    <span class="status-item status-hint">Nothing is saved &mdash; closing this tab discards everything</span>
+  </footer>
+</div>
+
+<div class="palette-backdrop" id="palette" hidden>
+  <div class="palette" role="dialog" aria-label="Command palette">
+    <input id="palette-input" class="palette-input" type="text" placeholder="Jump to a table, or type a command&hellip;" autocomplete="off" spellcheck="false">
+    <ul id="palette-list" class="palette-list" role="listbox"></ul>
+  </div>
+</div>
+
+<div id="toasts" class="toasts" aria-live="polite"></div>
+
+<script type="module" src="/app.js"></script>
+</body>
+</html>

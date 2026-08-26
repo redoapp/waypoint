@@ -29,6 +29,12 @@ import (
 
 // setupMongoProxy starts a MongoDB proxy with the given auth result and returns the proxy listen address.
 func setupMongoProxy(t *testing.T, authResult *auth.AuthResult, authErr error) string {
+	return setupMongoProxyWithOpts(t, authResult, authErr)
+}
+
+// setupMongoProxyWithOpts is setupMongoProxy with hooks to adjust the proxy
+// before it starts accepting.
+func setupMongoProxyWithOpts(t *testing.T, authResult *auth.AuthResult, authErr error, opts ...func(*proxy.MongoDBProxy)) string {
 	t.Helper()
 
 	rdb := testutil.RedisClient(t)
@@ -38,7 +44,7 @@ func setupMongoProxy(t *testing.T, authResult *auth.AuthResult, authErr error) s
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 	_, backend := testutil.MongoDBBackend(t)
-	provisioner := provision.NewMongoProvisioner("admin", "adminpass", backend, "admin", "wp_", "test", false, store, logger, nil)
+	provisioner := provision.NewMongoProvisioner("admin", "adminpass", backend, "test-listener", "admin", "wp_", "test", false, store, logger, nil)
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -63,6 +69,10 @@ func setupMongoProxy(t *testing.T, authResult *auth.AuthResult, authErr error) s
 		Logger:       logger,
 		BytesRead:    &atomic.Int64{},
 		BytesWritten: &atomic.Int64{},
+	}
+
+	for _, opt := range opts {
+		opt(p)
 	}
 
 	go func() {
@@ -658,7 +668,7 @@ func TestIntegration_MongoProxy_BackendUnavailable(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 	// Use an unreachable backend address.
-	provisioner := provision.NewMongoProvisioner("admin", "adminpass", "127.0.0.1:1", "admin", "wp_", "test", false, store, logger, nil)
+	provisioner := provision.NewMongoProvisioner("admin", "adminpass", "127.0.0.1:1", "test-listener", "admin", "wp_", "test", false, store, logger, nil)
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -770,7 +780,7 @@ func setupMongoRSProxy(t *testing.T, authResult *auth.AuthResult, authErr error)
 	tracker := restrict.NewTracker(store, m, slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})))
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
-	provisioner := provision.NewMongoProvisioner("admin", "adminpass", rsInfo.Primary, "admin", "wp_", "test", false, store, logger, nil)
+	provisioner := provision.NewMongoProvisioner("admin", "adminpass", rsInfo.Primary, "test-listener", "admin", "wp_", "test", false, store, logger, nil)
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -991,7 +1001,7 @@ func setupMongoProxyForBackend(t *testing.T, backend string, authResult *auth.Au
 	tracker := restrict.NewTracker(store, m, slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})))
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
-	provisioner := provision.NewMongoProvisioner("admin", "adminpass", backend, "admin", "wp_", "test", false, store, logger, nil)
+	provisioner := provision.NewMongoProvisioner("admin", "adminpass", backend, "test-listener", "admin", "wp_", "test", false, store, logger, nil)
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -1103,7 +1113,7 @@ func setupMongoShardedProxies(t *testing.T, authResult *auth.AuthResult, authErr
 
 	// Sharded provisioner connects through the mongos routers (no replicaSet,
 	// no directConnection) so createUser propagates cluster-wide.
-	provisioner := provision.NewMongoShardedProvisioner("admin", "adminpass", info.Mongos, "admin", "wp_", "test", false, store, logger, nil)
+	provisioner := provision.NewMongoShardedProvisioner("admin", "adminpass", info.Mongos, "test-listener", "admin", "wp_", "test", false, store, logger, nil)
 
 	mongoCfg := &config.MongoDBAdmin{
 		AdminUser:     "admin",

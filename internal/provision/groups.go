@@ -25,8 +25,31 @@ const groupReadyTTL = 24 * time.Hour
 // schema, database) tuple. Every user requesting that combination
 // becomes a member of the same group, so the expensive object-level
 // GRANTs happen once per group instead of per user.
-func presetGroupName(preset, schema, database string) string {
-	return clampIdentifier("wp_grp_" + sanitize(preset) + "_" + sanitize(schema) + "_" + sanitize(database))
+// Group naming.
+//
+// A group role is owned by the admin that created it, and Postgres 16 grants
+// ADMIN OPTION only to that creator — so a second admin cannot grant a group
+// the first one made. Group names therefore carry the same prefix and listener
+// the user roles do: each provisioner owns its own groups, and two listeners
+// over one backend with different non-superuser admins no longer collide.
+//
+// This also makes user_prefix mean something for groups. It previously did
+// not: a deployment with user_prefix = "acme_" got roles named acme_* and
+// groups named wp_grp_*, which the cleanup docs describe as sharing a prefix.
+func (p *Provisioner) groupPrefix() string {
+	prefix := p.userPrefix
+	if prefix == "" {
+		prefix = "wp_"
+	}
+	prefix += "grp_"
+	if listener := sanitize(p.listener); listener != "" {
+		prefix += listener + "_"
+	}
+	return prefix
+}
+
+func (p *Provisioner) presetGroupName(preset, schema, database string) string {
+	return p.clampIdentifier(p.groupPrefix() + sanitize(preset) + "_" + sanitize(schema) + "_" + sanitize(database))
 }
 
 // compositeGroupName returns the content-addressed group role name for
@@ -34,8 +57,8 @@ func presetGroupName(preset, schema, database string) string {
 // safely share preset groups. The name is deterministic for any
 // permission set that canonicalises identically; any change in
 // presets, schemas, or SQL fragments produces a fresh group.
-func compositeGroupName(perms *auth.DBPermissions, database string) string {
-	return clampIdentifier("wp_grp_perms_" + compositeGroupHash(perms) + "_" + sanitize(database))
+func (p *Provisioner) compositeGroupName(perms *auth.DBPermissions, database string) string {
+	return p.clampIdentifier(p.groupPrefix() + "perms_" + compositeGroupHash(perms) + "_" + sanitize(database))
 }
 
 // compositeGroupHash hashes the canonical encoding of a permission set
@@ -95,13 +118,15 @@ func normalizeWhitespace(s string) string {
 // clampIdentifier truncates an identifier to PG's 63-byte limit,
 // appending a short hash suffix to keep names unique if they'd
 // otherwise collide after truncation.
-func clampIdentifier(name string) string {
-	if len(name) <= 63 {
-		return name
+// clampIdentifier bounds a group name using the same scheme as role names, so
+// there is one truncation rule to reason about, and logs it for the same
+// reason: a truncated identifier has to be traceable back to what produced it.
+func (p *Provisioner) clampIdentifier(name string) string {
+	truncated := truncateWithHash(name, maxPGIdentifier)
+	if truncated != name {
+		p.truncations.record(p.logger, "group", name, truncated, maxPGIdentifier)
 	}
-	h := sha256.Sum256([]byte(name))
-	suffix := hex.EncodeToString(h[:4])
-	return name[:63-9] + "_" + suffix
+	return truncated
 }
 
 // usesCompositePath reports whether a permission set requires the
@@ -115,12 +140,12 @@ func usesCompositePath(perms *auth.DBPermissions) bool {
 
 // desiredGroups returns the set of group role names that the given
 // permission set requires the user to be a member of.
-func desiredGroups(perms *auth.DBPermissions, database string) []string {
+func (p *Provisioner) desiredGroups(perms *auth.DBPermissions, database string) []string {
 	if perms == nil {
 		return nil
 	}
 	if usesCompositePath(perms) {
-		return []string{compositeGroupName(perms, database)}
+		return []string{p.compositeGroupName(perms, database)}
 	}
 	if len(perms.Permissions) == 0 {
 		return nil
@@ -133,7 +158,7 @@ func desiredGroups(perms *auth.DBPermissions, database string) []string {
 	var groups []string
 	for _, preset := range perms.Permissions {
 		for _, schema := range schemas {
-			name := presetGroupName(preset, schema, database)
+			name := p.presetGroupName(preset, schema, database)
 			if _, ok := seen[name]; ok {
 				continue
 			}
@@ -151,7 +176,7 @@ func desiredGroups(perms *auth.DBPermissions, database string) []string {
 // skip the whole thing; on a miss we re-issue the GRANTs (CockroachDB
 // and Postgres both treat repeated GRANT as a no-op).
 func (p *Provisioner) ensurePresetGroup(ctx context.Context, tx pgx.Tx, dialect Dialect, preset, schema, database string) (string, error) {
-	name := presetGroupName(preset, schema, database)
+	name := p.presetGroupName(preset, schema, database)
 	if ok, _ := p.store.IsGroupReady(ctx, name); ok {
 		return name, nil
 	}
@@ -179,7 +204,7 @@ func (p *Provisioner) ensurePresetGroup(ctx context.Context, tx pgx.Tx, dialect 
 // REVOKE / ALTER DEFAULT statements act as deltas on top of the
 // preset GRANTs at group-create time, preserving the author's intent.
 func (p *Provisioner) ensureCompositeGroup(ctx context.Context, tx pgx.Tx, dialect Dialect, perms *auth.DBPermissions, database string) (string, error) {
-	name := compositeGroupName(perms, database)
+	name := p.compositeGroupName(perms, database)
 	if ok, _ := p.store.IsGroupReady(ctx, name); ok {
 		return name, nil
 	}
@@ -244,10 +269,10 @@ func createGroupRoleIfMissing(ctx context.Context, tx pgx.Tx, dialect Dialect, n
 }
 
 // currentGroupMemberships returns the waypoint-managed group roles
-// `user` is currently a direct member of. We filter on the wp_grp_
-// prefix so we never accidentally REVOKE operator-managed
-// memberships out from under a user.
-func currentGroupMemberships(ctx context.Context, tx pgx.Tx, user string) ([]string, error) {
+// `user` is currently a direct member of. We filter on this provisioner's
+// group prefix so we never accidentally REVOKE operator-managed memberships —
+// or another listener's groups — out from under a user.
+func (p *Provisioner) currentGroupMemberships(ctx context.Context, tx pgx.Tx, user string) ([]string, error) {
 	rows, err := tx.Query(ctx, `
 SELECT r.rolname
 FROM pg_catalog.pg_auth_members m
@@ -264,7 +289,7 @@ WHERE u.rolname = $1`, user)
 		if err := rows.Scan(&name); err != nil {
 			return nil, fmt.Errorf("scan membership: %w", err)
 		}
-		if strings.HasPrefix(name, "wp_grp_") {
+		if strings.HasPrefix(name, p.groupPrefix()) {
 			groups = append(groups, name)
 		}
 	}

@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/redoapp/waypoint/internal/querylog"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
@@ -23,6 +24,11 @@ type AuthResult struct {
 	Permissions  []string // all merged PG permissions (across all databases)
 	Limits       MergedLimits
 	MatchedRules []CapRule // rules that matched the backend, for per-database lookup
+
+	// QueryLog is the level the matched ACL grants asked for, or nil when no
+	// grant mentioned logging. Nil means "defer to the listener default"; the
+	// proxy applies the listener's ceiling on top either way.
+	QueryLog *querylog.Level
 }
 
 // BandwidthTier defines a byte budget over a time period.
@@ -145,7 +151,7 @@ func Authorize(ctx context.Context, lc *local.Client, remoteAddr string, backend
 		)
 	}
 
-	perms, limits := mergeRules(matched, backend)
+	perms, limits, queryLog := mergeRules(matched, backend, logger)
 
 	logger.DebugContext(ctx, "capability rules matched",
 		"rules_matched", len(matched),
@@ -175,6 +181,7 @@ func Authorize(ctx context.Context, lc *local.Client, remoteAddr string, backend
 		Permissions:  perms,
 		Limits:       limits,
 		MatchedRules: matched,
+		QueryLog:     queryLog,
 	}, nil
 }
 
@@ -262,9 +269,12 @@ func MongoDatabasePermissions(result *AuthResult, backend string, database strin
 
 // mergeRules collects all permissions and picks the most restrictive limits.
 // backend is used to look up the BackendCap entry in each rule.
-func mergeRules(rules []CapRule, backend string) ([]string, MergedLimits) {
+// mergeRules folds every rule matching backend into a single set of
+// permissions, limits, and query log level.
+func mergeRules(rules []CapRule, backend string, logger *slog.Logger) ([]string, MergedLimits, *querylog.Level) {
 	var perms []string
 	var limits MergedLimits
+	var queryLog *querylog.Level
 
 	for _, r := range rules {
 		bc, ok := r.Backends[backend]
@@ -290,9 +300,49 @@ func mergeRules(rules []CapRule, backend string) ([]string, MergedLimits) {
 			}
 			mergeEndpointLimits(limits.Endpoint, bc.Limits)
 		}
+
+		// A backend-scoped logging cap wins over the top-level one, the same
+		// way endpoint limits win over global limits.
+		for _, cap := range []*LoggingCap{r.Logging, bc.Logging} {
+			if lvl, ok := parseLoggingCap(cap, logger); ok {
+				queryLog = mergeQueryLog(queryLog, lvl)
+			}
+		}
 	}
 
-	return perms, limits
+	return perms, limits, queryLog
+}
+
+// parseLoggingCap reads a level out of a LoggingCap, warning and ignoring an
+// unrecognized value rather than failing the connection — an ACL typo should
+// not lock a user out of their database.
+func parseLoggingCap(cap *LoggingCap, logger *slog.Logger) (querylog.Level, bool) {
+	if cap == nil || cap.Queries == "" {
+		return 0, false
+	}
+	lvl, err := querylog.ParseLevel(cap.Queries)
+	if err != nil {
+		if logger != nil {
+			logger.Warn("ignoring unknown query log level in capability grant",
+				"queries", cap.Queries, "error", err)
+		}
+		return 0, false
+	}
+	return lvl, true
+}
+
+// mergeQueryLog keeps the most verbose level across matching rules.
+//
+// Note this is the opposite of mergeLimits, which keeps the most restrictive
+// value. The asymmetry is deliberate: for limits, "most restrictive" is the
+// safe direction, and for auditing it is "most verbose" — adding a grant must
+// never be able to quiet the record of what a user did. The listener's
+// max_level is what bounds the result.
+func mergeQueryLog(current *querylog.Level, candidate querylog.Level) *querylog.Level {
+	if current == nil || candidate > *current {
+		return &candidate
+	}
+	return current
 }
 
 // mergeEndpointLimits applies the most restrictive values from cap into endpoint limits.

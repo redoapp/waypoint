@@ -65,6 +65,17 @@
     SERVE=":8080" bash scripts/coverage.sh "$@"
   '';
 
+  scripts.console-demo.exec = ''
+    exec bash "${config.devenv.root}/scripts/console-demo.sh" "$@"
+  '';
+
+  scripts.build-console.exec = ''
+    cd "${config.devenv.root}/internal/web/frontend"
+    npm install
+    npm run build
+    echo "built internal/web/assets/app.js"
+  '';
+
   scripts.docs-dev.exec = ''
     cd "${config.devenv.root}/website"
     pnpm install
@@ -80,6 +91,6 @@
   enterShell = ''
     echo "Go: $(go version)"
     echo "Valkey service configured (start with 'devenv up')"
-    echo "Commands: run-proxy, debug-proxy, test, coverage, coverage-unit, coverage-serve, docs-dev, docs-build"
+    echo "Commands: run-proxy, debug-proxy, test, coverage, coverage-unit, coverage-serve, console-demo, build-console, docs-dev, docs-build"
   '';
 }
