@@ -27,13 +27,13 @@ import (
 // Connection pooling for the console.
 //
 // The console is stateless per request, but it must not re-provision per
-// request: EnsureUser rotates the role's password on every call, so calling it
-// on each keystroke-driven completion would mean an ALTER ROLE per keystroke.
+// request. EnsureUser takes a distributed role lock and runs a coalesced
+// provisioning round; calling it on every keystroke-driven completion would
+// mean contending for that lock on every keystroke.
 //
 // The split provision already offers is exactly right here:
 //
-//   - EnsureUser once, when a pool is created. It rotates the password, which
-//     is fine for pool setup.
+//   - EnsureUser once, when a pool is created.
 //   - ReconcileRole on subsequent requests. Its contract is "updates
 //     privileges for an existing backend role without rotating its password",
 //     which is what keeps pooled connections valid while grants stay current.
@@ -176,8 +176,9 @@ func (m *poolManager) acquire(ctx context.Context, loginName, nodeName, database
 }
 
 // invalidate tears down a pool. Used when the backend rejects the pooled
-// credential, which happens when another instance re-provisioned the same role
-// and rotated its password.
+// credential, which happens when the role's password is rotated after this
+// pool cached it — provisioning reuses a credential while it is fresh, so this
+// is rare, but it still has to be recoverable rather than fatal.
 func (m *poolManager) invalidate(loginName, nodeName, database string) {
 	key := poolKey(loginName, nodeName, database)
 	m.mu.Lock()
