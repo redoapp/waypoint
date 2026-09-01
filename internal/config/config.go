@@ -63,9 +63,11 @@ type ListenerConfig struct {
 	Listen              string         `toml:"listen"`
 	Mode                string         `toml:"mode"`
 	Backend             string         `toml:"backend"`
+	ProvisionBackend    string         `toml:"provision_backend"`
 	Advertise           string         `toml:"advertise"`
 	BackendViaTailscale bool           `toml:"backend_via_tailscale"`
 	BackendTLS          bool           `toml:"tls"`
+	ProvisionTLS        *bool          `toml:"provision_tls"`
 	PostgresTLSMode     string         `toml:"tls_mode"`
 	UseTailscaleTLS     *bool          `toml:"use_tailscale_tls"`
 	CertFile            string         `toml:"cert_file"`
@@ -75,6 +77,28 @@ type ListenerConfig struct {
 	MongoDB             *MongoDBAdmin  `toml:"mongodb"`
 	PortMap             map[int]int    `toml:"-"`
 	RawPortMap          map[string]int `toml:"port_map,omitempty"`
+}
+
+// EffectiveProvisionBackend returns the database endpoint used for PostgreSQL
+// role provisioning. Keeping it separate from Backend lets a session pass
+// through a read-only protocol proxy while administrative SQL goes directly to
+// the database. Existing listeners retain their current behavior when the
+// override is absent.
+func (l ListenerConfig) EffectiveProvisionBackend(sessionBackend string) string {
+	if strings.TrimSpace(l.ProvisionBackend) == "" {
+		return sessionBackend
+	}
+	return l.ProvisionBackend
+}
+
+// EffectiveProvisionTLS returns the backend TLS setting used for PostgreSQL
+// role provisioning. A pointer distinguishes an explicit false override from
+// the backward-compatible default inherited from BackendTLS.
+func (l ListenerConfig) EffectiveProvisionTLS() bool {
+	if l.ProvisionTLS == nil {
+		return l.BackendTLS
+	}
+	return *l.ProvisionTLS
 }
 
 type TLSMode string
@@ -395,6 +419,9 @@ func validate(cfg *Config) error {
 		}
 		if l.MongoDB.HasSRV() && mode != "mongodb" {
 			return fmt.Errorf("listeners[%d]: mongodb.srv is only supported for mode %q, got %q", i, "mongodb", l.Mode)
+		}
+		if (l.ProvisionBackend != "" || l.ProvisionTLS != nil) && mode != "postgres" {
+			return fmt.Errorf("listeners[%d].provision_backend and provision_tls are only supported for mode %q", i, "postgres")
 		}
 		hasMongoMembers := mode == "mongodb" && l.MongoDB != nil && len(l.MongoDB.Members) > 0
 		hasMongoSRV := mode == "mongodb" && l.MongoDB.HasSRV()

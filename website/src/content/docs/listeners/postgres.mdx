@@ -20,6 +20,9 @@ name = "pg-main"
 listen = ":5432"
 mode = "postgres"
 backend = "10.0.1.10:5432"
+# Optional independent role-provisioning path:
+# provision_backend = "10.0.1.10:5432"
+# provision_tls = true
 tls_mode = "optional"
 use_tailscale_tls = true
 
@@ -39,6 +42,27 @@ user_ttl = "24h"
 | `admin_database` | Database to connect to for admin operations (usually `postgres`). |
 | `user_prefix` | All provisioned roles begin with this string. Default `wp_`. <TestRef name="TestFormatUsername_DefaultPrefix" /> <TestRef name="TestFormatUsername_CustomPrefix" /> |
 | `user_ttl` | How long a role stays in the database after last use before cleanup eligibility. <TestRef name="TestPostgresAdmin_UserTTLDefault" /> <TestRef name="TestPostgresAdmin_UserTTLCustom" /> |
+
+## Independent provisioning backend
+
+By default, Waypoint uses `backend` and `tls` for both the authenticated user
+session and its administrative role-management connection. <TestRef
+name="TestPostgresProvisionBackendDefaultsToSessionPath" /> A listener that
+routes user sessions through another PostgreSQL protocol proxy can override the
+administrative path:
+
+```toml
+backend = "127.0.0.1:6432"
+tls = false
+provision_backend = "database.internal:26257"
+provision_tls = true
+```
+
+Waypoint still authenticates and authorizes the original caller, creates the
+temporary role directly on `provision_backend`, then authenticates that role on
+the session `backend`. <TestRef
+name="TestPostgresProvisionBackendCanBypassSessionProxy" /> The overrides are
+Postgres-only and independently default to the session settings.
 
 ## How roles are named
 
