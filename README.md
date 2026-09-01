@@ -69,13 +69,6 @@ user through `provision_backend` using `provision_tls`. Each override defaults
 to the corresponding session setting, so existing configurations are
 unchanged.
 
-The container also exposes a process-level TCP healthcheck for Kubernetes
-liveness probes. A failed check exits non-zero without starting tsnet:
-
-```sh
-waypoint --healthcheck-address 127.0.0.1:6432 --healthcheck-timeout 1s
-```
-
 Postgres listeners default to `tls_mode = "optional"`. If a client sends a PostgreSQL `SSLRequest`, Waypoint now upgrades that session to TLS and serves the certificate that matches the requested server name:
 - admin-provided `cert_file`/`key_file` for custom domains such as `waypoint.redo.run`
 - Tailscale-managed certificates for `*.ts.net` names when HTTPS certificates are enabled in the tailnet
