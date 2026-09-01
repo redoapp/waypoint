@@ -39,6 +39,9 @@ name = "pg-main"
 listen = ":5432"
 mode = "postgres"
 backend = "10.0.1.10:5432"
+# Optional independent administrative path. Defaults to backend/tls.
+# provision_backend = "10.0.1.10:5432"
+# provision_tls = true
 tls_mode = "optional"                   # off | optional | require
 use_tailscale_tls = true                # default: allow *.ts.net cert lookup
 cert_file = "/etc/waypoint/server.crt"  # optional: custom-domain cert
@@ -58,6 +61,13 @@ listen = ":3306"
 mode = "tcp"
 backend = "10.0.1.5:3306"
 ```
+
+PostgreSQL listeners may use `provision_backend` and `provision_tls` when the
+authenticated session path terminates at another proxy. Waypoint forwards the
+dynamic user's session to `backend` using `tls`, but creates and reconciles that
+user through `provision_backend` using `provision_tls`. Each override defaults
+to the corresponding session setting, so existing configurations are
+unchanged.
 
 Postgres listeners default to `tls_mode = "optional"`. If a client sends a PostgreSQL `SSLRequest`, Waypoint now upgrades that session to TLS and serves the certificate that matches the requested server name:
 - admin-provided `cert_file`/`key_file` for custom domains such as `waypoint.redo.run`

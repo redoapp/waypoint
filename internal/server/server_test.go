@@ -23,6 +23,38 @@ import (
 	"tailscale.com/tsnet"
 )
 
+func TestPostgresProvisionBackendDefaultsToSessionPath(t *testing.T) {
+	lCfg := config.ListenerConfig{BackendTLS: true}
+	paths := resolvePostgresBackendPaths(lCfg, "db.internal:26257")
+	if paths.Session != "db.internal:26257" || paths.Provision != paths.Session {
+		t.Fatalf("backend paths = %#v", paths)
+	}
+	if !paths.SessionTLS || paths.ProvisionTLS != paths.SessionTLS {
+		t.Fatalf("TLS paths = %#v", paths)
+	}
+}
+
+func TestPostgresProvisionBackendCanBypassSessionProxy(t *testing.T) {
+	provisionTLS := true
+	lCfg := config.ListenerConfig{
+		Backend:          "127.0.0.1:6432",
+		BackendTLS:       false,
+		ProvisionBackend: "db.internal:26257",
+		ProvisionTLS:     &provisionTLS,
+	}
+
+	paths := resolvePostgresBackendPaths(lCfg, lCfg.Backend)
+	if paths.Provision != "db.internal:26257" {
+		t.Fatalf("provision backend = %q, want direct database", paths.Provision)
+	}
+	if !paths.ProvisionTLS {
+		t.Fatal("provision TLS = false, want true")
+	}
+	if paths.Session != "127.0.0.1:6432" || paths.SessionTLS {
+		t.Fatalf("session path = %#v, want plaintext loopback proxy", paths)
+	}
+}
+
 func TestBuildPostgresClientTLSConfig_UsesAdminCertForMatchingSNI(t *testing.T) {
 	adminCert := mustNamedCertificate(t, "waypoint.redo.run")
 	tailscaleCalls := 0

@@ -72,6 +72,11 @@ name = "pg-main"
 listen = ":5432"
 mode = "postgres"
 backend = "10.0.1.10:5432"
+# Optional: send role-management SQL directly to the database while sessions
+# use a separate proxy named by backend. Both settings inherit backend/tls when
+# omitted, preserving the existing behavior.
+# provision_backend = "10.0.1.10:5432"
+# provision_tls = true
 tls_mode = "optional"                   # off | optional | require
 use_tailscale_tls = true                # set false to use only cert_file/key_file
 # cert_file = "/etc/waypoint/server.crt" # optional custom-domain cert

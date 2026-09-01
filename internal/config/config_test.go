@@ -70,6 +70,8 @@ name = "pg-main"
 listen = ":5432"
 mode = "postgres"
 backend = "10.0.1.10:5432"
+provision_backend = "10.0.1.11:5432"
+provision_tls = false
 tls_mode = "require"
 use_tailscale_tls = false
 cert_file = "/etc/waypoint/server.crt"
@@ -125,6 +127,12 @@ backend = "10.0.1.5:3306"
 	}
 	if pg.Postgres.UserTTLDuration() != 12*time.Hour {
 		t.Errorf("user_ttl = %v", pg.Postgres.UserTTLDuration())
+	}
+	if pg.EffectiveProvisionBackend(pg.Backend) != "10.0.1.11:5432" {
+		t.Errorf("provision backend = %q", pg.EffectiveProvisionBackend(pg.Backend))
+	}
+	if pg.EffectiveProvisionTLS() {
+		t.Error("provision TLS = true, want false")
 	}
 	if pg.EffectivePostgresTLSMode() != PostgresTLSRequire {
 		t.Errorf("tls mode = %q, want %q", pg.EffectivePostgresTLSMode(), PostgresTLSRequire)
@@ -362,6 +370,42 @@ func TestListenerConfig_EffectiveUseTailscaleTLS_False(t *testing.T) {
 	l := ListenerConfig{UseTailscaleTLS: &v}
 	if l.EffectiveUseTailscaleTLS() {
 		t.Fatal("expected use_tailscale_tls=false to be respected")
+	}
+}
+
+func TestListenerConfig_ProvisionDefaultsToSessionBackend(t *testing.T) {
+	l := ListenerConfig{Backend: "db.internal:5432", BackendTLS: true}
+	if got := l.EffectiveProvisionBackend(l.Backend); got != l.Backend {
+		t.Fatalf("provision backend = %q, want %q", got, l.Backend)
+	}
+	if !l.EffectiveProvisionTLS() {
+		t.Fatal("provision TLS should inherit tls = true")
+	}
+}
+
+func TestListenerConfig_ProvisionTLSCanOverrideTrueWithFalse(t *testing.T) {
+	provisionTLS := false
+	l := ListenerConfig{BackendTLS: true, ProvisionTLS: &provisionTLS}
+	if l.EffectiveProvisionTLS() {
+		t.Fatal("provision TLS should honor explicit false")
+	}
+}
+
+func TestValidate_ProvisionOverridesRequirePostgres(t *testing.T) {
+	content := `
+[tailscale]
+hostname = "waypoint-test"
+
+[[listeners]]
+name = "raw"
+listen = ":9999"
+mode = "tcp"
+backend = "10.0.0.1:5432"
+provision_backend = "10.0.0.2:5432"
+`
+	_, err := Load(writeTestConfig(t, content))
+	if err == nil || !strings.Contains(err.Error(), "only supported") {
+		t.Fatalf("expected postgres-only validation error, got %v", err)
 	}
 }
 

@@ -428,13 +428,14 @@ func RunServer(ctx context.Context, configPath string, logger *slog.Logger, leve
 					pgPeerService = lCfg.Postgres.ServiceName
 				}
 
+				backendPaths := resolvePostgresBackendPaths(lCfg, be.Backend)
 				provisioner := provision.NewProvisioner(
 					lCfg.Postgres.AdminUser,
 					lCfg.Postgres.AdminPassword,
 					lCfg.Postgres.AdminDatabase,
-					be.Backend,
+					backendPaths.Provision,
 					lCfg.Postgres.UserPrefix,
-					lCfg.BackendTLS,
+					backendPaths.ProvisionTLS,
 					config.AllowRawSQLResolved(lCfg.Postgres, &cfg.Provisioning),
 					pgPeerService,
 					store,
@@ -444,7 +445,7 @@ func RunServer(ctx context.Context, configPath string, logger *slog.Logger, leve
 				)
 
 				p := &proxy.PostgresProxy{
-					Backend:       be.Backend,
+					Backend:       backendPaths.Session,
 					Name:          lCfg.Name,
 					Auth:          &proxy.TailscaleAuthorizer{LC: lc, Logger: logger.With("listener", lCfg.Name)},
 					Tracker:       tracker,
@@ -453,7 +454,7 @@ func RunServer(ctx context.Context, configPath string, logger *slog.Logger, leve
 					PGConfig:      lCfg.Postgres,
 					ClientTLSMode: clientTLSMode,
 					ClientTLS:     clientTLSConfig,
-					BackendTLS:    lCfg.BackendTLS,
+					BackendTLS:    backendPaths.SessionTLS,
 					RevalInterval: revalInterval,
 					Logger:        logger.With("listener", lCfg.Name),
 					Dialer:        dialer,
@@ -507,6 +508,26 @@ func RunServer(ctx context.Context, configPath string, logger *slog.Logger, leve
 	wg.Wait()
 	logger.Info("shutdown complete")
 	return nil
+}
+
+type postgresBackendPaths struct {
+	Session      string
+	SessionTLS   bool
+	Provision    string
+	ProvisionTLS bool
+}
+
+// resolvePostgresBackendPaths keeps both destinations in one tested value so
+// the administrative and authenticated-session paths cannot be accidentally
+// recoupled at their two construction sites. Defaults preserve the historical
+// behavior for existing configurations.
+func resolvePostgresBackendPaths(lCfg config.ListenerConfig, sessionBackend string) postgresBackendPaths {
+	return postgresBackendPaths{
+		Session:      sessionBackend,
+		SessionTLS:   lCfg.BackendTLS,
+		Provision:    lCfg.EffectiveProvisionBackend(sessionBackend),
+		ProvisionTLS: lCfg.EffectiveProvisionTLS(),
+	}
 }
 
 func resolvePostgresClientTLS(lCfg config.ListenerConfig, srv *tsnet.Server, lc *local.Client, logger *slog.Logger) (config.PostgresTLSMode, *tls.Config, error) {
