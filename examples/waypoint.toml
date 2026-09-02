@@ -220,5 +220,4 @@ backend = "10.0.1.5:3306"
 # ca_file = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
 # # token = "${KUBE_TOKEN}"           # alternative to token_file
 # # insecure_skip_verify = false
-# # impersonate = true                # default
 

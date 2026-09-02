@@ -23,25 +23,38 @@ is the product. Kubernetes needs the same shape, but the backend already has
 a first-class impersonation API, so we should not invent per-user
 ServiceAccounts unless we have to.
 
-## Recommendation: impersonating HTTP reverse proxy (implemented)
+## Recommendation: follow Tailscale's impersonating proxy (implemented)
 
 `mode = "kubernetes"` terminates the client connection (TLS by default),
 authenticates the Tailscale peer against `redo.com/cap/waypoint`, then
-reverse-proxies HTTP/1.1 and HTTP/2 to kube-apiserver using **Waypoint's**
-token. Each request:
+reverse-proxies HTTP/1.1 to kube-apiserver using **Waypoint's** token. HTTP/2
+is deliberately disabled, matching Tailscale, because Kubernetes SPDY
+streaming is incompatible with h2. Each request:
 
 1. Strips client `Impersonate-User` / `Impersonate-Group` / `Impersonate-Uid`
    / `Impersonate-Extra-*` headers (clients must not escalate).
 2. Sets `Authorization: Bearer <waypoint token>`.
-3. Sets `Impersonate-User` to the Tailscale login (or an ACL override) and
-   `Impersonate-Group` / extra from the grant.
+3. Sets `Impersonate-User` to the Tailscale login for user devices, or the
+   node FQDN for tagged devices. Groups come from the grant; node tags are the
+   fallback groups for tagged devices.
 
 Cluster RBAC stays the source of truth. Waypoint only decides *whether the
 peer may use this listener* and *which identity/groups to impersonate*.
 
-This matches Teleport's kube service, Pomerium, and the Tailscale Kubernetes
-operator's identity mapping, without requiring a cluster operator
-controller.
+This now follows the Tailscale Kubernetes operator's core behavior:
+
+- WhoIs and grant evaluation happen per HTTP request.
+- User devices impersonate the login; tagged devices impersonate the node
+  FQDN and fall back to node tags as groups.
+- The grant payload is `impersonate.groups`.
+- Client and upstream HTTP/2 are disabled for SPDY compatibility.
+- client-go supplies the upstream token/TLS transport.
+
+The intentional Waypoint differences are listener-scoped
+`redo.com/cap/waypoint` grants, Redis connection limits, and OTel telemetry.
+Tailscale's explicit exec/attach routes exist to add session recording;
+without recording, both implementations use the same ReverseProxy upgrade
+path. Waypoint does not yet implement Tailscale's tsrecorder integration.
 
 ### ACL grammar
 
@@ -50,8 +63,9 @@ controller.
   "backends": {
     "eks-prod": {
       "k8s": {
-        "groups": ["waypoint:readonly", "system:authenticated"],
-        "extra": { "node": ["alice-laptop"] }
+        "impersonate": {
+          "groups": ["waypoint:readonly", "system:authenticated"]
+        }
       }
     }
   }
@@ -104,7 +118,8 @@ token_file = "/var/run/secrets/kubernetes.io/serviceaccount/token"
 ca_file = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
 ```
 
-`token_file` is re-read on each request so projected SA tokens can rotate.
+The backend transport is built with client-go. Projected ServiceAccount token
+files rotate through the same mechanism used by ordinary Kubernetes clients.
 
 ### Client kubeconfig
 
@@ -145,15 +160,14 @@ current-context: waypoint
 ## Protocol gaps (follow-ups)
 
 The Go `httputil.ReverseProxy` with `FlushInterval: -1` covers REST, watches,
-and HTTP Upgrade (WebSocket exec/port-forward used by current kubectl).
+and HTTP Upgrade. HTTP/1.1 is forced on both sides for SPDY compatibility. A
+k3s test exercises real RBAC and client-go's SPDY executor through Waypoint.
 
 Still unproven in this tree:
 
-- Older kubectl **SPDY** (`stream.k8s.io`) upgrades
-- `kubectl cp` / `exec` / `attach` / `port-forward` end-to-end against a real
-  apiserver
+- `kubectl cp` / `attach` / `port-forward` end-to-end
 - Aggregated APIs and the Konnectivity / apiserver-network-proxy path
-- HTTP/2 client TLS (`h2` ALPN) against Tailscale-issued certs
+- WebSocket exec negotiation used by newer kubectl clients
 
 Treat those as the next implementation slice, not as design unknowns.
 
@@ -171,9 +185,9 @@ Treat those as the next implementation slice, not as design unknowns.
 | Subsystem | Kubernetes mode |
 |---|---|
 | `auth.Authorize` | Unchanged; backend key is the listener name |
-| `auth.K8sCap` | Impersonation groups/extra/user |
+| `auth.K8sCap` | Tailscale-compatible `impersonate.groups` |
 | `restrict.Tracker` | Connection slots + byte counting on the client conn |
-| Revalidation | Re-WhoIs; update impersonation for *new* requests; close conn if grant revoked |
+| Revalidation | WhoIs + grant evaluation on every HTTP request |
 | Provisioner / Redis locks | Unused (no per-user backend objects) |
 | Client `tls_mode` | Defaults to `require` (kubectl always uses TLS) |
 | Backend `tls` | HTTPS to kube-apiserver |

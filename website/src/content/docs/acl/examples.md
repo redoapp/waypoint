@@ -130,7 +130,9 @@ For [static-user mode](/waypoint/listeners/mongodb/#mode--static-atlas-compatibl
   "backends": {
     "eks-prod": {
       "k8s": {
-        "groups": ["waypoint:readonly", "system:authenticated"]
+        "impersonate": {
+          "groups": ["waypoint:readonly", "system:authenticated"]
+        }
       }
     }
   }

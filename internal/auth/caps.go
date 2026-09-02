@@ -24,13 +24,13 @@ type BackendCap struct {
 // Authorization to reach the listener is the backend map key; this block
 // only shapes impersonation. Cluster RBAC remains the source of truth.
 type K8sCap struct {
-	// User overrides the impersonated username. Empty means the Tailscale
-	// login name (typically an email).
-	User string `json:"user,omitempty"`
-	// Groups are added as Impersonate-Group headers (unioned across grants).
+	// Impersonate mirrors tailscale.com/cap/kubernetes's grant shape.
+	Impersonate *K8sImpersonateRule `json:"impersonate,omitempty"`
+}
+
+// K8sImpersonateRule defines additional Kubernetes groups for the caller.
+type K8sImpersonateRule struct {
 	Groups []string `json:"groups,omitempty"`
-	// Extra is copied to Impersonate-Extra-<key> headers.
-	Extra map[string][]string `json:"extra,omitempty"`
 }
 
 // PGCap holds postgres-specific capabilities.

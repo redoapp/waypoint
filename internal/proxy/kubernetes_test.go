@@ -2,8 +2,6 @@ package proxy
 
 import (
 	"context"
-	"crypto/x509"
-	"encoding/pem"
 	"errors"
 	"io"
 	"log/slog"
@@ -29,6 +27,12 @@ type k8sTestAuthorizer struct {
 	err    error
 }
 
+type k8sFuncAuthorizer func(context.Context, string, string) (*auth.AuthResult, error)
+
+func (f k8sFuncAuthorizer) Authorize(ctx context.Context, remote, backend string) (*auth.AuthResult, error) {
+	return f(ctx, remote, backend)
+}
+
 func (a k8sTestAuthorizer) Authorize(context.Context, string, string) (*auth.AuthResult, error) {
 	return a.result, a.err
 }
@@ -42,8 +46,7 @@ func k8sAuthResult(t *testing.T, groups ...string) *auth.AuthResult {
 			Backends: map[string]auth.BackendCap{
 				"eks-prod": {
 					K8s: &auth.K8sCap{
-						Groups: groups,
-						Extra:  map[string][]string{"node": {"alice-laptop"}},
+						Impersonate: &auth.K8sImpersonateRule{Groups: groups},
 					},
 				},
 			},
@@ -136,12 +139,10 @@ func TestStripImpersonationHeaders(t *testing.T) {
 func TestKubernetesProxy_ImpersonatesUserAndGroups(t *testing.T) {
 	var gotUser, gotAuth string
 	var gotGroups []string
-	var gotExtra string
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotUser = r.Header.Get("Impersonate-User")
 		gotAuth = r.Header.Get("Authorization")
 		gotGroups = r.Header.Values("Impersonate-Group")
-		gotExtra = r.Header.Get("Impersonate-Extra-node")
 		if r.URL.Path != "/api/v1/namespaces/default/pods" {
 			t.Errorf("path = %s", r.URL.Path)
 		}
@@ -168,9 +169,6 @@ func TestKubernetesProxy_ImpersonatesUserAndGroups(t *testing.T) {
 	}
 	if strings.Join(gotGroups, ",") != "waypoint:readonly,system:authenticated" {
 		t.Errorf("groups = %v", gotGroups)
-	}
-	if gotExtra != "alice-laptop" {
-		t.Errorf("extra node = %q", gotExtra)
 	}
 }
 
@@ -213,6 +211,38 @@ func TestKubernetesProxy_AuthFailureForbidden(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("status = %d, want 403", resp.StatusCode)
+	}
+}
+
+func TestKubernetesProxy_AuthenticatesEveryRequest(t *testing.T) {
+	var calls atomic.Int64
+	p := &KubernetesProxy{
+		Name:    "eks-prod",
+		Metrics: metrics.Noop(),
+		Logger:  slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Auth: k8sFuncAuthorizer(func(context.Context, string, string) (*auth.AuthResult, error) {
+			if calls.Add(1) == 1 {
+				return k8sAuthResult(t, "readers"), nil
+			}
+			return nil, errors.New("revoked")
+		}),
+	}
+	nextCalls := 0
+	handler := p.requestAuthorizer("100.64.0.1:1234", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		nextCalls++
+		w.WriteHeader(http.StatusOK)
+	}), p.Logger)
+
+	first := httptest.NewRecorder()
+	handler.ServeHTTP(first, httptest.NewRequest(http.MethodGet, "/api", nil))
+	second := httptest.NewRecorder()
+	handler.ServeHTTP(second, httptest.NewRequest(http.MethodGet, "/api", nil))
+
+	if first.Code != http.StatusOK || second.Code != http.StatusForbidden {
+		t.Fatalf("status codes = %d, %d", first.Code, second.Code)
+	}
+	if calls.Load() != 2 || nextCalls != 1 {
+		t.Fatalf("auth calls = %d, next calls = %d", calls.Load(), nextCalls)
 	}
 }
 
@@ -259,38 +289,25 @@ func TestKubernetesProxy_WatchFlushes(t *testing.T) {
 	}
 }
 
-func TestLoadKubernetesBackendTLS_CAFile(t *testing.T) {
-	srv := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
-	t.Cleanup(srv.Close)
+func TestKubernetesProxy_UpstreamUsesHTTP1(t *testing.T) {
+	var protoMajor int
+	backend := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		protoMajor = r.ProtoMajor
+		w.WriteHeader(http.StatusOK)
+	}))
+	backend.EnableHTTP2 = true
+	backend.StartTLS()
+	t.Cleanup(backend.Close)
 
-	path := writeCertPEM(t, srv.Certificate())
-	cfg, err := LoadKubernetesBackendTLS(&config.KubernetesAdmin{CAFile: path})
+	addr := startK8sProxy(t, backend.URL, true, k8sAuthResult(t), nil)
+	resp, err := http.Get("http://" + addr + "/version")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.RootCAs == nil {
-		t.Fatal("expected RootCAs")
+	resp.Body.Close()
+	if protoMajor != 1 {
+		t.Fatalf("upstream HTTP version = %d, want HTTP/1.1", protoMajor)
 	}
-}
-
-func TestLoadKubernetesBackendTLS_InsecureSkipVerify(t *testing.T) {
-	cfg, err := LoadKubernetesBackendTLS(&config.KubernetesAdmin{InsecureSkipVerify: true})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !cfg.InsecureSkipVerify {
-		t.Fatal("expected InsecureSkipVerify")
-	}
-}
-
-func writeCertPEM(t *testing.T, cert *x509.Certificate) string {
-	t.Helper()
-	path := t.TempDir() + "/ca.pem"
-	block := &pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw}
-	if err := os.WriteFile(path, pem.EncodeToMemory(block), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	return path
 }
 
 func TestKubernetesProxy_TokenFile(t *testing.T) {

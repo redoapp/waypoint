@@ -3,7 +3,6 @@ package proxy
 import (
 	"context"
 	"crypto/tls"
-	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
@@ -12,7 +11,6 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
-	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -21,6 +19,8 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
+	"k8s.io/client-go/rest"
+	k8stransport "k8s.io/client-go/transport"
 
 	"github.com/redoapp/waypoint/internal/auth"
 	"github.com/redoapp/waypoint/internal/config"
@@ -35,24 +35,22 @@ const impersonateExtraPrefix = "Impersonate-Extra-"
 // the Tailscale peer, then impersonates that identity using Waypoint's own
 // service-account (or token) credentials.
 type KubernetesProxy struct {
-	Backend          string
-	Name             string
-	Auth             Authorizer
-	Tracker          *restrict.Tracker
-	Metrics          *metrics.Metrics
-	KubeConfig       *config.KubernetesAdmin
-	ClientTLSMode    config.TLSMode
-	ClientTLS        *tls.Config
-	BackendTLS       bool
-	BackendTLSConfig *tls.Config
-	RevalInterval    time.Duration
-	Logger           *slog.Logger
-	Dialer           func(ctx context.Context, network, addr string) (net.Conn, error)
-	BytesRead        *atomic.Int64
-	BytesWritten     *atomic.Int64
-	FlushInterval    time.Duration // 0 means flush immediately (watches)
-	backendURL       *url.URL
-	transport        http.RoundTripper
+	Backend       string
+	Name          string
+	Auth          Authorizer
+	Tracker       *restrict.Tracker
+	Metrics       *metrics.Metrics
+	KubeConfig    *config.KubernetesAdmin
+	ClientTLSMode config.TLSMode
+	ClientTLS     *tls.Config
+	BackendTLS    bool
+	Logger        *slog.Logger
+	Dialer        func(ctx context.Context, network, addr string) (net.Conn, error)
+	BytesRead     *atomic.Int64
+	BytesWritten  *atomic.Int64
+	FlushInterval time.Duration // 0 means flush immediately (watches)
+	backendURL    *url.URL
+	transport     http.RoundTripper
 }
 
 // Prepare parses the backend URL and builds the apiserver transport.
@@ -66,55 +64,38 @@ func (p *KubernetesProxy) Prepare() error {
 	}
 	p.backendURL = u
 
-	tlsConf := p.BackendTLSConfig
-	if tlsConf == nil && p.BackendTLS {
-		loaded, err := LoadKubernetesBackendTLS(p.KubeConfig)
-		if err != nil {
-			return err
-		}
-		tlsConf = loaded
-		p.BackendTLSConfig = tlsConf
-	}
-
-	dial := p.Dialer
-	p.transport = &http.Transport{
-		TLSClientConfig:   tlsConf,
-		ForceAttemptHTTP2: true,
-		IdleConnTimeout:   90 * time.Second,
-		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			if dial != nil {
-				return dial(ctx, network, addr)
-			}
-			d := net.Dialer{Timeout: 10 * time.Second}
-			return d.DialContext(ctx, network, addr)
+	restConfig := &rest.Config{
+		Host:            u.String(),
+		BearerToken:     strings.TrimSpace(p.KubeConfig.Token),
+		BearerTokenFile: p.KubeConfig.TokenFile,
+		TLSClientConfig: rest.TLSClientConfig{
+			CAFile:   p.KubeConfig.CAFile,
+			Insecure: p.KubeConfig.InsecureSkipVerify,
 		},
+		Dial: p.Dialer,
+	}
+	transportConfig, err := restConfig.TransportConfig()
+	if err != nil {
+		return fmt.Errorf("create kubernetes transport config: %w", err)
+	}
+	tlsConfig, err := k8stransport.TLSConfigFor(transportConfig)
+	if err != nil {
+		return fmt.Errorf("create kubernetes TLS config: %w", err)
+	}
+	base := http.DefaultTransport.(*http.Transport).Clone()
+	base.TLSClientConfig = tlsConfig
+	base.ForceAttemptHTTP2 = false
+	// Kubernetes SPDY streaming is incompatible with HTTP/2. Match the
+	// official Tailscale API proxy and force HTTP/1.1 upstream.
+	base.TLSNextProto = make(map[string]func(string, *tls.Conn) http.RoundTripper)
+	if p.Dialer != nil {
+		base.DialContext = p.Dialer
+	}
+	p.transport, err = k8stransport.HTTPWrappersForConfig(transportConfig, base)
+	if err != nil {
+		return fmt.Errorf("wrap kubernetes transport: %w", err)
 	}
 	return nil
-}
-
-// LoadKubernetesBackendTLS builds the TLS config used to reach kube-apiserver.
-func LoadKubernetesBackendTLS(k *config.KubernetesAdmin) (*tls.Config, error) {
-	cfg := &tls.Config{
-		MinVersion: tls.VersionTLS12,
-		NextProtos: []string{"h2", "http/1.1"},
-	}
-	if k != nil && k.InsecureSkipVerify {
-		cfg.InsecureSkipVerify = true
-		return cfg, nil
-	}
-	if k == nil || strings.TrimSpace(k.CAFile) == "" {
-		return cfg, nil
-	}
-	pem, err := os.ReadFile(k.CAFile)
-	if err != nil {
-		return nil, fmt.Errorf("read kubernetes ca_file: %w", err)
-	}
-	pool := x509.NewCertPool()
-	if !pool.AppendCertsFromPEM(pem) {
-		return nil, fmt.Errorf("kubernetes ca_file %q contains no certificates", k.CAFile)
-	}
-	cfg.RootCAs = pool
-	return cfg, nil
 }
 
 func kubernetesBackendURL(backend string, useTLS bool) (*url.URL, error) {
@@ -232,9 +213,6 @@ func (p *KubernetesProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 			m.Attrs("waypoint.conn.duration", listenerAttr, metrics.AttrUser.String(result.LoginName)))
 	}()
 
-	ident := auth.KubernetesIdentityFrom(result, p.Name)
-	state := &k8sConnState{ident: ident}
-
 	setupSpan.SetAttributes(attribute.String("waypoint.user", result.LoginName))
 	setupSpan.End()
 
@@ -244,13 +222,7 @@ func (p *KubernetesProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 
 	counted := &countingConn{Conn: clientConn, cl: cl}
 
-	revalCtx, revalCancel := context.WithCancel(ctx)
-	defer revalCancel()
-	if p.RevalInterval > 0 {
-		go p.revalidateLoop(revalCtx, setupSpanCtx, connID, counted, result.LoginName, state, log)
-	}
-
-	handler := p.reverseProxy(state, log)
+	handler := p.requestAuthorizer(counted.RemoteAddr().String(), p.apiHandler(log), log)
 	serveErr := serveHTTPOnConn(ctx, counted, handler)
 	if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) && !isBenignDisconnect(serveErr) {
 		log.WarnContext(ctx, "http serve ended", "error", serveErr)
@@ -284,24 +256,27 @@ func (p *KubernetesProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 	)
 }
 
-type k8sConnState struct {
-	mu    sync.Mutex
-	ident auth.KubernetesIdentity
+type kubernetesIdentityKey struct{}
+
+func (p *KubernetesProxy) requestAuthorizer(remoteAddr string, next http.Handler, log *slog.Logger) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		m := p.Metrics
+		listenerAttr := metrics.AttrListener.String(p.Name)
+		m.RevalAttempts.Add(r.Context(), 1, m.Attrs("waypoint.reval.attempts", listenerAttr))
+
+		result, err := p.Auth.Authorize(r.Context(), remoteAddr, p.Name)
+		if err != nil {
+			m.RevalFailures.Add(r.Context(), 1, m.Attrs("waypoint.reval.failures", listenerAttr))
+			log.WarnContext(r.Context(), "request authentication failed", "error", err)
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		ident := auth.KubernetesIdentityFrom(result, p.Name)
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), kubernetesIdentityKey{}, ident)))
+	})
 }
 
-func (s *k8sConnState) snapshot() auth.KubernetesIdentity {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.ident
-}
-
-func (s *k8sConnState) set(ident auth.KubernetesIdentity) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.ident = ident
-}
-
-func (p *KubernetesProxy) reverseProxy(state *k8sConnState, log *slog.Logger) http.Handler {
+func (p *KubernetesProxy) reverseProxy(log *slog.Logger) http.Handler {
 	flush := p.FlushInterval
 	if flush == 0 {
 		flush = -1
@@ -310,16 +285,10 @@ func (p *KubernetesProxy) reverseProxy(state *k8sConnState, log *slog.Logger) ht
 		Rewrite: func(r *httputil.ProxyRequest) {
 			r.SetURL(p.backendURL)
 			r.Out.Host = p.backendURL.Host
+			r.Out.Header.Del("Authorization")
 			stripImpersonationHeaders(r.Out.Header)
-			token, err := p.bearerToken()
-			if err != nil {
-				log.Error("kubernetes token unavailable", "error", err)
-				return
-			}
-			r.Out.Header.Set("Authorization", "Bearer "+token)
-			if p.KubeConfig.EffectiveImpersonate() {
-				applyImpersonation(r.Out.Header, state.snapshot())
-			}
+			ident, _ := r.Out.Context().Value(kubernetesIdentityKey{}).(auth.KubernetesIdentity)
+			applyImpersonation(r.Out.Header, ident)
 		},
 		Transport:     p.transport,
 		FlushInterval: flush,
@@ -331,70 +300,25 @@ func (p *KubernetesProxy) reverseProxy(state *k8sConnState, log *slog.Logger) ht
 	return rp
 }
 
-func (p *KubernetesProxy) bearerToken() (string, error) {
-	if p.KubeConfig == nil {
-		return "", errors.New("no kubernetes config")
+// apiHandler keeps streaming subresources explicit, as the official Tailscale
+// proxy does. They currently share the standard upgrade-capable reverse proxy;
+// separate routes leave room for session recording without changing REST
+// request behavior.
+func (p *KubernetesProxy) apiHandler(log *slog.Logger) http.Handler {
+	rp := p.reverseProxy(log)
+	mux := http.NewServeMux()
+	for _, pattern := range []string{
+		"GET /api/v1/namespaces/{namespace}/pods/{pod}/exec",
+		"POST /api/v1/namespaces/{namespace}/pods/{pod}/exec",
+		"GET /api/v1/namespaces/{namespace}/pods/{pod}/attach",
+		"POST /api/v1/namespaces/{namespace}/pods/{pod}/attach",
+		"GET /api/v1/namespaces/{namespace}/pods/{pod}/portforward",
+		"POST /api/v1/namespaces/{namespace}/pods/{pod}/portforward",
+	} {
+		mux.Handle(pattern, rp)
 	}
-	if t := strings.TrimSpace(p.KubeConfig.Token); t != "" {
-		return t, nil
-	}
-	if p.KubeConfig.TokenFile == "" {
-		return "", errors.New("no kubernetes token configured")
-	}
-	b, err := os.ReadFile(p.KubeConfig.TokenFile)
-	if err != nil {
-		return "", fmt.Errorf("read kubernetes token_file: %w", err)
-	}
-	t := strings.TrimSpace(string(b))
-	if t == "" {
-		return "", errors.New("kubernetes token_file is empty")
-	}
-	return t, nil
-}
-
-func (p *KubernetesProxy) revalidateLoop(ctx context.Context, setupSpanCtx trace.SpanContext, connID string, clientConn net.Conn, loginName string, state *k8sConnState, log *slog.Logger) {
-	ticker := time.NewTicker(p.RevalInterval)
-	defer ticker.Stop()
-
-	m := p.Metrics
-	tracer := m.Tracer()
-	listenerAttr := metrics.AttrListener.String(p.Name)
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			log.DebugContext(ctx, "revalidation check")
-			m.RevalAttempts.Add(ctx, 1, m.Attrs("waypoint.reval.attempts", listenerAttr))
-
-			_, revalSpan := tracer.Start(ctx, "waypoint.revalidation",
-				trace.WithLinks(trace.Link{SpanContext: setupSpanCtx}),
-				trace.WithAttributes(
-					attribute.String("waypoint.conn_id", connID),
-					attribute.String("waypoint.listener", p.Name),
-					attribute.String("waypoint.user", loginName),
-				),
-			)
-
-			revalResult, err := p.Auth.Authorize(ctx, clientConn.RemoteAddr().String(), p.Name)
-			if err != nil {
-				revalSpan.RecordError(err)
-				revalSpan.SetStatus(codes.Error, "revalidation failed")
-				revalSpan.End()
-				m.RevalFailures.Add(ctx, 1, m.Attrs("waypoint.reval.failures", listenerAttr))
-				log.WarnContext(ctx, "revalidation failed, closing connection",
-					"user", loginName,
-					"error", err,
-				)
-				clientConn.Close()
-				return
-			}
-			state.set(auth.KubernetesIdentityFrom(revalResult, p.Name))
-			revalSpan.End()
-			log.DebugContext(ctx, "revalidation passed")
-		}
-	}
+	mux.Handle("/", rp)
+	return mux
 }
 
 func applyImpersonation(h http.Header, ident auth.KubernetesIdentity) {
@@ -403,12 +327,6 @@ func applyImpersonation(h http.Header, ident auth.KubernetesIdentity) {
 	}
 	for _, g := range ident.Groups {
 		h.Add("Impersonate-Group", g)
-	}
-	for key, values := range ident.Extra {
-		header := impersonateExtraPrefix + key
-		for _, v := range values {
-			h.Add(header, v)
-		}
 	}
 }
 

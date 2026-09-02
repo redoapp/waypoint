@@ -91,7 +91,9 @@ impersonated onto kube-apiserver; cluster RBAC is the authorization engine.
   "backends": {
     "eks-prod": {
       "k8s": {
-        "groups": ["waypoint:readonly"]
+        "impersonate": {
+          "groups": ["waypoint:readonly"]
+        }
       }
     }
   }

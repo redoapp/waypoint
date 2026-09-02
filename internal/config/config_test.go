@@ -1597,17 +1597,6 @@ backend = "10.0.0.1:443"
 	}
 }
 
-func TestKubernetesAdmin_EffectiveImpersonate(t *testing.T) {
-	if !((*KubernetesAdmin)(nil)).EffectiveImpersonate() {
-		t.Fatal("nil should impersonate")
-	}
-	off := false
-	k := &KubernetesAdmin{Impersonate: &off}
-	if k.EffectiveImpersonate() {
-		t.Fatal("expected impersonate false")
-	}
-}
-
 // --- ExpandedBackends tests ---
 
 func TestExpandedBackends_NoPortMap(t *testing.T) {

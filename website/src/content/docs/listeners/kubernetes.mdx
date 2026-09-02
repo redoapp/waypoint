@@ -12,8 +12,8 @@ connect with `kubectl` (or any Kubernetes API client). Waypoint authenticates
 the Tailscale peer, then impersonates that identity using its own token so
 cluster RBAC applies to the human, not to a shared ServiceAccount.
 
-This is experimental: REST and watch streams are covered by unit tests;
-`kubectl exec` / SPDY against a real cluster is not yet in CI.
+This is experimental. REST, RBAC enforcement, watches, and SPDY `kubectl exec`
+are covered by tests, including a real k3s API server.
 
 ```toml
 [[listeners]]
@@ -30,7 +30,9 @@ token_file = "/var/run/secrets/kubernetes.io/serviceaccount/token"
 ca_file = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
 ```
 
-`token` may be set instead of `token_file`. If both are set, the inline `token` wins. When only `token_file` is set it is re-read on every request so projected ServiceAccount tokens can rotate.
+`token` may be set instead of `token_file`. If both are set, client-go gives the
+rotating token file precedence. The upstream transport uses the same client-go
+authentication and TLS stack as normal Kubernetes clients.
 <TestRef name="TestKubernetesProxy_TokenFile" />
 <TestRef name="TestLoad_KubernetesListener" />
 
@@ -44,7 +46,7 @@ defaults to `optional`). <TestRef name="TestListenerConfig_EffectiveTLSMode_Kube
    <TestRef name="TestKubernetesProxy_AuthFailureForbidden" />
 2. Replaces `Authorization` with Waypoint's bearer token.
 3. Strips any client `Impersonate-*` headers, then sets `Impersonate-User` to
-   the Tailscale login and `Impersonate-Group` / extra from the ACL.
+   the Tailscale identity and `Impersonate-Group` values from the ACL.
    <TestRef name="TestKubernetesProxy_ImpersonatesUserAndGroups" />
    <TestRef name="TestKubernetesProxy_StripsClientImpersonation" />
 4. Reverse-proxies the request, flushing immediately so watches stream.
@@ -65,7 +67,9 @@ impersonated users and groups in the cluster.
         "backends": {
           "eks-prod": {
             "k8s": {
-              "groups": ["waypoint:readonly", "system:authenticated"]
+              "impersonate": {
+                "groups": ["waypoint:readonly", "system:authenticated"]
+              }
             }
           }
         }
@@ -75,18 +79,23 @@ impersonated users and groups in the cluster.
 }
 ```
 
-<TestRef name="TestKubernetesIdentityFrom_MergesGroupsAndExtra" />
+<TestRef name="TestKubernetesIdentityFrom_MergesGroups" />
 <TestRef name="TestCapRuleUnmarshal_Kubernetes" />
 
 | Field | Meaning |
 |---|---|
-| `user` | Impersonated username. Default: Tailscale login (usually an email). |
-| `groups` | `Impersonate-Group` values; unioned across matching grants. |
-| `extra` | `Impersonate-Extra-<key>` values. |
+The shape deliberately matches Tailscale's official
+`tailscale.com/cap/kubernetes` `impersonate.groups` rule, nested under a
+Waypoint listener name.
+
+For user devices, the impersonated user is the Tailscale login (usually an
+email). For tagged devices it is the node FQDN. Grant groups override tag-based
+groups; without grant groups, a tagged device's tags become Kubernetes groups.
 
 An empty backend object (`"eks-prod": {}`) is a grant with no extra groups,
 same shape as [TCP](/waypoint/listeners/tcp/).
 <TestRef name="TestKubernetesIdentityFrom_DefaultsToLogin" />
+<TestRef name="TestKubernetesIdentityFrom_TaggedNode" />
 
 Prefer a dedicated group (`waypoint:readonly`) over `system:masters`.
 
@@ -155,5 +164,7 @@ The `token` value is not used for cluster auth; identity comes from Tailscale.
   [the design notes](https://github.com/redoapp/waypoint/blob/main/docs/design/kubernetes-api-proxy.md).
 - **No path/verb ACLs in Waypoint.** Namespace and verb restrictions belong
   in Kubernetes RBAC.
+- **No HTTP/2 on this listener.** Like Tailscale's official proxy, Waypoint
+  forces HTTP/1.1 because Kubernetes SPDY streaming is incompatible with h2.
 - **TCP mode remains available** if you only need reachability and clients
   already have cluster credentials.

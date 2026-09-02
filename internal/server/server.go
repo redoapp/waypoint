@@ -500,28 +500,24 @@ func RunServer(ctx context.Context, configPath string, logger *slog.Logger, leve
 				}
 				if clientTLSConfig != nil {
 					clientTLSConfig = clientTLSConfig.Clone()
-					clientTLSConfig.NextProtos = []string{"h2", "http/1.1"}
-				}
-				backendTLSConfig, err := proxy.LoadKubernetesBackendTLS(lCfg.Kubernetes)
-				if err != nil {
-					return fmt.Errorf("configure kubernetes backend TLS for listener %s: %w", lCfg.Name, err)
+					// Match the official Tailscale API proxy: Kubernetes SPDY
+					// streaming is incompatible with HTTP/2.
+					clientTLSConfig.NextProtos = []string{"http/1.1"}
 				}
 				kp := &proxy.KubernetesProxy{
-					Backend:          be.Backend,
-					Name:             lCfg.Name,
-					Auth:             &proxy.TailscaleAuthorizer{LC: lc, Logger: logger.With("listener", lCfg.Name)},
-					Tracker:          tracker,
-					Metrics:          m,
-					KubeConfig:       lCfg.Kubernetes,
-					ClientTLSMode:    clientTLSMode,
-					ClientTLS:        clientTLSConfig,
-					BackendTLS:       lCfg.BackendTLS,
-					BackendTLSConfig: backendTLSConfig,
-					RevalInterval:    revalInterval,
-					Logger:           logger.With("listener", lCfg.Name),
-					Dialer:           dialer,
-					BytesRead:        &bytesRead,
-					BytesWritten:     &bytesWritten,
+					Backend:       be.Backend,
+					Name:          lCfg.Name,
+					Auth:          &proxy.TailscaleAuthorizer{LC: lc, Logger: logger.With("listener", lCfg.Name)},
+					Tracker:       tracker,
+					Metrics:       m,
+					KubeConfig:    lCfg.Kubernetes,
+					ClientTLSMode: clientTLSMode,
+					ClientTLS:     clientTLSConfig,
+					BackendTLS:    lCfg.BackendTLS,
+					Logger:        logger.With("listener", lCfg.Name),
+					Dialer:        dialer,
+					BytesRead:     &bytesRead,
+					BytesWritten:  &bytesWritten,
 				}
 				if err := kp.Prepare(); err != nil {
 					return fmt.Errorf("kubernetes listener %s: %w", lCfg.Name, err)

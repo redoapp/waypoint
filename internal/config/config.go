@@ -383,13 +383,7 @@ type KubernetesAdmin struct {
 	TokenFile          string `toml:"token_file"`
 	CAFile             string `toml:"ca_file"`
 	InsecureSkipVerify bool   `toml:"insecure_skip_verify"`
-	// Impersonate defaults to true when nil.
-	Impersonate *bool  `toml:"impersonate"`
-	ServiceName string `toml:"service_name"`
-}
-
-func (k *KubernetesAdmin) EffectiveImpersonate() bool {
-	return k == nil || k.Impersonate == nil || *k.Impersonate
+	ServiceName        string `toml:"service_name"`
 }
 
 // Load reads and parses a TOML config file, expanding environment variables
