@@ -260,6 +260,71 @@ func MongoDatabasePermissions(result *AuthResult, backend string, database strin
 	}
 }
 
+// KubernetesIdentity is the impersonation material for a Kubernetes API connection.
+type KubernetesIdentity struct {
+	User   string
+	Groups []string
+	Extra  map[string][]string
+}
+
+// KubernetesIdentityFrom merges k8s grants for backend. User defaults to the
+// Tailscale login name when no grant sets user.
+func KubernetesIdentityFrom(result *AuthResult, backend string) KubernetesIdentity {
+	ident := KubernetesIdentity{}
+	if result != nil {
+		ident.User = result.LoginName
+	}
+
+	groupsSeen := make(map[string]bool)
+	var extra map[string][]string
+	extraSeen := make(map[string]map[string]bool)
+
+	if result == nil {
+		return ident
+	}
+
+	for _, r := range result.MatchedRules {
+		bc, ok := r.Backends[backend]
+		if !ok || bc.K8s == nil {
+			continue
+		}
+		if u := strings.TrimSpace(bc.K8s.User); u != "" {
+			ident.User = u
+		}
+		for _, g := range bc.K8s.Groups {
+			g = strings.TrimSpace(g)
+			if g == "" || groupsSeen[g] {
+				continue
+			}
+			groupsSeen[g] = true
+			ident.Groups = append(ident.Groups, g)
+		}
+		for key, values := range bc.K8s.Extra {
+			key = strings.TrimSpace(key)
+			if key == "" {
+				continue
+			}
+			if extra == nil {
+				extra = make(map[string][]string)
+			}
+			if extraSeen[key] == nil {
+				extraSeen[key] = make(map[string]bool)
+			}
+			for _, v := range values {
+				v = strings.TrimSpace(v)
+				if v == "" || extraSeen[key][v] {
+					continue
+				}
+				extraSeen[key][v] = true
+				extra[key] = append(extra[key], v)
+			}
+		}
+	}
+
+	ident.Extra = extra
+	return ident
+}
+
 // mergeRules collects all permissions and picks the most restrictive limits.
 // backend is used to look up the BackendCap entry in each rule.
 func mergeRules(rules []CapRule, backend string) ([]string, MergedLimits) {

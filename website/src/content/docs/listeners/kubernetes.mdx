@@ -1,0 +1,159 @@
+---
+title: Kubernetes
+description: Impersonating HTTPS reverse proxy for kube-apiserver.
+sidebar:
+  order: 5
+---
+
+import TestRef from '../../../components/TestRef.astro';
+
+Kubernetes mode is an HTTP reverse proxy in front of kube-apiserver. Clients
+connect with `kubectl` (or any Kubernetes API client). Waypoint authenticates
+the Tailscale peer, then impersonates that identity using its own token so
+cluster RBAC applies to the human, not to a shared ServiceAccount.
+
+This is experimental: REST and watch streams are covered by unit tests;
+`kubectl exec` / SPDY against a real cluster is not yet in CI.
+
+```toml
+[[listeners]]
+name = "eks-prod"
+listen = ":6443"
+mode = "kubernetes"
+backend = "kubernetes.default.svc:443"
+tls = true                          # Waypoint → apiserver (HTTPS)
+tls_mode = "require"                # default for kubernetes; kubectl always uses TLS
+use_tailscale_tls = true
+
+[listeners.kubernetes]
+token_file = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+ca_file = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+```
+
+`token` may be set instead of `token_file`. If both are set, the inline `token` wins. When only `token_file` is set it is re-read on every request so projected ServiceAccount tokens can rotate.
+<TestRef name="TestKubernetesProxy_TokenFile" />
+<TestRef name="TestLoad_KubernetesListener" />
+
+Client `tls_mode` defaults to `require` for this mode (unlike Postgres, which
+defaults to `optional`). <TestRef name="TestListenerConfig_EffectiveTLSMode_KubernetesDefaultRequire" />
+
+## What Waypoint does
+
+1. Identifies the caller with Tailscale `WhoIs` and requires a grant for this
+   listener name. Unauthorized clients receive HTTP 403.
+   <TestRef name="TestKubernetesProxy_AuthFailureForbidden" />
+2. Replaces `Authorization` with Waypoint's bearer token.
+3. Strips any client `Impersonate-*` headers, then sets `Impersonate-User` to
+   the Tailscale login and `Impersonate-Group` / extra from the ACL.
+   <TestRef name="TestKubernetesProxy_ImpersonatesUserAndGroups" />
+   <TestRef name="TestKubernetesProxy_StripsClientImpersonation" />
+4. Reverse-proxies the request, flushing immediately so watches stream.
+   <TestRef name="TestKubernetesProxy_WatchFlushes" />
+
+Waypoint does **not** provision Kubernetes objects. Bind ClusterRoles to the
+impersonated users and groups in the cluster.
+
+## ACL grants
+
+```json
+{
+  "grants": [{
+    "src": ["group:backend"],
+    "dst": ["tag:waypoint"],
+    "cap": {
+      "redo.com/cap/waypoint": [{
+        "backends": {
+          "eks-prod": {
+            "k8s": {
+              "groups": ["waypoint:readonly", "system:authenticated"]
+            }
+          }
+        }
+      }]
+    }
+  }]
+}
+```
+
+<TestRef name="TestKubernetesIdentityFrom_MergesGroupsAndExtra" />
+<TestRef name="TestCapRuleUnmarshal_Kubernetes" />
+
+| Field | Meaning |
+|---|---|
+| `user` | Impersonated username. Default: Tailscale login (usually an email). |
+| `groups` | `Impersonate-Group` values; unioned across matching grants. |
+| `extra` | `Impersonate-Extra-<key>` values. |
+
+An empty backend object (`"eks-prod": {}`) is a grant with no extra groups,
+same shape as [TCP](/waypoint/listeners/tcp/).
+<TestRef name="TestKubernetesIdentityFrom_DefaultsToLogin" />
+
+Prefer a dedicated group (`waypoint:readonly`) over `system:masters`.
+
+## Cluster RBAC for Waypoint
+
+The token Waypoint presents must be allowed to impersonate users and groups:
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: waypoint-impersonator
+rules:
+  - apiGroups: [""]
+    resources: ["users", "groups", "serviceaccounts"]
+    verbs: ["impersonate"]
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["userextras"]
+    verbs: ["impersonate"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: waypoint-impersonator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: waypoint-impersonator
+subjects:
+  - kind: ServiceAccount
+    name: waypoint
+    namespace: waypoint
+```
+
+Then bind *end-user* groups to the roles they should have, for example
+`waypoint:readonly` → `view`.
+
+## Client kubeconfig
+
+```yaml
+apiVersion: v1
+kind: Config
+clusters:
+  - name: waypoint
+    cluster:
+      server: https://waypoint-db:6443
+users:
+  - name: waypoint
+    user:
+      token: unused
+contexts:
+  - name: waypoint
+    context:
+      cluster: waypoint
+      user: waypoint
+current-context: waypoint
+```
+
+Trust the certificate Waypoint serves (`use_tailscale_tls` or `cert_file`).
+The `token` value is not used for cluster auth; identity comes from Tailscale.
+
+## What this mode does not do
+
+- **No per-user ServiceAccount provisioning.** That is the Postgres analog;
+  Kubernetes impersonation replaces it for v1. See
+  [the design notes](https://github.com/redoapp/waypoint/blob/main/docs/design/kubernetes-api-proxy.md).
+- **No path/verb ACLs in Waypoint.** Namespace and verb restrictions belong
+  in Kubernetes RBAC.
+- **TCP mode remains available** if you only need reachability and clients
+  already have cluster credentials.

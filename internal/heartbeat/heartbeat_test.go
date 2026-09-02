@@ -57,6 +57,10 @@ func TestHeartbeat(t *testing.T) {
 				},
 			},
 		},
+		{
+			Name: "test-k8s", Listen: ":6443", Mode: "kubernetes", Backend: "kube:443",
+			Kubernetes: &config.KubernetesAdmin{Token: adminSecret},
+		},
 	}
 
 	cfg := Config{
@@ -112,8 +116,8 @@ func TestHeartbeat(t *testing.T) {
 	if err := json.Unmarshal([]byte(fields["listeners"]), &parsedListeners); err != nil {
 		t.Fatalf("unmarshal listeners: %v", err)
 	}
-	if len(parsedListeners) != 3 {
-		t.Fatalf("got %d listeners, want 3: %+v", len(parsedListeners), parsedListeners)
+	if len(parsedListeners) != 4 {
+		t.Fatalf("got %d listeners, want 4: %+v", len(parsedListeners), parsedListeners)
 	}
 	byName := map[string]RedactedListener{}
 	for _, l := range parsedListeners {
@@ -127,6 +131,9 @@ func TestHeartbeat(t *testing.T) {
 	}
 	if byName["test-mongo"].Provisioner != "mongodb" {
 		t.Errorf("test-mongo provisioner = %q, want mongodb", byName["test-mongo"].Provisioner)
+	}
+	if byName["test-k8s"].Provisioner != "" {
+		t.Errorf("test-k8s provisioner = %q, want empty", byName["test-k8s"].Provisioner)
 	}
 
 	// Check TTL is set.

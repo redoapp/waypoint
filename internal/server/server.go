@@ -489,6 +489,44 @@ func RunServer(ctx context.Context, configPath string, logger *slog.Logger, leve
 					BytesWritten:  &bytesWritten,
 				}
 				go acceptLoop(ctx, &wg, ln, mp.HandleConn, logger.With("listener", lCfg.Name))
+
+			case "kubernetes":
+				if lCfg.Kubernetes == nil {
+					return fmt.Errorf("kubernetes listener %s requires [listeners.kubernetes] config", lCfg.Name)
+				}
+				clientTLSMode, clientTLSConfig, err := resolveClientTLS(lCfg, srv, lc, logger.With("listener", lCfg.Name))
+				if err != nil {
+					return fmt.Errorf("configure client TLS for listener %s: %w", lCfg.Name, err)
+				}
+				if clientTLSConfig != nil {
+					clientTLSConfig = clientTLSConfig.Clone()
+					clientTLSConfig.NextProtos = []string{"h2", "http/1.1"}
+				}
+				backendTLSConfig, err := proxy.LoadKubernetesBackendTLS(lCfg.Kubernetes)
+				if err != nil {
+					return fmt.Errorf("configure kubernetes backend TLS for listener %s: %w", lCfg.Name, err)
+				}
+				kp := &proxy.KubernetesProxy{
+					Backend:          be.Backend,
+					Name:             lCfg.Name,
+					Auth:             &proxy.TailscaleAuthorizer{LC: lc, Logger: logger.With("listener", lCfg.Name)},
+					Tracker:          tracker,
+					Metrics:          m,
+					KubeConfig:       lCfg.Kubernetes,
+					ClientTLSMode:    clientTLSMode,
+					ClientTLS:        clientTLSConfig,
+					BackendTLS:       lCfg.BackendTLS,
+					BackendTLSConfig: backendTLSConfig,
+					RevalInterval:    revalInterval,
+					Logger:           logger.With("listener", lCfg.Name),
+					Dialer:           dialer,
+					BytesRead:        &bytesRead,
+					BytesWritten:     &bytesWritten,
+				}
+				if err := kp.Prepare(); err != nil {
+					return fmt.Errorf("kubernetes listener %s: %w", lCfg.Name, err)
+				}
+				go acceptLoop(ctx, &wg, ln, kp.HandleConn, logger.With("listener", lCfg.Name))
 			}
 
 			m.SystemListeners.Add(ctx, 1, m.Attrs("waypoint.system.listeners"))

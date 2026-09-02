@@ -80,6 +80,24 @@ Preset names are case-insensitive <TestRef name="TestExpandPresets_CaseInsensiti
 
 For MongoDB, presets map to MongoDB built-in roles (`read`, `readWrite`, `dbAdmin`). <TestRef name="TestExpandMongoPresets_Readonly" /> <TestRef name="TestExpandMongoPresets_ReadWrite" /> <TestRef name="TestExpandMongoPresets_Admin" /> See [MongoDB](/waypoint/listeners/mongodb/) for the static-user matching rules when `provision.mode = "static"`.
 
+## Kubernetes
+
+Kubernetes listeners use a `k8s` block instead of database presets. Groups are
+impersonated onto kube-apiserver; cluster RBAC is the authorization engine.
+<TestRef name="TestCapRuleUnmarshal_Kubernetes" /> See [Kubernetes](/waypoint/listeners/kubernetes/).
+
+```json
+{
+  "backends": {
+    "eks-prod": {
+      "k8s": {
+        "groups": ["waypoint:readonly"]
+      }
+    }
+  }
+}
+```
+
 ## Per-connection downgrade
 
 Postgres clients can downgrade their effective preset for one connection with `?waypoint_presets=readonly` in the connection string. This **cannot elevate** beyond the grant; it only narrows. <TestRef name="TestLimitDBPermissionsToPostgresPreset" /> See [Postgres](/waypoint/listeners/postgres/#per-connection-preset-override).

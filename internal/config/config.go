@@ -59,24 +59,25 @@ type DefaultLimitsConfig struct {
 }
 
 type ListenerConfig struct {
-	Name                string         `toml:"name"`
-	Listen              string         `toml:"listen"`
-	Mode                string         `toml:"mode"`
-	Backend             string         `toml:"backend"`
-	ProvisionBackend    string         `toml:"provision_backend"`
-	Advertise           string         `toml:"advertise"`
-	BackendViaTailscale bool           `toml:"backend_via_tailscale"`
-	BackendTLS          bool           `toml:"tls"`
-	ProvisionTLS        *bool          `toml:"provision_tls"`
-	PostgresTLSMode     string         `toml:"tls_mode"`
-	UseTailscaleTLS     *bool          `toml:"use_tailscale_tls"`
-	CertFile            string         `toml:"cert_file"`
-	KeyFile             string         `toml:"key_file"`
-	Service             string         `toml:"service"`
-	Postgres            *PostgresAdmin `toml:"postgres"`
-	MongoDB             *MongoDBAdmin  `toml:"mongodb"`
-	PortMap             map[int]int    `toml:"-"`
-	RawPortMap          map[string]int `toml:"port_map,omitempty"`
+	Name                string           `toml:"name"`
+	Listen              string           `toml:"listen"`
+	Mode                string           `toml:"mode"`
+	Backend             string           `toml:"backend"`
+	ProvisionBackend    string           `toml:"provision_backend"`
+	Advertise           string           `toml:"advertise"`
+	BackendViaTailscale bool             `toml:"backend_via_tailscale"`
+	BackendTLS          bool             `toml:"tls"`
+	ProvisionTLS        *bool            `toml:"provision_tls"`
+	PostgresTLSMode     string           `toml:"tls_mode"`
+	UseTailscaleTLS     *bool            `toml:"use_tailscale_tls"`
+	CertFile            string           `toml:"cert_file"`
+	KeyFile             string           `toml:"key_file"`
+	Service             string           `toml:"service"`
+	Postgres            *PostgresAdmin   `toml:"postgres"`
+	MongoDB             *MongoDBAdmin    `toml:"mongodb"`
+	Kubernetes          *KubernetesAdmin `toml:"kubernetes"`
+	PortMap             map[int]int      `toml:"-"`
+	RawPortMap          map[string]int   `toml:"port_map,omitempty"`
 }
 
 // EffectiveProvisionBackend returns the database endpoint used for PostgreSQL
@@ -117,7 +118,12 @@ type PostgresTLSMode = TLSMode
 
 func (l ListenerConfig) EffectiveTLSMode() TLSMode {
 	switch strings.ToLower(strings.TrimSpace(l.PostgresTLSMode)) {
-	case "", string(TLSOptional):
+	case "":
+		if strings.EqualFold(strings.TrimSpace(l.Mode), "kubernetes") {
+			return TLSRequire
+		}
+		return TLSOptional
+	case string(TLSOptional):
 		return TLSOptional
 	case string(TLSOff):
 		return TLSOff
@@ -368,6 +374,24 @@ func (m *MongoDBAdmin) EffectiveAuthDatabase() string {
 	return m.AuthDatabase
 }
 
+// KubernetesAdmin holds credentials Waypoint uses to reach kube-apiserver.
+// The connecting Tailscale identity is impersonated; this principal must be
+// allowed to impersonate users/groups in the cluster.
+type KubernetesAdmin struct {
+	// Token is a secret and must never be serialized off-process.
+	Token              string `toml:"token" json:"-"`
+	TokenFile          string `toml:"token_file"`
+	CAFile             string `toml:"ca_file"`
+	InsecureSkipVerify bool   `toml:"insecure_skip_verify"`
+	// Impersonate defaults to true when nil.
+	Impersonate *bool  `toml:"impersonate"`
+	ServiceName string `toml:"service_name"`
+}
+
+func (k *KubernetesAdmin) EffectiveImpersonate() bool {
+	return k == nil || k.Impersonate == nil || *k.Impersonate
+}
+
 // Load reads and parses a TOML config file, expanding environment variables
 // in string values using ${VAR} syntax.
 func Load(path string) (*Config, error) {
@@ -414,8 +438,8 @@ func validate(cfg *Config) error {
 		names[l.Name] = true
 
 		mode := strings.ToLower(l.Mode)
-		if mode != "tcp" && mode != "postgres" && mode != "mongodb" {
-			return fmt.Errorf("listeners[%d].mode must be 'tcp', 'postgres', or 'mongodb', got %q", i, l.Mode)
+		if mode != "tcp" && mode != "postgres" && mode != "mongodb" && mode != "kubernetes" {
+			return fmt.Errorf("listeners[%d].mode must be 'tcp', 'postgres', 'mongodb', or 'kubernetes', got %q", i, l.Mode)
 		}
 		if l.MongoDB.HasSRV() && mode != "mongodb" {
 			return fmt.Errorf("listeners[%d]: mongodb.srv is only supported for mode %q, got %q", i, "mongodb", l.Mode)
@@ -587,13 +611,16 @@ func validate(cfg *Config) error {
 			return fmt.Errorf("listeners[%d] must set both cert_file and key_file together", i)
 		}
 		if (l.CertFile != "" || l.KeyFile != "") && !supportsClientTLS(mode) {
-			return fmt.Errorf("listeners[%d].cert_file and key_file are only supported for mode \"postgres\" or \"mongodb\"", i)
+			return fmt.Errorf("listeners[%d].cert_file and key_file are only supported for mode \"postgres\", \"mongodb\", or \"kubernetes\"", i)
 		}
 		if l.PostgresTLSMode != "" && !supportsClientTLS(mode) {
-			return fmt.Errorf("listeners[%d].tls_mode is only supported for mode \"postgres\" or \"mongodb\"", i)
+			return fmt.Errorf("listeners[%d].tls_mode is only supported for mode \"postgres\", \"mongodb\", or \"kubernetes\"", i)
 		}
 		if l.UseTailscaleTLS != nil && !supportsClientTLS(mode) {
-			return fmt.Errorf("listeners[%d].use_tailscale_tls is only supported for mode \"postgres\" or \"mongodb\"", i)
+			return fmt.Errorf("listeners[%d].use_tailscale_tls is only supported for mode \"postgres\", \"mongodb\", or \"kubernetes\"", i)
+		}
+		if err := validateKubernetes(i, mode, l.Kubernetes); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -658,8 +685,24 @@ func validMongoPreset(preset string) bool {
 	}
 }
 
+func validateKubernetes(listenerIndex int, mode string, k *KubernetesAdmin) error {
+	if mode != "kubernetes" {
+		if k != nil {
+			return fmt.Errorf("listeners[%d]: kubernetes config is only supported for mode %q, got %q", listenerIndex, "kubernetes", mode)
+		}
+		return nil
+	}
+	if k == nil {
+		return fmt.Errorf("listeners[%d]: mode %q requires [listeners.kubernetes]", listenerIndex, "kubernetes")
+	}
+	if strings.TrimSpace(k.Token) == "" && strings.TrimSpace(k.TokenFile) == "" {
+		return fmt.Errorf("listeners[%d].kubernetes.token or kubernetes.token_file is required", listenerIndex)
+	}
+	return nil
+}
+
 func supportsClientTLS(mode string) bool {
-	return mode == "postgres" || mode == "mongodb"
+	return mode == "postgres" || mode == "mongodb" || mode == "kubernetes"
 }
 
 func validateAdvertiseHostOrAddr(advertise string) error {

@@ -675,7 +675,7 @@ tls_mode = "require"
 `
 	path := writeTestConfig(t, content)
 	_, err := Load(path)
-	if err == nil || !strings.Contains(err.Error(), "tls_mode is only supported for mode \"postgres\" or \"mongodb\"") {
+	if err == nil || !strings.Contains(err.Error(), "tls_mode is only supported for mode \"postgres\", \"mongodb\", or \"kubernetes\"") {
 		t.Errorf("expected tls_mode mode error, got: %v", err)
 	}
 }
@@ -719,7 +719,7 @@ key_file = "/tmp/server.key"
 `
 	path := writeTestConfig(t, content)
 	_, err := Load(path)
-	if err == nil || !strings.Contains(err.Error(), "cert_file and key_file are only supported for mode \"postgres\" or \"mongodb\"") {
+	if err == nil || !strings.Contains(err.Error(), "cert_file and key_file are only supported for mode \"postgres\", \"mongodb\", or \"kubernetes\"") {
 		t.Errorf("expected cert mode error, got: %v", err)
 	}
 }
@@ -738,7 +738,7 @@ use_tailscale_tls = false
 `
 	path := writeTestConfig(t, content)
 	_, err := Load(path)
-	if err == nil || !strings.Contains(err.Error(), "use_tailscale_tls is only supported for mode \"postgres\" or \"mongodb\"") {
+	if err == nil || !strings.Contains(err.Error(), "use_tailscale_tls is only supported for mode \"postgres\", \"mongodb\", or \"kubernetes\"") {
 		t.Errorf("expected use_tailscale_tls mode error, got: %v", err)
 	}
 }
@@ -1493,6 +1493,118 @@ topology = "clustered"
 	_, err := Load(path)
 	if err == nil || !strings.Contains(err.Error(), "mongodb.topology must be one of") {
 		t.Errorf("expected unknown topology error, got: %v", err)
+	}
+}
+
+func TestLoad_KubernetesListener(t *testing.T) {
+	content := `
+[tailscale]
+hostname = "waypoint-test"
+
+[[listeners]]
+name = "eks-prod"
+listen = ":6443"
+mode = "kubernetes"
+backend = "10.0.1.20:443"
+tls = true
+tls_mode = "require"
+
+[listeners.kubernetes]
+token = "sa-token"
+ca_file = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+`
+	path := writeTestConfig(t, content)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	l := cfg.Listeners[0]
+	if l.Mode != "kubernetes" {
+		t.Fatalf("mode = %q", l.Mode)
+	}
+	if l.Kubernetes == nil || l.Kubernetes.Token != "sa-token" {
+		t.Fatalf("kubernetes config = %+v", l.Kubernetes)
+	}
+	if l.EffectiveTLSMode() != TLSRequire {
+		t.Fatalf("tls mode = %q", l.EffectiveTLSMode())
+	}
+}
+
+func TestListenerConfig_EffectiveTLSMode_KubernetesDefaultRequire(t *testing.T) {
+	l := ListenerConfig{Mode: "kubernetes"}
+	if got := l.EffectiveTLSMode(); got != TLSRequire {
+		t.Fatalf("default kubernetes tls mode = %q, want %q", got, TLSRequire)
+	}
+}
+
+func TestValidate_KubernetesMissingToken(t *testing.T) {
+	content := `
+[tailscale]
+hostname = "test"
+
+[[listeners]]
+name = "eks"
+listen = ":6443"
+mode = "kubernetes"
+backend = "10.0.0.1:443"
+
+[listeners.kubernetes]
+ca_file = "/tmp/ca.crt"
+`
+	path := writeTestConfig(t, content)
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "token") {
+		t.Errorf("expected token error, got: %v", err)
+	}
+}
+
+func TestValidate_KubernetesBlockOnTCP(t *testing.T) {
+	content := `
+[tailscale]
+hostname = "test"
+
+[[listeners]]
+name = "tcp"
+listen = ":6443"
+mode = "tcp"
+backend = "10.0.0.1:443"
+
+[listeners.kubernetes]
+token = "x"
+`
+	path := writeTestConfig(t, content)
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "kubernetes config is only supported") {
+		t.Errorf("expected kubernetes-on-tcp error, got: %v", err)
+	}
+}
+
+func TestValidate_KubernetesMissingBlock(t *testing.T) {
+	content := `
+[tailscale]
+hostname = "test"
+
+[[listeners]]
+name = "eks"
+listen = ":6443"
+mode = "kubernetes"
+backend = "10.0.0.1:443"
+`
+	path := writeTestConfig(t, content)
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "[listeners.kubernetes]") {
+		t.Errorf("expected kubernetes block error, got: %v", err)
+	}
+}
+
+func TestKubernetesAdmin_EffectiveImpersonate(t *testing.T) {
+	if !((*KubernetesAdmin)(nil)).EffectiveImpersonate() {
+		t.Fatal("nil should impersonate")
+	}
+	off := false
+	k := &KubernetesAdmin{Impersonate: &off}
+	if k.EffectiveImpersonate() {
+		t.Fatal("expected impersonate false")
 	}
 }
 

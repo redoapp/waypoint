@@ -202,3 +202,23 @@ backend = "10.0.1.5:3306"
 # backend = "10.0.1.10:5432"
 # tls_mode = "require"
 # service = "svc:waypoint-db"
+
+# Example: kube-apiserver via impersonation. Waypoint presents token_file (or
+# token) to the API server and impersonates the Tailscale user. The token must
+# be allowed to impersonate users/groups; bind end-user groups in cluster RBAC.
+# [[listeners]]
+# name = "eks-prod"
+# listen = ":6443"
+# mode = "kubernetes"
+# backend = "kubernetes.default.svc:443"
+# tls = true
+# tls_mode = "require"
+# use_tailscale_tls = true
+#
+# [listeners.kubernetes]
+# token_file = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+# ca_file = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+# # token = "${KUBE_TOKEN}"           # alternative to token_file
+# # insecure_skip_verify = false
+# # impersonate = true                # default
+

@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"encoding/json"
 	"testing"
 	"time"
 )
@@ -538,5 +539,82 @@ func TestMergeRules_MultipleDBs(t *testing.T) {
 
 	if len(perms) != 3 {
 		t.Errorf("expected 3 total perms across all DBs, got %d: %v", len(perms), perms)
+	}
+}
+
+func TestKubernetesIdentityFrom_DefaultsToLogin(t *testing.T) {
+	result := &AuthResult{
+		LoginName: "alice@example.com",
+		MatchedRules: []CapRule{{
+			Backends: map[string]BackendCap{
+				"eks-prod": {},
+			},
+		}},
+	}
+	ident := KubernetesIdentityFrom(result, "eks-prod")
+	if ident.User != "alice@example.com" {
+		t.Errorf("user = %q", ident.User)
+	}
+	if len(ident.Groups) != 0 {
+		t.Errorf("groups = %v", ident.Groups)
+	}
+}
+
+func TestKubernetesIdentityFrom_MergesGroupsAndExtra(t *testing.T) {
+	result := &AuthResult{
+		LoginName: "alice@example.com",
+		MatchedRules: []CapRule{
+			{
+				Backends: map[string]BackendCap{
+					"eks-prod": {K8s: &K8sCap{
+						Groups: []string{"waypoint:readonly", "system:authenticated"},
+						Extra:  map[string][]string{"node": {"laptop"}},
+					}},
+				},
+			},
+			{
+				Backends: map[string]BackendCap{
+					"eks-prod": {K8s: &K8sCap{
+						User:   "alice",
+						Groups: []string{"waypoint:readonly", "waypoint:oncall"},
+						Extra:  map[string][]string{"node": {"laptop", "ci"}},
+					}},
+				},
+			},
+		},
+	}
+	ident := KubernetesIdentityFrom(result, "eks-prod")
+	if ident.User != "alice" {
+		t.Errorf("user = %q", ident.User)
+	}
+	if len(ident.Groups) != 3 {
+		t.Fatalf("groups = %v", ident.Groups)
+	}
+	if len(ident.Extra["node"]) != 2 {
+		t.Fatalf("extra node = %v", ident.Extra["node"])
+	}
+}
+
+func TestCapRuleUnmarshal_Kubernetes(t *testing.T) {
+	data := []byte(`{
+		"backends": {
+			"eks-prod": {
+				"k8s": {
+					"groups": ["waypoint:readonly"],
+					"extra": {"node": ["alice-laptop"]}
+				}
+			}
+		}
+	}`)
+	var rule CapRule
+	if err := json.Unmarshal(data, &rule); err != nil {
+		t.Fatal(err)
+	}
+	k8s := rule.Backends["eks-prod"].K8s
+	if k8s == nil || len(k8s.Groups) != 1 || k8s.Groups[0] != "waypoint:readonly" {
+		t.Fatalf("k8s = %+v", k8s)
+	}
+	if k8s.Extra["node"][0] != "alice-laptop" {
+		t.Fatalf("extra = %v", k8s.Extra)
 	}
 }
