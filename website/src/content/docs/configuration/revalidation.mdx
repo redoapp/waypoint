@@ -24,6 +24,11 @@ Every `interval`, for every active connection:
 
 This means permission changes take effect mid-session: a user downgraded from `readwrite` to `readonly` keeps their existing connection but loses write privileges on the next tick. <TestRef name="TestIntegration_Proxy_RevalidationReconcilesPermissionDowngrade" />
 
+Kubernetes mode follows the official Tailscale API proxy more closely:
+`WhoIs` and the listener grant are evaluated on every HTTP request rather than
+on this interval. A streaming exec/watch request keeps the identity established
+when that request began; the next request sees policy changes immediately.
+
 ## What happens when access is revoked
 
 A *downgrade* (e.g. `readwrite` → `readonly`) is reconciled live and the session continues with reduced privileges. A *full revocation* of access to the connected database closes the connection. <TestRef name="TestIntegration_Proxy_RevalidationPermissionRevoked" />

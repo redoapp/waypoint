@@ -9,6 +9,7 @@ Waypoint is a Tailscale-aware database proxy that authenticates connections usin
 - **Tailscale-native auth** — identifies callers via `tsnet` + `WhoIs`, checks `redo.com/cap/waypoint` capability grants from your ACL policy
 - **Postgres mode** — intercepts the PG wire protocol, dynamically provisions per-user database roles with scoped `GRANT` permissions, and cleans up expired users
 - **MongoDB mode** — provisions scoped MongoDB users or uses static backend users, and rewrites replica-set topology so clients stay on the proxy, including TLS-terminated clients
+- **Kubernetes mode** — HTTPS reverse proxy for kube-apiserver; impersonates the Tailscale identity so cluster RBAC applies to the caller
 - **TCP mode** — transparent L4 proxy for any TCP backend (MySQL, Redis, etc.)
 - **Connection tracking** — per-user limits on concurrent connections, bytes transferred, connection duration, and bandwidth budgets, all stored in Redis/Valkey
 - **Mid-session revalidation** — periodically re-checks Tailscale identity during long-lived connections

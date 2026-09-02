@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What is Waypoint
 
-Waypoint is a Tailscale-aware database proxy that authenticates connections using Tailscale identity and ACL capability grants (`redo.com/cap/waypoint`). It supports two modes: **Postgres mode** (intercepts PG wire protocol, dynamically provisions per-user roles) and **TCP mode** (transparent L4 proxy for any TCP backend).
+Waypoint is a Tailscale-aware database proxy that authenticates connections using Tailscale identity and ACL capability grants (`redo.com/cap/waypoint`). It supports **Postgres mode** (intercepts PG wire protocol, dynamically provisions per-user roles), **MongoDB mode**, **Kubernetes mode** (impersonating HTTPS reverse proxy for kube-apiserver), and **TCP mode** (transparent L4 proxy for any TCP backend).
 
 ## Development Environment
 
@@ -86,7 +86,7 @@ Requires `TS_AUTHKEY` environment variable for initial Tailscale authentication.
 - **`internal/server`** — main server; listener accept loop, graceful shutdown, heartbeat publishing
 - **`cmd/waypoint-monitor`** — TUI dashboard that discovers instances via Redis
 - **`internal/auth`** — Tailscale identity verification and ACL capability parsing
-- **`internal/proxy`** — Postgres and TCP proxy implementations (`postgres.go`, `tcp.go`)
+- **`internal/proxy`** — Postgres, MongoDB, Kubernetes, and TCP proxy implementations
 - **`internal/provision`** — dynamic PostgreSQL role lifecycle (create, grant, cleanup); uses Redis distributed locks
 - **`internal/restrict`** — connection tracking, limits enforcement, Redis-backed state
 - **`internal/pgwire`** — PostgreSQL wire protocol (startup messages, SSL negotiation, SCRAM auth)

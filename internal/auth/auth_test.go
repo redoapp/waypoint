@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"encoding/json"
 	"testing"
 	"time"
 )
@@ -538,5 +539,118 @@ func TestMergeRules_MultipleDBs(t *testing.T) {
 
 	if len(perms) != 3 {
 		t.Errorf("expected 3 total perms across all DBs, got %d: %v", len(perms), perms)
+	}
+}
+
+func TestKubernetesIdentityFrom_DefaultsToLogin(t *testing.T) {
+	result := &AuthResult{
+		LoginName: "alice@example.com",
+		MatchedRules: []CapRule{{
+			Backends: map[string]BackendCap{
+				"eks-prod": {},
+			},
+		}},
+	}
+	ident := KubernetesIdentityFrom(result, "eks-prod")
+	if ident.User != "alice@example.com" {
+		t.Errorf("user = %q", ident.User)
+	}
+	if len(ident.Groups) != 0 {
+		t.Errorf("groups = %v", ident.Groups)
+	}
+}
+
+func TestKubernetesIdentityFrom_MergesGroups(t *testing.T) {
+	result := &AuthResult{
+		LoginName: "alice@example.com",
+		MatchedRules: []CapRule{
+			{
+				Backends: map[string]BackendCap{
+					"eks-prod": {K8s: &K8sCap{
+						Impersonate: &K8sImpersonateRule{
+							Groups: []string{"waypoint:readonly", "system:authenticated"},
+						},
+					}},
+				},
+			},
+			{
+				Backends: map[string]BackendCap{
+					"eks-prod": {K8s: &K8sCap{
+						Impersonate: &K8sImpersonateRule{
+							Groups: []string{"waypoint:readonly", "waypoint:oncall"},
+						},
+					}},
+				},
+			},
+		},
+	}
+	ident := KubernetesIdentityFrom(result, "eks-prod")
+	if ident.User != "alice@example.com" {
+		t.Errorf("user = %q", ident.User)
+	}
+	if len(ident.Groups) != 3 {
+		t.Fatalf("groups = %v", ident.Groups)
+	}
+}
+
+func TestCapRuleUnmarshal_Kubernetes(t *testing.T) {
+	data := []byte(`{
+		"backends": {
+			"eks-prod": {
+				"k8s": {
+					"impersonate": {
+						"groups": ["waypoint:readonly"]
+					}
+				}
+			}
+		}
+	}`)
+	var rule CapRule
+	if err := json.Unmarshal(data, &rule); err != nil {
+		t.Fatal(err)
+	}
+	k8s := rule.Backends["eks-prod"].K8s
+	if k8s == nil || k8s.Impersonate == nil || len(k8s.Impersonate.Groups) != 1 ||
+		k8s.Impersonate.Groups[0] != "waypoint:readonly" {
+		t.Fatalf("k8s = %+v", k8s)
+	}
+}
+
+func TestKubernetesIdentityFrom_TaggedNode(t *testing.T) {
+	result := &AuthResult{
+		LoginName:  "tagged-device",
+		NodeFQDN:   "ci-runner.example.ts.net",
+		NodeTags:   []string{"tag:ci", "tag:deploy"},
+		NodeTagged: true,
+		MatchedRules: []CapRule{{
+			Backends: map[string]BackendCap{"eks-prod": {}},
+		}},
+	}
+	ident := KubernetesIdentityFrom(result, "eks-prod")
+	if ident.User != "ci-runner.example.ts.net" {
+		t.Fatalf("user = %q", ident.User)
+	}
+	if len(ident.Groups) != 2 || ident.Groups[0] != "tag:ci" || ident.Groups[1] != "tag:deploy" {
+		t.Fatalf("groups = %v", ident.Groups)
+	}
+}
+
+func TestKubernetesIdentityFrom_TaggedNodeGrantGroupsOverrideTags(t *testing.T) {
+	result := &AuthResult{
+		LoginName:  "tagged-device",
+		NodeFQDN:   "ci-runner.example.ts.net",
+		NodeTags:   []string{"tag:ci"},
+		NodeTagged: true,
+		MatchedRules: []CapRule{{
+			Backends: map[string]BackendCap{
+				"eks-prod": {K8s: &K8sCap{
+					Impersonate: &K8sImpersonateRule{Groups: []string{"deployer"}},
+				}},
+			},
+		}},
+	}
+	ident := KubernetesIdentityFrom(result, "eks-prod")
+	if len(ident.Groups) != 1 || ident.Groups[0] != "deployer" {
+		t.Fatalf("groups = %v", ident.Groups)
 	}
 }

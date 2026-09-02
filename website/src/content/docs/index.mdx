@@ -33,6 +33,9 @@ Waypoint is a database proxy that sits on your tailnet between clients and backe
   <Card title="TCP mode" icon="bars">
     Transparent L4 proxy for any TCP backend — MySQL, Redis, anything else.
   </Card>
+  <Card title="Kubernetes mode" icon="approve-check">
+    Impersonating HTTPS reverse proxy for kube-apiserver; cluster RBAC applies to the Tailscale identity.
+  </Card>
   <Card title="Per-user limits" icon="setting">
     Concurrent connection caps, byte budgets, and duration ceilings — enforced cross-instance via Redis.
   </Card>
@@ -44,6 +47,6 @@ Waypoint is a database proxy that sits on your tailnet between clients and backe
 ## Where to go next
 
 - New here? Start with [Installation](/waypoint/getting-started/installation/) and the [Quickstart](/waypoint/getting-started/quickstart/).
-- Setting up a listener? See [Postgres](/waypoint/listeners/postgres/), [MongoDB](/waypoint/listeners/mongodb/), or [TCP](/waypoint/listeners/tcp/).
+- Setting up a listener? See [Postgres](/waypoint/listeners/postgres/), [MongoDB](/waypoint/listeners/mongodb/), [Kubernetes](/waypoint/listeners/kubernetes/), or [TCP](/waypoint/listeners/tcp/).
 - Wiring up ACL grants? Read [Capability Grants](/waypoint/acl/capability-grants/).
 - Running in production? See [Observability](/waypoint/observability/metrics/) and [Operations](/waypoint/operations/monitor/).

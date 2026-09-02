@@ -16,7 +16,21 @@ type CapRule struct {
 type BackendCap struct {
 	PG     *PGCap     `json:"pg,omitempty"`
 	Mongo  *MongoCap  `json:"mongo,omitempty"`
+	K8s    *K8sCap    `json:"k8s,omitempty"`
 	Limits *LimitsCap `json:"limits,omitempty"`
+}
+
+// K8sCap holds Kubernetes API proxy capabilities for a listener.
+// Authorization to reach the listener is the backend map key; this block
+// only shapes impersonation. Cluster RBAC remains the source of truth.
+type K8sCap struct {
+	// Impersonate mirrors tailscale.com/cap/kubernetes's grant shape.
+	Impersonate *K8sImpersonateRule `json:"impersonate,omitempty"`
+}
+
+// K8sImpersonateRule defines additional Kubernetes groups for the caller.
+type K8sImpersonateRule struct {
+	Groups []string `json:"groups,omitempty"`
 }
 
 // PGCap holds postgres-specific capabilities.

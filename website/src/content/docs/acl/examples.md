@@ -122,3 +122,19 @@ For database-mode provisioning, the grammar is the same shape as Postgres:
 ```
 
 For [static-user mode](/waypoint/listeners/mongodb/#mode--static-atlas-compatible), the grant shape is identical — Waypoint picks the matching pre-configured user based on the resolved preset set.
+
+## Kubernetes impersonation groups
+
+```json
+{
+  "backends": {
+    "eks-prod": {
+      "k8s": {
+        "impersonate": {
+          "groups": ["waypoint:readonly", "system:authenticated"]
+        }
+      }
+    }
+  }
+}
+```

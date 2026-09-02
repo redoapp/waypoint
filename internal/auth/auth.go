@@ -20,6 +20,9 @@ import (
 type AuthResult struct {
 	LoginName    string
 	NodeName     string
+	NodeFQDN     string
+	NodeTags     []string
+	NodeTagged   bool
 	Permissions  []string // all merged PG permissions (across all databases)
 	Limits       MergedLimits
 	MatchedRules []CapRule // rules that matched the backend, for per-database lookup
@@ -172,6 +175,9 @@ func Authorize(ctx context.Context, lc *local.Client, remoteAddr string, backend
 	return &AuthResult{
 		LoginName:    who.UserProfile.LoginName,
 		NodeName:     nodeName,
+		NodeFQDN:     strings.TrimSuffix(who.Node.Name, "."),
+		NodeTags:     append([]string(nil), who.Node.Tags...),
+		NodeTagged:   who.Node.IsTagged(),
 		Permissions:  perms,
 		Limits:       limits,
 		MatchedRules: matched,
@@ -258,6 +264,54 @@ func MongoDatabasePermissions(result *AuthResult, backend string, database strin
 	return &MongoDBPermissions{
 		Permissions: perms,
 	}
+}
+
+// KubernetesIdentity is the impersonation material for a Kubernetes API connection.
+type KubernetesIdentity struct {
+	User   string
+	Groups []string
+}
+
+// KubernetesIdentityFrom mirrors the official Tailscale Kubernetes proxy:
+// human devices use the login name; tagged devices use the node FQDN and,
+// when no grant groups are present, the node tags as groups.
+func KubernetesIdentityFrom(result *AuthResult, backend string) KubernetesIdentity {
+	ident := KubernetesIdentity{}
+	if result == nil {
+		return ident
+	}
+	ident.User = result.LoginName
+	if result.NodeTagged {
+		ident.User = result.NodeFQDN
+		if ident.User == "" {
+			ident.User = result.NodeName
+		}
+	}
+
+	groupsSeen := make(map[string]bool)
+	for _, r := range result.MatchedRules {
+		bc, ok := r.Backends[backend]
+		if !ok || bc.K8s == nil || bc.K8s.Impersonate == nil {
+			continue
+		}
+		for _, g := range bc.K8s.Impersonate.Groups {
+			g = strings.TrimSpace(g)
+			if g == "" || groupsSeen[g] {
+				continue
+			}
+			groupsSeen[g] = true
+			ident.Groups = append(ident.Groups, g)
+		}
+	}
+	if result.NodeTagged && len(ident.Groups) == 0 {
+		for _, tag := range result.NodeTags {
+			if tag != "" && !groupsSeen[tag] {
+				groupsSeen[tag] = true
+				ident.Groups = append(ident.Groups, tag)
+			}
+		}
+	}
+	return ident
 }
 
 // mergeRules collects all permissions and picks the most restrictive limits.
