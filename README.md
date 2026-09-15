@@ -12,6 +12,7 @@ Waypoint is a Tailscale-aware database proxy that authenticates connections usin
 - **TCP mode** — transparent L4 proxy for any TCP backend (MySQL, Redis, etc.)
 - **Connection tracking** — per-user limits on concurrent connections, bytes transferred, connection duration, and bandwidth budgets, all stored in Redis/Valkey
 - **Mid-session revalidation** — periodically re-checks Tailscale identity during long-lived connections
+- **Delegated Postgres sessions** — dedicated listeners accept one-use, gateway-signed agent credentials without charging or provisioning as the gateway
 - **Graceful shutdown** — drains active connections on `SIGINT`/`SIGTERM`
 
 ## Configuration
@@ -68,6 +69,12 @@ dynamic user's session to `backend` using `tls`, but creates and reconciles that
 user through `provision_backend` using `provision_tls`. Each override defaults
 to the corresponding session setting, so existing configurations are
 unchanged.
+
+Dedicated agent-gateway listeners may additionally configure
+`[listeners.delegation]`. They require the gateway's separate
+`redo.com/cap/waypoint-delegation` Tailscale grant, consume an ES256-signed
+`WPDG` preface before PostgreSQL startup, and resolve a server-owned permission
+profile. See the [delegation protocol and configuration](https://redoapp.github.io/waypoint/listeners/delegation/).
 
 Postgres listeners default to `tls_mode = "optional"`. If a client sends a PostgreSQL `SSLRequest`, Waypoint now upgrades that session to TLS and serves the certificate that matches the requested server name:
 - admin-provided `cert_file`/`key_file` for custom domains such as `waypoint.redo.run`

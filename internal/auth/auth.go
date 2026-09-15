@@ -295,6 +295,16 @@ func mergeRules(rules []CapRule, backend string) ([]string, MergedLimits) {
 	return perms, limits
 }
 
+// ResolveLimits converts a configured capability-shaped limit into the same
+// effective limits used by ordinary Tailscale authorization.
+func ResolveLimits(cap *LimitsCap) MergedLimits {
+	var limits MergedLimits
+	if cap != nil {
+		mergeLimits(&limits, cap)
+	}
+	return limits
+}
+
 // mergeEndpointLimits applies the most restrictive values from cap into endpoint limits.
 func mergeEndpointLimits(merged *EndpointLimits, cap *LimitsCap) {
 	if cap.MaxConns > 0 && (merged.MaxConns == 0 || cap.MaxConns < merged.MaxConns) {

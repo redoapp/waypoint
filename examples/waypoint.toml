@@ -90,6 +90,44 @@ user_prefix = "wp_"
 user_ttl = "24h"
 # service_name = "my-prod-db"   # peer.service override for OTel (default: listener name)
 
+# A delegated listener uses a separate Tailscale service and requires the
+# redo.com/cap/waypoint-delegation grant. The public key must be P-256 PEM.
+# [[listeners]]
+# name = "pgmask-readonly"
+# listen = ":15432"
+# mode = "postgres"
+# service = "svc:waypoint-db-agents"
+# backend = "127.0.0.1:6432"
+# provision_backend = "10.0.1.10:5432"
+# provision_tls = true
+#
+# [listeners.postgres]
+# admin_user = "waypoint_admin"
+# admin_password = "${PG_ADMIN_PASSWORD}"
+# admin_database = "postgres"
+# user_prefix = "wp_agent_"
+# user_ttl = "24h"
+#
+# [listeners.delegation]
+# issuer = "https://waypoint-gateway.example"
+# audience = "waypoint.prod"
+# preface_timeout = "5s"
+# max_credential_bytes = 8192
+#
+# [listeners.delegation.keys]
+# gateway_2026_09 = "${WAYPOINT_GATEWAY_PUBLIC_KEY}"
+#
+# [listeners.delegation.profiles.pgmask-readonly]
+# backend = "pgmask-readonly"
+#
+# [listeners.delegation.profiles.pgmask-readonly.postgres.databases.redo]
+# permissions = ["readonly"]
+# schemas = ["public"]
+#
+# [listeners.delegation.profiles.pgmask-readonly.limits]
+# max_conns = 4
+# max_conn_duration = "1h"
+
 [[listeners]]
 name = "raw-mysql"
 listen = ":3306"

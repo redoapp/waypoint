@@ -24,3 +24,14 @@ type TailscaleAuthorizer struct {
 func (a *TailscaleAuthorizer) Authorize(ctx context.Context, remoteAddr string, backend string) (*auth.AuthResult, error) {
 	return auth.Authorize(ctx, a.LC, remoteAddr, backend, a.Logger)
 }
+
+// TailscaleDelegationAuthorizer uses the distinct delegation capability and
+// never accepts an ordinary database grant as a substitute.
+type TailscaleDelegationAuthorizer struct {
+	LC     *local.Client
+	Logger *slog.Logger
+}
+
+func (a *TailscaleDelegationAuthorizer) AuthorizeDelegation(ctx context.Context, remoteAddr, backend string) (*auth.TransportIdentity, error) {
+	return auth.AuthorizeDelegation(ctx, a.LC, remoteAddr, backend, a.Logger)
+}

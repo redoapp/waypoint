@@ -4,6 +4,16 @@ import "encoding/json"
 
 const WaypointCap = "redo.com/cap/waypoint"
 
+// WaypointDelegationCap permits a trusted transport peer to submit delegated
+// credentials. It is intentionally distinct from WaypointCap: possessing this
+// grant alone never authorizes an ordinary database connection.
+const WaypointDelegationCap = "redo.com/cap/waypoint-delegation"
+
+// DelegationCapRule scopes a gateway's delegation authority to listeners.
+type DelegationCapRule struct {
+	Backends []string `json:"backends"`
+}
+
 // CapRule represents a single capability rule from the Tailscale ACL grant.
 // Top-level Limits apply globally (per-user across all backends).
 // Each backend entry in Backends carries its own PG and Limits (per-endpoint).

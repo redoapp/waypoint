@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/BurntSushi/toml"
+	"github.com/redoapp/waypoint/internal/delegation"
 	"github.com/redoapp/waypoint/internal/metrics"
 	"github.com/redoapp/waypoint/internal/tsconfig"
 )
@@ -59,24 +60,25 @@ type DefaultLimitsConfig struct {
 }
 
 type ListenerConfig struct {
-	Name                string         `toml:"name"`
-	Listen              string         `toml:"listen"`
-	Mode                string         `toml:"mode"`
-	Backend             string         `toml:"backend"`
-	ProvisionBackend    string         `toml:"provision_backend"`
-	Advertise           string         `toml:"advertise"`
-	BackendViaTailscale bool           `toml:"backend_via_tailscale"`
-	BackendTLS          bool           `toml:"tls"`
-	ProvisionTLS        *bool          `toml:"provision_tls"`
-	PostgresTLSMode     string         `toml:"tls_mode"`
-	UseTailscaleTLS     *bool          `toml:"use_tailscale_tls"`
-	CertFile            string         `toml:"cert_file"`
-	KeyFile             string         `toml:"key_file"`
-	Service             string         `toml:"service"`
-	Postgres            *PostgresAdmin `toml:"postgres"`
-	MongoDB             *MongoDBAdmin  `toml:"mongodb"`
-	PortMap             map[int]int    `toml:"-"`
-	RawPortMap          map[string]int `toml:"port_map,omitempty"`
+	Name                string             `toml:"name"`
+	Listen              string             `toml:"listen"`
+	Mode                string             `toml:"mode"`
+	Backend             string             `toml:"backend"`
+	ProvisionBackend    string             `toml:"provision_backend"`
+	Advertise           string             `toml:"advertise"`
+	BackendViaTailscale bool               `toml:"backend_via_tailscale"`
+	BackendTLS          bool               `toml:"tls"`
+	ProvisionTLS        *bool              `toml:"provision_tls"`
+	PostgresTLSMode     string             `toml:"tls_mode"`
+	UseTailscaleTLS     *bool              `toml:"use_tailscale_tls"`
+	CertFile            string             `toml:"cert_file"`
+	KeyFile             string             `toml:"key_file"`
+	Service             string             `toml:"service"`
+	Postgres            *PostgresAdmin     `toml:"postgres"`
+	Delegation          *delegation.Config `toml:"delegation"`
+	MongoDB             *MongoDBAdmin      `toml:"mongodb"`
+	PortMap             map[int]int        `toml:"-"`
+	RawPortMap          map[string]int     `toml:"port_map,omitempty"`
 }
 
 // EffectiveProvisionBackend returns the database endpoint used for PostgreSQL
@@ -422,6 +424,14 @@ func validate(cfg *Config) error {
 		}
 		if (l.ProvisionBackend != "" || l.ProvisionTLS != nil) && mode != "postgres" {
 			return fmt.Errorf("listeners[%d].provision_backend and provision_tls are only supported for mode %q", i, "postgres")
+		}
+		if l.Delegation != nil {
+			if mode != "postgres" {
+				return fmt.Errorf("listeners[%d].delegation is only supported for mode %q", i, "postgres")
+			}
+			if err := delegation.ValidateConfig(*l.Delegation, l.Name); err != nil {
+				return fmt.Errorf("listeners[%d].delegation: %w", i, err)
+			}
 		}
 		hasMongoMembers := mode == "mongodb" && l.MongoDB != nil && len(l.MongoDB.Members) > 0
 		hasMongoSRV := mode == "mongodb" && l.MongoDB.HasSRV()

@@ -1,0 +1,134 @@
+---
+title: Delegated Postgres connections
+description: Gateway-signed one-time credentials for agent PostgreSQL sessions.
+---
+
+import TestRef from '../../../components/TestRef.astro';
+
+A dedicated Postgres listener can accept connections from a trusted gateway on
+behalf of an agent. Delegation is opt-in per listener. A delegation capability
+does not authorize the gateway to open an ordinary database connection, and an
+ordinary `redo.com/cap/waypoint` database grant does not authorize delegation.
+
+## Wire format
+
+After Tailscale's service-level PROXY protocol header and before any PostgreSQL
+bytes, the gateway writes exactly one frame:
+
+```text
+"WPDG"                  4-byte protocol identifier
+version                 1 byte; currently 1
+credential_length       uint32, network byte order
+credential              signed JWT bytes
+PostgreSQL traffic      unframed for the rest of the connection
+```
+
+The credential is limited to 8 KiB and the complete preface must arrive within
+five seconds. Waypoint reads exact lengths, so a PostgreSQL startup message sent
+in the same TCP write remains available to the normal PostgreSQL parser.
+<TestRef name="TestReadPrefaceFragmentedAndPreservesPostgresBytes" /> There is
+no success response. Invalid, truncated, or replayed prefaces are closed before
+Waypoint sends PostgreSQL bytes.
+
+## Credential contract
+
+The JWT uses ES256 and protected header
+`typ = "waypoint-delegation+jwt"`. A configured `kid` selects a P-256 public
+key. The required claims are `iss`, `aud`, `sub`, `iat`, `exp`, `jti`,
+`backend`, and `profile`.
+
+- `sub` is the trusted gateway's stable, namespaced agent identity.
+- `backend` must equal the listener name.
+- `profile` selects a server-owned grant and limit profile. A token cannot carry
+  SQL grants, destinations, or rate-bucket names.
+- `iat` must be within the previous 60 seconds, with five seconds of clock skew.
+- `exp` must be after `iat` and no more than one hour later.
+- Redis consumes each issuer/`jti` pair atomically. Every connection, including
+  a retry after setup failure, needs a newly issued credential.
+
+<TestRef name="TestVerifierRejectsInvalidCredentials" />
+<TestRef name="TestConsumeDelegationJTIAtomicAcrossStores" />
+
+## Configuration
+
+```toml
+[[listeners]]
+name = "pgmask-readonly"
+listen = ":5432"
+mode = "postgres"
+service = "svc:waypoint-db-agents"
+backend = "127.0.0.1:6432"          # pgmask session path
+provision_backend = "crdb.internal:26257" # direct admin path
+tls = false
+provision_tls = true
+
+[listeners.postgres]
+admin_user = "waypoint_admin"
+admin_password = "${PG_ADMIN_PASSWORD}"
+admin_database = "postgres"
+user_prefix = "wp_agent_"
+
+[listeners.delegation]
+issuer = "https://waypoint-gateway.example"
+audience = "waypoint.prod"
+preface_timeout = "5s"
+max_credential_bytes = 8192
+
+[listeners.delegation.keys]
+gateway_2026_09 = "${WAYPOINT_GATEWAY_PUBLIC_KEY}"
+
+[listeners.delegation.profiles.pgmask-readonly]
+backend = "pgmask-readonly"
+
+[listeners.delegation.profiles.pgmask-readonly.postgres.databases.redo]
+permissions = ["readonly"]
+schemas = ["public"]
+
+[listeners.delegation.profiles.pgmask-readonly.limits]
+max_conns = 4
+max_bytes_per_conn = 1073741824
+max_conn_duration = "1h"
+```
+
+The matching Tailscale grant is separate from database grants:
+
+```json
+{
+  "grants": [{
+    "src": ["tag:waypoint-gateway"],
+    "dst": ["tag:waypoint"],
+    "cap": {
+      "redo.com/cap/waypoint-delegation": [
+        { "backends": ["pgmask-readonly"] }
+      ]
+    }
+  }]
+}
+```
+
+Waypoint retains the authenticated gateway transport identity for logs and
+revalidation. The delegated subject supplies a hashed quota identity shared
+across gateway replicas and refreshed credentials. Provisioned roles are also
+derived from that stable subject and scoped by listener, profile, database, and
+any requested lower preset. The gateway's identity is never substituted for
+the agent during authorization or quota checks.
+
+Waypoint closes both sockets at the credential's absolute expiration, including
+while idle or during startup. A shorter configured connection-duration limit
+wins. At the normal revalidation interval Waypoint rechecks the gateway's
+delegation capability while retaining the original subject and profile; losing
+that capability closes the session.
+
+## Key rotation
+
+1. Add the new public key under a new `kid` and deploy every Waypoint replica.
+2. Switch every gateway signer to the new private key and `kid`.
+3. Wait for the one-hour maximum credential lifetime plus clock skew, and verify
+   that sessions signed by the old key have expired.
+4. Remove the old public key and deploy Waypoint again.
+
+Never switch the signer before all Waypoint replicas trust the new key. Keep
+gateway and Waypoint clocks synchronized.
+
+Cursor/Coder authenticators, repository policy, production key provisioning,
+infrastructure deployment, and agent bootstrap are outside this protocol.
