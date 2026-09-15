@@ -14,6 +14,10 @@ Postgres mode intercepts the PostgreSQL wire protocol. For each incoming connect
 3. Provisions a temporary backend role with the permissions described by the ACL grant. <TestRef name="TestIntegration_EnsureUser_CreatesRole" /> <TestRef name="TestIntegration_EnsureUser_CanLogin" />
 4. Authenticates as that role against the backend (supporting SCRAM, MD5, and cleartext upstream auth) <TestRef name="TestHandleUpstreamAuth_SCRAM" /> <TestRef name="TestHandleUpstreamAuth_MD5Password" /> <TestRef name="TestHandleUpstreamAuth_CleartextPassword" /> and proxies the rest of the session. <TestRef name="TestIntegration_Proxy_SelectAllowed" />
 
+For agent gateways, a dedicated listener can authenticate a one-time signed
+preface instead of treating the gateway as the database principal. See
+[Delegated Postgres connections](/waypoint/listeners/delegation/).
+
 ```toml
 [[listeners]]
 name = "pg-main"
