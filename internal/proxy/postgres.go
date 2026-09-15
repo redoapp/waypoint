@@ -22,12 +22,13 @@ import (
 	"github.com/redoapp/waypoint/internal/restrict"
 )
 
-// PostgresProxy handles PG-aware proxying with Tailscale auth,
+// PostgresProxy handles PG-aware proxying with direct or delegated auth,
 // dynamic user provisioning, and mid-session revalidation.
 type PostgresProxy struct {
 	Backend       string
 	Name          string
 	Auth          Authorizer
+	SessionAuth   PostgresAuthenticator
 	Tracker       *restrict.Tracker
 	Provisioner   *provision.Provisioner
 	Metrics       *metrics.Metrics
@@ -40,6 +41,18 @@ type PostgresProxy struct {
 	Dialer        func(ctx context.Context, network, addr string) (net.Conn, error)
 	BytesRead     *atomic.Int64 // optional: aggregate byte counter
 	BytesWritten  *atomic.Int64 // optional: aggregate byte counter
+}
+
+func sessionContext(parent context.Context, deadline time.Time) (context.Context, context.CancelFunc) {
+	if deadline.IsZero() {
+		return context.WithCancel(parent)
+	}
+	return context.WithDeadline(parent, deadline)
+}
+
+func closeConnWhenDone(ctx context.Context, conn net.Conn) {
+	<-ctx.Done()
+	_ = conn.Close()
 }
 
 // HandleConn processes a single inbound PostgreSQL connection.
@@ -70,11 +83,15 @@ func (p *PostgresProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 	)
 	setupSpanCtx := setupSpan.SpanContext()
 
-	// Step 1: Authorize via Tailscale identity.
+	// Step 1: Resolve direct or delegated authentication to one session.
 	m.AuthAttempts.Add(ctx, 1, m.Attrs("waypoint.auth.attempts", listenerAttr))
 	ctx, authSpan := tracer.Start(ctx, "waypoint.auth")
 	authStart := time.Now()
-	result, err := p.Auth.Authorize(ctx, clientConn.RemoteAddr().String(), p.Name)
+	authenticator := p.SessionAuth
+	if authenticator == nil {
+		authenticator = directPostgresAuthenticator{authorizer: p.Auth}
+	}
+	result, err := authenticator.Authenticate(ctx, clientConn, p.Name)
 	authDur := time.Since(authStart).Seconds()
 	m.AuthLatency.Record(ctx, authDur, m.Attrs("waypoint.auth.latency", listenerAttr))
 	if err != nil {
@@ -87,21 +104,43 @@ func (p *PostgresProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 		m.AuthFailures.Add(ctx, 1, m.Attrs("waypoint.auth.failures", listenerAttr))
 		m.ConnRejected.Add(ctx, 1, m.Attrs("waypoint.conn.rejected", listenerAttr, modeAttr))
 		log.WarnContext(ctx, "auth failed", "error", err, "listener", p.Name)
-		pgwire.SendErrorResponse(clientConn, "FATAL", "28000", "authentication failed: "+err.Error())
+		if !errors.Is(err, ErrCloseWithoutResponse) {
+			pgwire.SendErrorResponse(clientConn, "FATAL", "28000", "authentication failed: "+err.Error())
+		}
 		return
 	}
-	authSpan.SetAttributes(attribute.String("waypoint.user", result.LoginName))
+	authorization := result.Authorization()
+	principal := result.Principal()
+	quotaIdentity := result.QuotaIdentity()
+	transport := result.Transport()
+	delegationContext, delegated := result.Delegation()
+	profile := ""
+	if delegated {
+		profile = delegationContext.Profile
+	}
+	authSpan.SetAttributes(attribute.String("waypoint.user", principal))
 	authSpan.End()
 
 	log.InfoContext(ctx, "authorized",
-		"user", result.LoginName,
-		"node", result.NodeName,
+		"user", principal,
+		"node", authorization.NodeName,
+		"transport_user", transport.LoginName,
+		"transport_node", transport.NodeName,
+		"delegated", delegated,
+		"profile", profile,
 		"backend", p.Name,
 	)
 
+	// A context deadline plus explicit socket closes enforce expiration during
+	// startup, active traffic, and idle sessions. The configured duration limit
+	// can only shorten a delegated credential's absolute expiry.
+	ctx, cancelSession := sessionContext(ctx, result.Deadline())
+	defer cancelSession()
+	go closeConnWhenDone(ctx, clientConn)
+
 	// Step 2: Acquire connection slot.
 	ctx, slotSpan := tracer.Start(ctx, "waypoint.acquire_slot")
-	release, err := p.Tracker.Acquire(ctx, result.LoginName, result.Limits, p.Name)
+	release, err := p.Tracker.Acquire(ctx, quotaIdentity, authorization.Limits, p.Name)
 	if err != nil {
 		slotSpan.RecordError(err)
 		slotSpan.SetStatus(codes.Error, "limit exceeded")
@@ -110,7 +149,7 @@ func (p *PostgresProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 		setupSpan.SetStatus(codes.Error, "limit exceeded")
 		setupSpan.End()
 		m.ConnRejected.Add(ctx, 1, m.Attrs("waypoint.conn.rejected", listenerAttr, modeAttr))
-		log.WarnContext(ctx, "limit exceeded", "user", result.LoginName, "error", err)
+		log.WarnContext(ctx, "limit exceeded", "user", principal, "error", err)
 		pgwire.SendErrorResponse(clientConn, "FATAL", "53300", "too many connections: "+err.Error())
 		return
 	}
@@ -125,7 +164,7 @@ func (p *PostgresProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 	defer func() {
 		m.ConnActive.Add(ctx, -1, m.Attrs("waypoint.conn.active", listenerAttr, modeAttr))
 		m.ConnDuration.Record(ctx, time.Since(connStart).Seconds(),
-			m.Attrs("waypoint.conn.duration", listenerAttr, metrics.AttrUser.String(result.LoginName)))
+			m.Attrs("waypoint.conn.duration", listenerAttr, metrics.AttrUser.String(principal)))
 	}()
 
 	// Step 3: Read client's StartupMessage to get requested database.
@@ -170,11 +209,11 @@ func (p *PostgresProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 	}
 
 	// Step 4: Check per-database permissions from cap rules.
-	dbPerms := auth.DatabasePermissions(result, p.Name, requestedDB)
+	dbPerms := auth.DatabasePermissions(authorization, p.Name, requestedDB)
 	if dbPerms == nil {
 		var grantedDBs []string
 		seen := make(map[string]bool)
-		for _, r := range result.MatchedRules {
+		for _, r := range authorization.MatchedRules {
 			bc, ok := r.Backends[p.Name]
 			if !ok || bc.PG == nil {
 				continue
@@ -189,7 +228,7 @@ func (p *PostgresProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 		setupSpan.SetStatus(codes.Error, "no permissions for database")
 		setupSpan.End()
 		log.WarnContext(ctx, "no permissions for database",
-			"user", result.LoginName,
+			"user", principal,
 			"database", requestedDB,
 			"granted_databases", grantedDBs,
 		)
@@ -198,7 +237,8 @@ func (p *PostgresProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 		return
 	}
 
-	roleScope := ""
+	provisioning := result.Provisioning()
+	roleScope := provisioning.RoleScope
 	if presetLimit != nil {
 		var effectivePreset string
 		dbPerms, effectivePreset, err = limitDBPermissionsToPostgresPreset(dbPerms, presetLimit)
@@ -207,7 +247,7 @@ func (p *PostgresProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 			setupSpan.SetStatus(codes.Error, "preset limit denied")
 			setupSpan.End()
 			log.WarnContext(ctx, "preset limit denied",
-				"user", result.LoginName,
+				"user", principal,
 				"database", requestedDB,
 				"preset_limit", presetLimit.Raw,
 				"error", err,
@@ -216,7 +256,10 @@ func (p *PostgresProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 				"not authorized for requested preset limit: "+err.Error())
 			return
 		}
-		roleScope = "preset_" + effectivePreset
+		if roleScope != "" {
+			roleScope += "_"
+		}
+		roleScope += "preset_" + effectivePreset
 		setupSpan.SetAttributes(
 			attribute.String("waypoint.preset_limit", presetLimit.Raw),
 			attribute.String("waypoint.effective_preset", effectivePreset),
@@ -240,9 +283,9 @@ func (p *PostgresProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 	ctx, provSpan := tracer.Start(ctx, "waypoint.provision")
 	var pgUser, pgPass string
 	if roleScope != "" {
-		pgUser, pgPass, err = p.Provisioner.EnsureUserWithRoleScope(ctx, result.LoginName, result.NodeName, requestedDB, roleScope, dbPerms)
+		pgUser, pgPass, err = p.Provisioner.EnsureUserWithRoleScope(ctx, provisioning.LoginName, provisioning.NodeName, requestedDB, roleScope, dbPerms)
 	} else {
-		pgUser, pgPass, err = p.Provisioner.EnsureUser(ctx, result.LoginName, result.NodeName, requestedDB, dbPerms)
+		pgUser, pgPass, err = p.Provisioner.EnsureUser(ctx, provisioning.LoginName, provisioning.NodeName, requestedDB, dbPerms)
 	}
 	provSpan.End()
 	m.ProvisionLatency.Record(ctx, time.Since(provStart).Seconds(),
@@ -257,7 +300,7 @@ func (p *PostgresProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 			// still provisioning. Say so, so the user retries instead of
 			// reading "internal error" and filing a bug.
 			log.WarnContext(ctx, "provision contended",
-				"user", result.LoginName,
+				"user", principal,
 				"database", requestedDB,
 				"error", err,
 			)
@@ -266,7 +309,7 @@ func (p *PostgresProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 			return
 		}
 		log.ErrorContext(ctx, "provision failed",
-			"user", result.LoginName,
+			"user", principal,
 			"database", requestedDB,
 			"error", err,
 		)
@@ -299,6 +342,7 @@ func (p *PostgresProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 	}
 	dialSpan.End()
 	defer backendConn.Close()
+	go closeConnWhenDone(ctx, backendConn)
 
 	log.DebugContext(ctx, "backend connected")
 
@@ -358,17 +402,17 @@ func (p *PostgresProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 	}
 
 	// Setup complete — end span before long-lived relay.
-	setupSpan.SetAttributes(attribute.String("waypoint.user", result.LoginName))
+	setupSpan.SetAttributes(attribute.String("waypoint.user", principal))
 	setupSpan.End()
 
 	// Step 11: Bidirectional relay with limits.
-	cl := p.Tracker.WrapConn(ctx, result.LoginName, result.Limits, p.Name)
+	cl := p.Tracker.WrapConn(ctx, quotaIdentity, authorization.Limits, p.Name)
 
 	// Step 12: Start mid-session revalidation.
 	revalCtx, revalCancel := context.WithCancel(ctx)
 	defer revalCancel()
 	if p.RevalInterval > 0 {
-		go p.revalidateLoop(revalCtx, setupSpanCtx, connID, clientConn, backendConn, result.LoginName, requestedDB, pgUser, presetLimit, log)
+		go p.revalidateLoop(revalCtx, setupSpanCtx, connID, clientConn, backendConn, result, authenticator, requestedDB, pgUser, presetLimit, log)
 	}
 
 	log.DebugContext(ctx, "relay started")
@@ -378,14 +422,14 @@ func (p *PostgresProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 	switch relayResult.Reason {
 	case restrict.CloseLimit:
 		log.WarnContext(ctx, "relay ended: limit exceeded",
-			"user", result.LoginName,
+			"user", principal,
 			"close_reason", relayResult.Reason,
 			"initiated_by", relayResult.InitiatedBy,
 			"error", relayResult.Err,
 		)
 	case restrict.CloseNetwork:
 		log.WarnContext(ctx, "relay ended: network error",
-			"user", result.LoginName,
+			"user", principal,
 			"initiated_by", relayResult.InitiatedBy,
 			"error", relayResult.Err,
 		)
@@ -407,7 +451,7 @@ func (p *PostgresProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 		trace.WithAttributes(
 			attribute.String("waypoint.conn_id", connID),
 			attribute.String("waypoint.listener", p.Name),
-			attribute.String("waypoint.user", result.LoginName),
+			attribute.String("waypoint.user", principal),
 			attribute.Int64("waypoint.bytes_read", br),
 			attribute.Int64("waypoint.bytes_written", bw),
 			attribute.Float64("waypoint.duration_s", time.Since(connStart).Seconds()),
@@ -428,13 +472,14 @@ func (p *PostgresProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 
 // revalidateLoop periodically re-checks WhoIs + caps and reconciles the active
 // backend role to match current permissions.
-func (p *PostgresProxy) revalidateLoop(ctx context.Context, setupSpanCtx trace.SpanContext, connID string, clientConn, backendConn net.Conn, loginName, database, pgUser string, presetLimit *postgresPresetLimit, log *slog.Logger) {
+func (p *PostgresProxy) revalidateLoop(ctx context.Context, setupSpanCtx trace.SpanContext, connID string, clientConn, backendConn net.Conn, session *auth.AuthorizedSession, authenticator PostgresAuthenticator, database, pgUser string, presetLimit *postgresPresetLimit, log *slog.Logger) {
 	ticker := time.NewTicker(p.RevalInterval)
 	defer ticker.Stop()
 
 	m := p.Metrics
 	tracer := m.Tracer()
 	listenerAttr := metrics.AttrListener.String(p.Name)
+	loginName := session.Principal()
 
 	for {
 		select {
@@ -453,7 +498,7 @@ func (p *PostgresProxy) revalidateLoop(ctx context.Context, setupSpanCtx trace.S
 				),
 			)
 
-			result, err := p.Auth.Authorize(ctx, clientConn.RemoteAddr().String(), p.Name)
+			result, err := authenticator.Revalidate(ctx, clientConn, session, p.Name)
 			if err != nil {
 				revalSpan.RecordError(err)
 				revalSpan.SetStatus(codes.Error, "revalidation failed")
@@ -469,7 +514,7 @@ func (p *PostgresProxy) revalidateLoop(ctx context.Context, setupSpanCtx trace.S
 			}
 
 			var dbPerms *auth.DBPermissions
-			if currentPerms := auth.DatabasePermissions(result, p.Name, database); currentPerms != nil {
+			if currentPerms := auth.DatabasePermissions(result.Authorization(), p.Name, database); currentPerms != nil {
 				dbPerms = currentPerms
 				if presetLimit != nil {
 					var effectivePreset string
