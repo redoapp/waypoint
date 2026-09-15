@@ -23,6 +23,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 
 	"github.com/redoapp/waypoint/internal/config"
+	"github.com/redoapp/waypoint/internal/delegation"
 	"github.com/redoapp/waypoint/internal/heartbeat"
 	"github.com/redoapp/waypoint/internal/logging"
 	"github.com/redoapp/waypoint/internal/metrics"
@@ -428,6 +429,23 @@ func RunServer(ctx context.Context, configPath string, logger *slog.Logger, leve
 					pgPeerService = lCfg.Postgres.ServiceName
 				}
 
+				var sessionAuth proxy.PostgresAuthenticator
+				if lCfg.Delegation != nil {
+					verifier, err := delegation.NewVerifier(*lCfg.Delegation, store)
+					if err != nil {
+						return fmt.Errorf("configure delegation for listener %s: %w", lCfg.Name, err)
+					}
+					sessionAuth = &proxy.DelegatedPostgresAuthenticator{
+						GatewayAuth: &proxy.TailscaleDelegationAuthorizer{
+							LC:     lc,
+							Logger: logger.With("listener", lCfg.Name),
+						},
+						Verifier:          verifier,
+						PrefaceTimeout:    lCfg.Delegation.EffectivePrefaceTimeout(),
+						MaxCredentialSize: lCfg.Delegation.EffectiveMaxCredentialBytes(),
+					}
+				}
+
 				backendPaths := resolvePostgresBackendPaths(lCfg, be.Backend)
 				provisioner := provision.NewProvisioner(
 					lCfg.Postgres.AdminUser,
@@ -448,6 +466,7 @@ func RunServer(ctx context.Context, configPath string, logger *slog.Logger, leve
 					Backend:       backendPaths.Session,
 					Name:          lCfg.Name,
 					Auth:          &proxy.TailscaleAuthorizer{LC: lc, Logger: logger.With("listener", lCfg.Name)},
+					SessionAuth:   sessionAuth,
 					Tracker:       tracker,
 					Provisioner:   provisioner,
 					Metrics:       m,

@@ -1,6 +1,11 @@
 package config
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"encoding/pem"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -8,6 +13,19 @@ import (
 	"testing"
 	"time"
 )
+
+func testDelegationPublicKey(t *testing.T) string {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	der, err := x509.MarshalPKIXPublicKey(&key.PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: der}))
+}
 
 func writeTestConfig(t *testing.T, content string) string {
 	t.Helper()
@@ -175,6 +193,57 @@ user_ttl = "24h"
 	}
 	if cfg.Listeners[0].Postgres.AdminPassword != "mysecretpass" {
 		t.Errorf("expected env var expansion, got %q", cfg.Listeners[0].Postgres.AdminPassword)
+	}
+}
+
+func TestLoad_DelegationProfile(t *testing.T) {
+	content := fmt.Sprintf(`
+[tailscale]
+hostname = "waypoint-test"
+
+[[listeners]]
+name = "pg-masked"
+listen = ":5432"
+mode = "postgres"
+backend = "127.0.0.1:6432"
+provision_backend = "127.0.0.1:5432"
+
+[listeners.postgres]
+admin_user = "admin"
+admin_password = "pass"
+admin_database = "postgres"
+
+[listeners.delegation]
+issuer = "https://gateway.test"
+audience = "waypoint.test"
+preface_timeout = "5s"
+max_credential_bytes = 8192
+
+[listeners.delegation.keys]
+gateway_test = '''
+%s'''
+
+[listeners.delegation.profiles.pgmask-readonly]
+backend = "pg-masked"
+
+[listeners.delegation.profiles.pgmask-readonly.postgres.databases.redo]
+permissions = ["readonly"]
+
+[listeners.delegation.profiles.pgmask-readonly.limits]
+max_conns = 4
+max_conn_duration = "30m"
+`, testDelegationPublicKey(t))
+	cfg, err := Load(writeTestConfig(t, content))
+	if err != nil {
+		t.Fatal(err)
+	}
+	delegation := cfg.Listeners[0].Delegation
+	if delegation == nil {
+		t.Fatal("delegation config was not decoded")
+	}
+	profile := delegation.Profiles["pgmask-readonly"]
+	if profile.Postgres == nil || profile.Postgres.Databases["redo"].Permissions[0] != "readonly" {
+		t.Fatalf("unexpected profile: %+v", profile)
 	}
 }
 
