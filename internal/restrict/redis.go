@@ -2,6 +2,8 @@ package restrict
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"strings"
 	"time"
@@ -22,6 +24,22 @@ type RedisStore struct {
 	metrics   *metrics.Metrics
 	// nowFunc allows tests to override time.Now for sliding window calculations.
 	nowFunc func() time.Time
+}
+
+// ConsumeDelegationJTI records a signed credential identifier exactly once.
+// SET NX is atomic in Redis, so all Waypoint replicas share the replay gate.
+func (s *RedisStore) ConsumeDelegationJTI(ctx context.Context, issuer, jti string, expiresAt time.Time) (bool, error) {
+	ctx, span := s.startOp(ctx, "consume_delegation_jti")
+	start := time.Now()
+	digest := sha256.Sum256([]byte(issuer + "\x00" + jti))
+	ttl := time.Until(expiresAt)
+	if ttl <= 0 {
+		s.recordOp(ctx, span, "consume_delegation_jti", start, nil)
+		return false, nil
+	}
+	consumed, err := s.client.SetNX(ctx, s.key("delegation_jti", hex.EncodeToString(digest[:])), "1", ttl).Result()
+	s.recordOp(ctx, span, "consume_delegation_jti", start, err)
+	return consumed, err
 }
 
 // NewRedisStore creates a new Redis-backed counter store.

@@ -2,6 +2,8 @@ package restrict
 
 import (
 	"context"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -10,6 +12,39 @@ import (
 	"github.com/redoapp/waypoint/internal/auth"
 	"github.com/redoapp/waypoint/internal/metrics"
 )
+
+func TestConsumeDelegationJTIAtomicAcrossStores(t *testing.T) {
+	mr := miniredis.RunT(t)
+	firstClient := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	secondClient := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = firstClient.Close() })
+	t.Cleanup(func() { _ = secondClient.Close() })
+	stores := []*RedisStore{
+		NewRedisStore(firstClient, "test:", metrics.Noop()),
+		NewRedisStore(secondClient, "test:", metrics.Noop()),
+	}
+
+	var accepted atomic.Int32
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func(store *RedisStore) {
+			defer wg.Done()
+			consumed, err := store.ConsumeDelegationJTI(context.Background(), "issuer", "one-time-id", time.Now().Add(time.Hour))
+			if err != nil {
+				t.Errorf("consume: %v", err)
+				return
+			}
+			if consumed {
+				accepted.Add(1)
+			}
+		}(stores[i%len(stores)])
+	}
+	wg.Wait()
+	if got := accepted.Load(); got != 1 {
+		t.Fatalf("accepted %d credentials, want exactly one", got)
+	}
+}
 
 func setupRedis(t *testing.T) (*RedisStore, *miniredis.Miniredis) {
 	t.Helper()
