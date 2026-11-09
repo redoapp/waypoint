@@ -84,6 +84,12 @@ When set, Waypoint provisions a scoped backend role for that effective preset an
 
 Postgres clients negotiate TLS via `SSLRequest`. Waypoint serves the certificate that matches the requested server name. See [TLS](/waypoint/configuration/tls/) for the full certificate-selection logic. Use `tls_mode = "require"` to reject plaintext clients entirely. <TestRef name="TestReadStartupMessage_TLSRequireRejectsPlaintext" />
 
+## Protocol version negotiation
+
+Waypoint speaks wire protocol 3.0 to clients and backends. Clients that ask for a newer 3.x minor version (for example libpq 18 with `max_protocol_version=latest`, which requests 3.2) or that send `_pq_.` protocol options get a `NegotiateProtocolVersion` reply, the same way PostgreSQL itself answers, and the session continues on 3.0. Protocol options are never forwarded to the backend. Clients requesting a different major version are rejected with SQLSTATE `0A000`. <TestRef name="TestReadStartupMessage_Protocol32Negotiated" /> <TestRef name="TestReadStartupMessage_ProtocolOptionsRejectedAndStripped" />
+
+CancelRequest packets are recognized with both 3.0 (4-byte) and 3.2 (up to 256-byte) secret keys and are closed without being recorded as errors. <TestRef name="TestReadStartupMessage_Protocol32CancelRequest" />
+
 ## CockroachDB
 
 Waypoint auto-detects CockroachDB backends and adjusts role-lifecycle behavior accordingly. See [CockroachDB](/waypoint/listeners/cockroachdb/) for the differences.

@@ -139,6 +139,14 @@ func (p *PostgresProxy) HandleConn(ctx context.Context, clientConn net.Conn) {
 			pgwire.SendErrorResponse(clientConn, "FATAL", "28000", "TLS is required for this listener")
 			return
 		}
+		if errors.Is(err, pgwire.ErrUnsupportedProtocol) {
+			setupSpan.RecordError(err)
+			setupSpan.SetStatus(codes.Error, "unsupported protocol")
+			setupSpan.End()
+			log.WarnContext(ctx, "client requested unsupported protocol version", "error", err)
+			pgwire.SendErrorResponse(clientConn, "FATAL", "0A000", err.Error())
+			return
+		}
 		if errors.Is(err, pgwire.ErrCancelRequest) {
 			// Client sent a CancelRequest, not a startup. We don't forward query
 			// cancellation; close cleanly without recording an error.
