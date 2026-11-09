@@ -77,6 +77,11 @@ Set `use_tailscale_tls = false` to disable Tailscale certificate lookup and use 
 
 Use `tls_mode = "require"` to reject plaintext Postgres clients.
 
+Postgres sessions run on wire protocol 3.0. Clients that request a newer 3.x
+minor version (such as libpq 18 with `max_protocol_version=latest`) or send
+`_pq_.` protocol options receive a `NegotiateProtocolVersion` message and
+continue on 3.0, matching PostgreSQL's own behavior.
+
 MongoDB replica sets can be exposed as one logical listener with one Waypoint
 port per member. Set `backend_via_tailscale = true` when Waypoint must reach the
 members over Tailscale or subnet routes. For SRV-backed clusters, omit
